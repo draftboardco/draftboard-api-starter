@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Draftboard — New paths</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+  <div class="max-w-5xl mx-auto px-6 py-10">
+    {% include "_nav.html" %}
+
+    <header class="mb-6 flex items-center justify-between flex-wrap gap-3">
+      <div>
+        <h1 class="text-2xl font-semibold tracking-tight">New paths</h1>
+        <p class="text-sm text-slate-500 mt-1">
+          Paths Draftboard discovered through your network in
+          <strong>{{ since_label }}</strong>, sorted by score.
+          {% if last_sync_completed %}
+            Last full sync: <span class="font-mono">{{ last_sync_completed }}</span>.
+          {% else %}
+            <span class="text-amber-600">Background sync hasn't completed yet — new paths will appear after the next sync.</span>
+          {% endif %}
+        </p>
+      </div>
+    </header>
+
+    {# Filter bar #}
+    <form method="GET" action="/new-paths" class="mb-6 flex items-end gap-3 flex-wrap bg-white border border-slate-200 rounded-lg p-4 shadow-sm">
+      {# Lookback window #}
+      <div>
+        <label for="since" class="block text-[10px] uppercase tracking-wider text-slate-500 mb-1">Discovered</label>
+        <select name="since" id="since" onchange="this.form.submit()"
+                class="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500">
+          <option value="24h" {% if since == '24h' %}selected{% endif %}>Last 24 hours</option>
+          <option value="7d" {% if since == '7d' %}selected{% endif %}>Last 7 days</option>
+          <option value="30d" {% if since == '30d' %}selected{% endif %}>Last 30 days</option>
+          <option value="last_sync" {% if since == 'last_sync' %}selected{% endif %}>Since last sync</option>
+          <option value="all" {% if since == 'all' %}selected{% endif %}>All time</option>
+        </select>
+      </div>
+
+      {# Score threshold #}
+      <div>
+        <label for="min_score" class="block text-[10px] uppercase tracking-wider text-slate-500 mb-1">Min score</label>
+        <input type="number" name="min_score" id="min_score" value="{{ min_score }}"
+               min="0" step="5"
+               class="w-24 rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500" />
+      </div>
+
+      {# Owner filter #}
+      {% if owners_list %}
+        <div>
+          <label for="owner" class="block text-[10px] uppercase tracking-wider text-slate-500 mb-1">Owner</label>
+          <select name="owner" id="owner" onchange="this.form.submit()"
+                  class="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500">
+            <option value="" {% if not owner_filter %}selected{% endif %}>All teammates</option>
+            {% if me and me.owner_id %}
+              <option value="me" {% if owner_filter == 'me' or owner_filter == me.owner_id %}selected{% endif %}>
+                Owned by you{% if me.user_first %} ({{ me.user_first }}){% endif %}
+              </option>
+            {% endif %}
+            {% for o in owners_list %}
+              {% if not me or not me.owner_id or o.id != me.owner_id %}
+                <option value="{{ o.id }}" {% if owner_filter == o.id %}selected{% endif %}>
+                  {{ o.name }} ({{ o.target_count }})
+                </option>
+              {% endif %}
+            {% endfor %}
+          </select>
+        </div>
+      {% endif %}
+
+      <button type="submit"
+              class="text-xs px-3 py-1.5 rounded-md bg-slate-900 text-white hover:bg-slate-800">
+        Apply
+      </button>
+
+      <div class="ml-auto text-xs text-slate-500">
+        Showing <strong>{{ total }}</strong> path{{ '' if total == 1 else 's' }} (top 200)
+      </div>
+    </form>
+
+    {% if not api_key_set %}
+      <div class="mb-6 rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+        <strong>DRAFTBOARD_API_KEY is not set.</strong>
+      </div>
+    {% endif %}
+
+    {% if total == 0 %}
+      <div class="rounded-lg border border-dashed border-slate-300 bg-white py-16 px-6 text-center">
+        <p class="text-base font-medium text-slate-700">No new paths match these filters yet.</p>
+        <p class="mt-2 text-sm text-slate-500 max-w-md mx-auto">
+          New paths appear here as the background sync discovers them
+          (every {{ '%g'|format(12.0) }} hours by default).
+          {% if since != 'all' %}<br>Try widening the lookback or lowering the min score.{% endif %}
+        </p>
+        <p class="mt-4 text-xs text-slate-500">
+          Want to seed this view right now from your existing workspace data?
+        </p>
+        <button type="button" onclick="forceResyncPaths(this)"
+                class="mt-2 inline-flex items-center justify-center rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow hover:bg-indigo-700">
+          Force re-sync all paths
+        </button>
+        <p class="mt-2 text-[11px] text-slate-400">
+          Re-fetches connections for every target (~30 minutes for ~4k targets).
+          Runs in background; refresh this page periodically to watch new paths populate.
+        </p>
+      </div>
+      <script>
+        window.forceResyncPaths = function (btn) {
+          btn.disabled = true;
+          btn.textContent = 'Starting…';
+          fetch('/sync/start?force=1', { method: 'POST' })
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+              btn.textContent = data.started ? 'Sync started — check the nav' : 'Already running';
+            })
+            .catch(function () { btn.disabled = false; btn.textContent = 'Failed — try again'; });
+        };
+      </script>
+    {% else %}
+      <div class="space-y-3">
+        {% for p in paths %}
+          <article class="bg-white border border-slate-200 rounded-lg shadow-sm">
+            {# Target row at top — clickable to open the target's full drawer #}
+            <header data-target-id="{{ p.target_id }}"
+                    class="px-5 py-3 border-b border-slate-100 flex items-center gap-3 cursor-pointer hover:bg-slate-50 transition">
+              <span class="text-[10px] uppercase tracking-wider text-slate-400">→ Path to</span>
+              <div class="flex-shrink-0 w-8 h-8 rounded-full bg-indigo-100 text-indigo-700 flex items-center justify-center text-xs font-semibold">
+                {{ p.target.initials }}
+              </div>
+              <div class="flex-1 min-w-0">
+                <div class="text-sm font-semibold text-slate-900 truncate">{{ p.target.name }}</div>
+                <div class="text-xs text-slate-500 truncate">
+                  {% if p.target.title %}{{ p.target.title }}{% endif %}
+                  {% if p.target.title and p.target.company %} · {% endif %}
+                  {% if p.target.company %}{{ p.target.company }}{% endif %}
+                </div>
+              </div>
+              <span class="text-[10px] text-slate-400">discovered just now</span>
+            </header>
+
+            {# Connector card (re-uses the shared partial — Compose email + Assign to teammate buttons work as-is) #}
+            <div class="p-4">
+              {% with c = p.connection, target_id = p.target_id %}
+                {% include "_connector_card.html" with context %}
+              {% endwith %}
+            </div>
+          </article>
+        {% endfor %}
+      </div>
+    {% endif %}
+
+    <footer class="mt-10 text-xs text-slate-400 text-center">
+      Draftboard API starter · New paths · Auto-syncs every {{ '%g'|format(12.0) }} hours
+    </footer>
+  </div>
+
+  {% include "_drawer_skeleton.html" %}
+</body>
+</html>

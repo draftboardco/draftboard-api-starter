@@ -31,18 +31,89 @@ from flask import Flask, render_template, request, jsonify, redirect, url_for
 import requests
 
 API_BASE = "https://intros.draftboard.com/api/v1/integration"
-API_KEY = os.environ.get("DRAFTBOARD_API_KEY", "")
+
+
+def _load_api_key():
+    """Load the Draftboard API key, in priority order:
+
+      1. DRAFTBOARD_API_KEY environment variable
+      2. .env file in the app directory (KEY=value, KEY=value lines)
+      3. ~/.draftboard-secrets/draftboard-api-starter (raw key, or
+         DRAFTBOARD_API_KEY=...)
+
+    Returns (key_string, source_label). Source label is shown at startup so
+    the user knows where the key came from.
+    """
+    # 1. Env var
+    env_key = os.environ.get("DRAFTBOARD_API_KEY", "").strip()
+    if env_key:
+        return env_key, "DRAFTBOARD_API_KEY env var"
+
+    def _extract(line):
+        """Pull a value out of a 'KEY=value' or just-value line."""
+        line = line.strip()
+        if not line or line.startswith("#"):
+            return None
+        if line.startswith("DRAFTBOARD_API_KEY"):
+            _, _, val = line.partition("=")
+            return val.strip().strip('"').strip("'") or None
+        return line.strip().strip('"').strip("'") or None
+
+    # 2. .env in app dir
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    env_path = os.path.join(app_dir, ".env")
+    if os.path.exists(env_path):
+        try:
+            with open(env_path) as f:
+                for line in f:
+                    if line.strip().startswith("DRAFTBOARD_API_KEY"):
+                        v = _extract(line)
+                        if v:
+                            return v, env_path
+        except OSError:
+            pass
+
+    # 3. ~/.draftboard-secrets/draftboard-api-starter
+    secrets_path = os.path.expanduser("~/.draftboard-secrets/draftboard-api-starter")
+    if os.path.exists(secrets_path):
+        try:
+            with open(secrets_path) as f:
+                content = f.read().strip()
+            if content:
+                # First non-comment line — raw key or KEY=value
+                for line in content.splitlines():
+                    v = _extract(line)
+                    if v:
+                        return v, secrets_path
+        except OSError:
+            pass
+
+    return "", None
+
+
+API_KEY, _api_key_source = _load_api_key()
+if API_KEY:
+    print(f"[draftboard-starter] Loaded API key from: {_api_key_source}")
+else:
+    print("[draftboard-starter] No API key found. Set one of:")
+    print("  - DRAFTBOARD_API_KEY environment variable")
+    print("  - .env file in the app directory (DRAFTBOARD_API_KEY=db-api_...)")
+    print("  - ~/.draftboard-secrets/draftboard-api-starter (file containing the key)")
+    print("  Then restart the server.")
 TARGETS_CACHE_TTL = 300  # 5 minutes; Refresh button forces a re-fetch
 TAGS_CACHE_TTL = 600  # 10 minutes
 CONNECTIONS_CACHE_TTL = 24 * 3600  # 24 hours; SQLite-persisted connections
 ACCOUNT_FANOUT_LIMIT = 50  # max targets to fan out (mostly cache hits after sync)
 SYNC_CONCURRENCY = 5  # parallel /targets/{id}/connections fetches during bulk sync
+SYNC_INTERVAL_HOURS = float(os.environ.get("SYNC_INTERVAL_HOURS", "12"))  # background re-sync cadence
 
 app = Flask(__name__)
 
-# In-memory caches for the lightweight endpoints (targets list, tags list).
+# In-memory caches for the lightweight endpoints (targets list, tags list, /me).
 _targets_cache = {"data": None, "error": None, "fetched_at": 0}
 _tags_cache = {"data": None, "error": None, "fetched_at": 0}
+_me_cache = {"data": None, "error": None, "fetched_at": 0}
+ME_CACHE_TTL = 600
 
 # SQLite-backed persistent caches: per-target connections + intro_requests state.
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.db")
@@ -60,6 +131,7 @@ _sync_state = {
     "last_target_name": "",
 }
 _sync_thread = None
+_scheduled_thread = None
 
 
 def _db_connect():
@@ -87,6 +159,87 @@ def init_db():
                 PRIMARY KEY (target_id, connection_id)
             )
         """)
+        # Denormalized index: which team-member owners can intro to which target.
+        # Populated alongside `connections` in db_put_connections. Lets us filter
+        # the Targets/Accounts views by owner without scanning every JSON blob.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS target_owners (
+                target_id TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                owner_first TEXT NOT NULL,
+                owner_last TEXT NOT NULL,
+                owner_linkedin TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (target_id, owner_id)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_target_owners_owner ON target_owners(owner_id)")
+        # Add owner_linkedin column to existing tables created before this migration
+        try:
+            conn.execute("ALTER TABLE target_owners ADD COLUMN owner_linkedin TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass  # already exists
+
+        # Per-path discovery log. One row per (target_id, connection_id) pair.
+        # `first_seen_at` is set on insert; `last_seen_at` is bumped on every sync
+        # that re-confirms the pair. Powers the "New paths" tab. Intentionally
+        # NOT backfilled from existing connections — only new paths discovered
+        # after this table starts being populated will appear in the tab.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS discovered_paths (
+                target_id TEXT NOT NULL,
+                connection_id TEXT NOT NULL,
+                score INTEGER NOT NULL,
+                first_seen_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                PRIMARY KEY (target_id, connection_id)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_discovered_paths_first_seen ON discovered_paths(first_seen_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_discovered_paths_score ON discovered_paths(score DESC)")
+
+        # Simple persistent key-value app state (last sync completion, etc.)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS app_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+        """)
+        conn.commit()
+
+
+def backfill_target_owners():
+    """Populate target_owners from existing rows in `connections` (one-time on boot).
+
+    Re-runs if any rows are missing the owner_linkedin field (from a pre-migration
+    state). Cheap on a fresh DB; takes a few seconds on thousands of cached targets.
+    """
+    with _db_lock, _db_connect() as conn:
+        # Check if backfill is needed: empty table OR any row with empty linkedin
+        cur = conn.execute("SELECT COUNT(*) FROM target_owners WHERE owner_linkedin = ''")
+        missing_linkedin = cur.fetchone()[0]
+        cur = conn.execute("SELECT COUNT(*) FROM target_owners")
+        total = cur.fetchone()[0]
+        if total > 0 and missing_linkedin == 0:
+            return  # already populated and migrated
+        # Wipe and rebuild — simpler than diffing
+        conn.execute("DELETE FROM target_owners")
+        cur = conn.execute("SELECT target_id, connections_json FROM connections WHERE error IS NULL")
+        rows = cur.fetchall()
+        for target_id, json_str in rows:
+            try:
+                conns = json.loads(json_str) or []
+            except Exception:
+                continue
+            for c in conns:
+                for o in (c.get("owners") or []):
+                    oid = o.get("id")
+                    if not oid:
+                        continue
+                    conn.execute(
+                        "INSERT OR IGNORE INTO target_owners (target_id, owner_id, owner_first, owner_last, owner_linkedin) VALUES (?, ?, ?, ?, ?)",
+                        (target_id, oid, o.get("firstName") or "", o.get("lastName") or "", o.get("linkedinUrl") or "")
+                    )
         conn.commit()
 
 
@@ -104,12 +257,157 @@ def db_get_connections(target_id):
 
 
 def db_put_connections(target_id, connections, error):
+    """Persist a target's connections + maintain the target_owners index +
+    record (target_id, connection_id) pairs in discovered_paths.
+
+    Newly-seen pairs get first_seen_at = now (this powers the "New paths" tab).
+    Already-seen pairs refresh last_seen_at and current score.
+    """
+    now = int(time.time())
     with _db_lock, _db_connect() as conn:
         conn.execute(
             "INSERT OR REPLACE INTO connections (target_id, connections_json, fetched_at, error) VALUES (?, ?, ?, ?)",
-            (target_id, json.dumps(connections or []), int(time.time()), error),
+            (target_id, json.dumps(connections or []), now, error),
+        )
+        # Refresh the owner index for this target.
+        conn.execute("DELETE FROM target_owners WHERE target_id = ?", (target_id,))
+        for c in (connections or []):
+            for o in (c.get("owners") or []):
+                oid = o.get("id")
+                if not oid:
+                    continue
+                conn.execute(
+                    "INSERT OR IGNORE INTO target_owners (target_id, owner_id, owner_first, owner_last, owner_linkedin) VALUES (?, ?, ?, ?, ?)",
+                    (target_id, oid, o.get("firstName") or "", o.get("lastName") or "", o.get("linkedinUrl") or "")
+                )
+        # Discovered paths: INSERT preserves first_seen_at for known pairs,
+        # UPDATE refreshes last_seen_at + score for everything in this batch.
+        for c in (connections or []):
+            cid = c.get("id")
+            if not cid:
+                continue
+            score = c.get("score") or 0
+            conn.execute(
+                "INSERT OR IGNORE INTO discovered_paths "
+                "(target_id, connection_id, score, first_seen_at, last_seen_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (target_id, cid, score, now, now)
+            )
+            conn.execute(
+                "UPDATE discovered_paths SET last_seen_at = ?, score = ? "
+                "WHERE target_id = ? AND connection_id = ?",
+                (now, score, target_id, cid)
+            )
+        conn.commit()
+
+
+def db_query_new_paths(since_ts, min_score, owner_id=None, limit=200):
+    """Return new paths (target_id, connection_id, score, timestamps) sorted by
+    score desc, then first_seen_at desc."""
+    args = [since_ts, min_score]
+    sql = (
+        "SELECT dp.target_id, dp.connection_id, dp.score, dp.first_seen_at, dp.last_seen_at "
+        "FROM discovered_paths dp "
+        "WHERE dp.first_seen_at >= ? AND dp.score >= ? "
+    )
+    if owner_id:
+        sql += "AND EXISTS (SELECT 1 FROM target_owners ot WHERE ot.target_id = dp.target_id AND ot.owner_id = ?) "
+        args.append(owner_id)
+    sql += "ORDER BY dp.score DESC, dp.first_seen_at DESC LIMIT ?"
+    args.append(limit)
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(sql, args)
+        return [
+            {
+                "target_id": r[0],
+                "connection_id": r[1],
+                "score": r[2],
+                "first_seen_at": r[3],
+                "last_seen_at": r[4],
+            }
+            for r in cur.fetchall()
+        ]
+
+
+def db_app_state_get(key, default=None):
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute("SELECT value FROM app_state WHERE key = ?", (key,))
+        row = cur.fetchone()
+        return row[0] if row else default
+
+
+def db_app_state_set(key, value):
+    with _db_lock, _db_connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO app_state (key, value, updated_at) VALUES (?, ?, ?)",
+            (key, str(value), int(time.time()))
         )
         conn.commit()
+
+
+def db_unique_owners():
+    """All distinct team members who appear as a Connection.owner across the cache.
+
+    Returns a list of dicts sorted by how many targets each can intro to (desc).
+    """
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT owner_id, owner_first, owner_last, owner_linkedin, COUNT(DISTINCT target_id) "
+            "FROM target_owners GROUP BY owner_id, owner_first, owner_last, owner_linkedin "
+            "ORDER BY 5 DESC"
+        )
+        return [
+            {
+                "id": r[0],
+                "first": r[1],
+                "last": r[2],
+                "linkedin": r[3] or "",
+                "name": f"{r[1]} {r[2]}".strip() or "(unnamed)",
+                "target_count": r[4],
+            }
+            for r in cur.fetchall()
+        ]
+
+
+def _normalize_linkedin(url):
+    """Lowercase + strip trailing slash + strip query/anchor — for fuzzy URL match."""
+    if not url:
+        return ""
+    u = url.strip().lower()
+    u = u.split("?", 1)[0].split("#", 1)[0]
+    return u.rstrip("/")
+
+
+def db_owner_id_by_linkedin(linkedin_url):
+    """Return the owner_id from target_owners that matches a LinkedIn URL.
+
+    Used to map the /me user (whose user.id may not match the in-org member.id)
+    to the actual owner_id used in connection.owners[]. Tolerant to trailing
+    slash and case differences (Draftboard's /me sometimes returns the URL
+    without the trailing slash that appears inside connection.owners[]).
+    """
+    norm = _normalize_linkedin(linkedin_url)
+    if not norm:
+        return None
+    with _db_lock, _db_connect() as conn:
+        # Compare normalized forms by stripping trailing slash on the DB side too.
+        cur = conn.execute(
+            "SELECT owner_id FROM target_owners "
+            "WHERE LOWER(RTRIM(owner_linkedin, '/')) = ? LIMIT 1",
+            (norm,),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def db_target_ids_for_owner(owner_id):
+    """Set of target_ids where this owner is on at least one Connection."""
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT DISTINCT target_id FROM target_owners WHERE owner_id = ?",
+            (owner_id,),
+        )
+        return {r[0] for r in cur.fetchall()}
 
 
 def db_count_fresh_connections(target_ids, ttl=CONNECTIONS_CACHE_TTL):
@@ -166,8 +464,11 @@ def db_intro_requests_for_target(target_id):
         return {row[0] for row in cur.fetchall()}
 
 
-# Initialize DB on import
+# Initialize DB on import + backfill the target_owners index from existing rows.
+# (start_scheduled_sync() is called at the bottom of this module, after its
+# definition — Python doesn't hoist.)
 init_db()
+backfill_target_owners()
 
 
 def _auth_headers():
@@ -175,6 +476,80 @@ def _auth_headers():
         "Authorization": f"Bearer {API_KEY}",
         "Content-Type": "application/json",
     }
+
+
+def fetch_me(force=False):
+    """GET /me -> the customer + the API-key owner's user record. Cached.
+
+    Returns (data_dict, error). data_dict has keys: customer (with id, name)
+    and user (with id, firstName, lastName, linkedinUrl). The user.id is
+    what shows up in Connection.owners[] for paths "owned by you".
+    """
+    now = time.time()
+    if (
+        not force
+        and _me_cache["data"] is not None
+        and (now - _me_cache["fetched_at"]) < ME_CACHE_TTL
+    ):
+        return _me_cache["data"], _me_cache["error"]
+    if not API_KEY:
+        return None, "DRAFTBOARD_API_KEY not set."
+    try:
+        r = requests.get(f"{API_BASE}/me", headers=_auth_headers(), timeout=10)
+        if r.status_code != 200:
+            err = f"GET /me returned {r.status_code}."
+            _me_cache.update({"data": None, "error": err, "fetched_at": now})
+            return None, err
+        data = r.json() or {}
+        customer = data.get("customer") or {}
+        user = customer.get("user") or {}
+        result = {
+            "customer_id": customer.get("id"),
+            "customer_name": customer.get("name"),
+            "user_id": user.get("id"),
+            "user_first": user.get("firstName") or "",
+            "user_last": user.get("lastName") or "",
+            "user_linkedin": user.get("linkedinUrl") or "",
+        }
+        _me_cache.update({"data": result, "error": None, "fetched_at": now})
+        return result, None
+    except requests.RequestException as e:
+        return None, f"Network error fetching /me: {e}"
+
+
+def get_my_user_id():
+    """Convenience: just the user.id, or None if /me hasn't been fetched."""
+    me, _ = fetch_me()
+    return (me or {}).get("user_id")
+
+
+def get_my_owner_id():
+    """The owner_id used in connection.owners[] that represents the current user.
+
+    The /me endpoint returns user.id, which is *supposed* to match the owner_id
+    used inside connections. In some workspaces those are different UUIDs
+    (separate User vs Member entities). We try the user.id first; if it doesn't
+    appear in target_owners, fall back to LinkedIn-URL match.
+    """
+    me, _ = fetch_me()
+    if not me:
+        return None
+    user_id = me.get("user_id")
+    if user_id:
+        with _db_lock, _db_connect() as conn:
+            cur = conn.execute(
+                "SELECT 1 FROM target_owners WHERE owner_id = ? LIMIT 1",
+                (user_id,),
+            )
+            if cur.fetchone():
+                return user_id
+    # Fall back to LinkedIn URL
+    linkedin = me.get("user_linkedin")
+    fallback = db_owner_id_by_linkedin(linkedin)
+    if fallback:
+        return fallback
+    # Last resort: return user.id even if no owner row matches yet
+    return user_id
 
 
 def fetch_tags(force=False):
@@ -334,12 +709,13 @@ def _sync_one_target(t):
             _sync_state["errors"] += 1
 
 
-def _sync_worker():
+def _sync_worker(force_all=False):
     """Background worker: fetches and caches connections for every target in parallel.
 
-    Skips targets already fresh in SQLite. Uses a ThreadPoolExecutor so multiple
-    /targets/{id}/connections calls run concurrently — modest concurrency
-    (SYNC_CONCURRENCY) keeps us friendly to the API while cutting sync time ~5x.
+    Skips targets already fresh in SQLite (unless force_all=True). Uses a
+    ThreadPoolExecutor so multiple /targets/{id}/connections calls run
+    concurrently — modest concurrency (SYNC_CONCURRENCY) keeps us friendly to
+    the API while cutting sync time ~5x.
     """
     targets, _err = fetch_all_targets()
     if not targets:
@@ -360,15 +736,19 @@ def _sync_worker():
         _sync_state["last_target_name"] = ""
 
     threshold = int(time.time()) - CONNECTIONS_CACHE_TTL
-    # Filter to targets that actually need sync (skip fresh, skip missing id)
+    # Filter to targets that actually need sync (skip fresh, skip missing id).
+    # When force_all=True, sync every target regardless of cache freshness —
+    # used by the "Force re-sync" button to populate discovered_paths from
+    # all currently-cached connections.
     to_sync = []
     for t in targets:
         tid = t.get("id")
         if not tid:
             continue
-        cached_data, fetched_at, cached_error = db_get_connections(tid)
-        if cached_data is not None and fetched_at >= threshold and not cached_error:
-            continue
+        if not force_all:
+            cached_data, fetched_at, cached_error = db_get_connections(tid)
+            if cached_data is not None and fetched_at >= threshold and not cached_error:
+                continue
         to_sync.append(t)
 
     # Concurrent fetches. ThreadPoolExecutor handles the worker pool;
@@ -381,21 +761,50 @@ def _sync_worker():
     with _sync_lock:
         _sync_state["running"] = False
         _sync_state["ended_at"] = int(time.time())
+    # Persist the completion timestamp for the "Since last sync" filter on the
+    # New Paths page (and for any future "last synced X minutes ago" UI).
+    db_app_state_set("last_sync_completed_at", int(time.time()))
+
+
+def _scheduled_sync_loop():
+    """Background daemon: kicks off start_sync() every SYNC_INTERVAL_HOURS.
+
+    Skips if a sync is already running. Restarts naturally on server boot —
+    state isn't persisted across restarts.
+    """
+    interval_seconds = max(60, int(SYNC_INTERVAL_HOURS * 3600))
+    while True:
+        time.sleep(interval_seconds)
+        with _sync_lock:
+            if _sync_state["running"]:
+                continue
+        start_sync()
+
+
+def start_scheduled_sync():
+    """Spawn the scheduled sync daemon. Idempotent (no-op if already started)."""
+    global _scheduled_thread
+    if _scheduled_thread is not None and _scheduled_thread.is_alive():
+        return
+    _scheduled_thread = threading.Thread(target=_scheduled_sync_loop, daemon=True, name="scheduled-sync")
+    _scheduled_thread.start()
 
 
 def start_sync(force_all=False):
     """Kick off the background sync if it's not already running.
 
-    If force_all=True, marks all current rows as stale by passing through (the worker
-    re-fetches anything older than CONNECTIONS_CACHE_TTL — to fully re-sync we'd need
-    to truncate; for now use the TTL knob).
+    `force_all=True` re-fetches every target regardless of cache freshness — useful
+    for the "Force re-sync" button when the user wants discovered_paths to repopulate
+    against current API data.
     """
     global _sync_thread
     with _sync_lock:
         if _sync_state["running"]:
             return False
         _sync_state["running"] = True
-    _sync_thread = threading.Thread(target=_sync_worker, daemon=True, name="db-sync")
+    _sync_thread = threading.Thread(
+        target=_sync_worker, args=(force_all,), daemon=True, name="db-sync"
+    )
     _sync_thread.start()
     return True
 
@@ -442,30 +851,34 @@ _SCHOOL_RE = re.compile(r"^They went to (.+?) together", re.IGNORECASE)
 _YEAR_RE = re.compile(r"most recently in (\d{4})", re.IGNORECASE)
 
 
-def _humanize_score_detail(detail, target_first):
-    """Rewrite an API scoreDetail string from third-person ('they') to second-person
-    ('you'), from the user's POV writing to the connector.
+def _humanize_for_card(detail, connector_first, target_first):
+    """Rewrite a scoreDetail string for the BULLET LIST shown to the user inside
+    a connector card.
+
+    The relationship described is between the connector and the target — both
+    third parties from the user's POV — so the rewrite uses the connector's
+    name as the subject. The user is reading "Mindy worked with Bogdan at X",
+    not "you worked with Bogdan".
 
     Examples:
       'They overlapped for a long time (26 months) @ Microsoft, most recently in 2009'
-        -> 'you worked with Bogdan at Microsoft for 26 months, most recently in 2009'
-      'They have a good number (15) of mutual connections'
-        -> 'you have 15 mutual connections'
-      'They have a lot (590) of mutual connections'
-        -> 'you have 590 mutual connections'
+        -> 'Mindy worked with Bogdan at Microsoft for 26 months, most recently in 2009'
+      'They have 69 mutual connections'
+        -> 'Mindy has 69 mutual connections'
       'They went to Stanford together'
-        -> 'you both went to Stanford'
+        -> 'Mindy and Bogdan went to Stanford together'
       'They both worked @ Acme (but didn't overlap)'
-        -> 'you both worked at Acme (but didn't overlap)'
+        -> 'Mindy and Bogdan both worked at Acme (but didn't overlap)'
     """
     if not detail:
         return ""
     d = detail.strip()
-    target_first = target_first or "them"
+    connector = connector_first or "they"
+    target = target_first or "them"
 
     m = _MUTUALS_RE.match(d)
     if m:
-        return f"you have {m.group(1)} mutual connections"
+        return f"{connector} has {m.group(1)} mutual connections"
 
     m = _OVERLAP_RE.match(d)
     if m:
@@ -475,7 +888,7 @@ def _humanize_score_detail(detail, target_first):
             duration = wrap.group(1).strip()
         company = m.group(2).strip()
         rest = m.group(4) or ""
-        result = f"you worked with {target_first} at {company}"
+        result = f"{connector} worked with {target} at {company}"
         if duration and duration.lower() not in ("a little while", "a long time"):
             result += f" for {duration}"
         ym = _YEAR_RE.search(rest)
@@ -485,17 +898,17 @@ def _humanize_score_detail(detail, target_first):
 
     m = _SCHOOL_RE.match(d)
     if m:
-        return f"you both went to {m.group(1).strip()}"
+        return f"{connector} and {target} went to {m.group(1).strip()} together"
 
     m = _BOTH_WORKED_RE.match(d)
     if m:
         company = m.group(1).strip()
         note = f" ({m.group(2)})" if m.group(2) else ""
-        return f"you both worked at {company}{note}"
+        return f"{connector} and {target} both worked at {company}{note}"
 
-    # Fallback: simple pronoun substitution so we never leak raw "They"
-    rewrite = re.sub(r"\bThey\b", "you", d)
-    rewrite = re.sub(r"\bthey\b", "you", rewrite)
+    # Fallback: substitute "They" with the connector's name so we never leak raw API text
+    rewrite = re.sub(r"\bThey\b", connector, d)
+    rewrite = re.sub(r"\bthey\b", connector, rewrite)
     return rewrite
 
 
@@ -624,13 +1037,59 @@ def _gmail_compose_url(subject, body):
     )
 
 
-def _enrich_connection(target, connection, requested_set=None):
+def _build_assign_to_teammate_draft(target, connection, teammate):
+    """Generate a Gmail draft asking a teammate to ping the connector for an
+    intro to the target. Used by the 'Assigned to' dropdown."""
+    target_first = (target.get("firstName") or "").strip() or "them"
+    target_last = (target.get("lastName") or "").strip()
+    target_full = f"{target_first} {target_last}".strip() if target_last else target_first
+    target_company = (target.get("position") or {}).get("companyName") or ""
+    target_linkedin = target.get("linkedinUrl") or ""
+
+    connector_first = (connection.get("firstName") or "").strip()
+    connector_last = (connection.get("lastName") or "").strip()
+    connector_full = f"{connector_first} {connector_last}".strip() if connector_last else connector_first
+    if not connector_full:
+        connector_full = "your connection"
+
+    teammate_first = (teammate.get("firstName") or "").strip() or "there"
+
+    company_clause = f" at {target_company}" if target_company else ""
+    body_parts = [
+        f"Hey {teammate_first} - quick ask: any chance you could ping {connector_full} "
+        f"about a warm intro to {target_full}{company_clause}? Draftboard shows you have a path "
+        f"through {connector_first or 'them'}.",
+    ]
+    if target_linkedin:
+        body_parts.append(f"{target_first}'s LinkedIn: {target_linkedin}")
+    body_parts.append("Happy to coordinate or send a forwardable email.")
+    body = "\n\n".join(body_parts)
+    subject = f"Quick ask: warm intro to {target_full}?"
+
+    return {
+        "teammate_id": teammate.get("id"),
+        "teammate_first": teammate_first,
+        "teammate_last": (teammate.get("lastName") or "").strip(),
+        "teammate_full": (
+            f"{teammate_first} {(teammate.get('lastName') or '').strip()}"
+        ).strip(),
+        "teammate_initials": _initials(teammate.get("firstName"), teammate.get("lastName")),
+        "subject": subject,
+        "body": body,
+        "gmail_url": _gmail_compose_url(subject, body),
+    }
+
+
+def _enrich_connection(target, connection, requested_set=None, my_user_id=None):
     """Format a Connection for the drawer template.
 
     `requested_set` is an optional pre-fetched set of connection_ids that have
     been Marked-as-requested for this target — saves a per-connection DB query.
+    `my_user_id` is the current user's id (from /me). Used to flag which owners
+    are "you" vs teammates.
 
-    Also generates the Compose-Email Gmail URL for the connector card.
+    Generates the Compose-Email Gmail URL for the connector card AND the
+    per-teammate assign-to drafts for any owners who aren't the current user.
     """
     pos = connection.get("position") or {}
     first = (connection.get("firstName") or "").strip()
@@ -641,18 +1100,40 @@ def _enrich_connection(target, connection, requested_set=None):
     else:
         is_requested = db_intro_request_get(target.get("id"), cid)
 
-    # Humanize scoreDetails into 2nd-person bullets the user can read in the drawer.
-    # (Bullets keep precise data like exact mutual counts — drafts don't.)
+    if my_user_id is None:
+        my_user_id = get_my_owner_id()
+
+    # Bullet list shown to the user in each connector card. These describe the
+    # connector-to-target relationship in third person — "Mindy worked with
+    # Bogdan at Microsoft" — distinct from the email draft body which is in
+    # second person addressed to the connector ("you worked with Bogdan").
     raw_details = connection.get("scoreDetails") or []
-    humanized = [_humanize_score_detail(d, (target.get("firstName") or "").strip() or "them")
-                 for d in raw_details]
+    connector_first_for_bullets = (connection.get("firstName") or "").strip() or "they"
+    target_first_for_bullets = (target.get("firstName") or "").strip() or "them"
+    humanized = [
+        _humanize_for_card(d, connector_first_for_bullets, target_first_for_bullets)
+        for d in raw_details
+    ]
     humanized = [h for h in humanized if h]
 
     # Plain + HTML message variants for the drawer + Compose-email button.
     messages = _build_messages(target, connection)
-    # Fallback Gmail URL (used if clipboard write fails) — uses the plain_fallback
-    # body which includes the LinkedIn URL inline.
     gmail_url = _gmail_compose_url(messages["subject"], messages["plain_fallback"])
+
+    # Owner classification: which owners are me vs teammates.
+    raw_owners = connection.get("owners") or []
+    is_owned_by_me = False
+    other_owners = []
+    for o in raw_owners:
+        if o.get("id") == my_user_id:
+            is_owned_by_me = True
+        else:
+            other_owners.append(o)
+
+    # Per-teammate draft for the "Assigned to" dropdown.
+    assign_drafts = [
+        _build_assign_to_teammate_draft(target, connection, o) for o in other_owners
+    ]
 
     return {
         "id": cid,
@@ -664,7 +1145,10 @@ def _enrich_connection(target, connection, requested_set=None):
         "score": connection.get("score") or 0,
         "score_details": connection.get("scoreDetails") or [],
         "humanized_details": humanized,
-        "owners": connection.get("owners") or [],
+        "owners": raw_owners,
+        "is_owned_by_me": is_owned_by_me,
+        "other_owners": other_owners,
+        "assign_drafts": assign_drafts,
         "draft_message": messages["plain"],
         "draft_html": messages["html"],
         "draft_plain_fallback": messages["plain_fallback"],
@@ -741,6 +1225,14 @@ def targets_view():
     force_refresh = request.args.get("refresh") == "1"
     targets, error = fetch_all_targets(force=force_refresh)
 
+    # Owner filter: ?owner=<member_id>  (or "me" to mean the current user)
+    owner_filter = (request.args.get("owner") or "").strip()
+    me_id = get_my_owner_id()
+    resolved_owner_id = me_id if owner_filter == "me" else owner_filter
+    if resolved_owner_id:
+        owner_target_ids = db_target_ids_for_owner(resolved_owner_id)
+        targets = [t for t in targets if t.get("id") in owner_target_ids]
+
     # Search filter (case-insensitive substring across name/title/company/tags)
     q = (request.args.get("q") or "").strip()
     q_lower = q.lower()
@@ -768,6 +1260,10 @@ def targets_view():
     # coverage yet. Non-blocking — runs in a daemon thread.
     maybe_auto_start_sync(targets)
 
+    me_for_template, _ = fetch_me()
+    if me_for_template:
+        me_for_template = dict(me_for_template, owner_id=me_id)
+    owners_list = db_unique_owners()
     return render_template(
         "targets.html",
         targets=enriched,
@@ -781,6 +1277,9 @@ def targets_view():
         api_key_set=bool(API_KEY),
         active="targets",
         cache_age=cache_age_seconds(),
+        owners_list=owners_list,
+        owner_filter=owner_filter,
+        me=me_for_template,
     )
 
 
@@ -788,6 +1287,14 @@ def targets_view():
 def accounts_view():
     force_refresh = request.args.get("refresh") == "1"
     targets, error = fetch_all_targets(force=force_refresh)
+
+    # Owner filter (same semantics as targets_view)
+    owner_filter = (request.args.get("owner") or "").strip()
+    me_id = get_my_user_id()
+    resolved_owner_id = me_id if owner_filter == "me" else owner_filter
+    if resolved_owner_id:
+        owner_target_ids = db_target_ids_for_owner(resolved_owner_id)
+        targets = [t for t in targets if t.get("id") in owner_target_ids]
 
     # Group by company name (case-insensitive key, preserve display case)
     accounts = {}
@@ -841,6 +1348,10 @@ def accounts_view():
     # Auto-start background sync of per-target connections.
     maybe_auto_start_sync(targets)
 
+    me_for_template, _ = fetch_me()
+    if me_for_template:
+        me_for_template = dict(me_for_template, owner_id=me_id)
+    owners_list = db_unique_owners()
     return render_template(
         "accounts.html",
         accounts=page_accounts,
@@ -854,6 +1365,9 @@ def accounts_view():
         api_key_set=bool(API_KEY),
         active="accounts",
         cache_age=cache_age_seconds(),
+        owners_list=owners_list,
+        owner_filter=owner_filter,
+        me=me_for_template,
     )
 
 
@@ -1060,6 +1574,99 @@ def toggle_intro_request():
     return jsonify({"requested": new_state})
 
 
+@app.route("/new-paths", methods=["GET"])
+def new_paths_view():
+    """Show paths discovered recently, sorted by score. Filterable by lookback
+    window, minimum score, and which team-member owns the path."""
+    # Lookback preset → epoch threshold
+    since_param = (request.args.get("since") or "7d").strip()
+    now = int(time.time())
+    if since_param == "24h":
+        since_ts = now - 86400
+        since_label = "Last 24 hours"
+    elif since_param == "30d":
+        since_ts = now - 86400 * 30
+        since_label = "Last 30 days"
+    elif since_param == "all":
+        since_ts = 0
+        since_label = "All time"
+    elif since_param == "last_sync":
+        try:
+            last_sync = int(db_app_state_get("last_sync_completed_at") or 0)
+        except (TypeError, ValueError):
+            last_sync = 0
+        # "Since last sync" = paths whose first_seen_at is at or after the most
+        # recent sync's start. We approximate by anchoring 1h before completion.
+        since_ts = max(0, last_sync - 3600) if last_sync else 0
+        since_label = "Since last sync"
+    else:  # default 7d
+        since_param = "7d"
+        since_ts = now - 86400 * 7
+        since_label = "Last 7 days"
+
+    try:
+        min_score = int(request.args.get("min_score") or "30")
+    except ValueError:
+        min_score = 30
+
+    owner_filter = (request.args.get("owner") or "").strip()
+    me_id = get_my_owner_id()
+    resolved_owner_id = me_id if owner_filter == "me" else owner_filter
+
+    rows = db_query_new_paths(since_ts, min_score, resolved_owner_id, limit=200)
+
+    # Hydrate each row with the full target + connection objects so the
+    # connector card can render with the same UI as the other drawers.
+    targets_all, _ = fetch_all_targets()
+    target_map = {t.get("id"): t for t in targets_all}
+    enriched_paths = []
+    seen_targets = set()
+    for r in rows:
+        target = target_map.get(r["target_id"])
+        if not target:
+            continue
+        # Find the matching connection in the cached per-target list.
+        target_conns, _err = fetch_target_connections(r["target_id"])
+        conn_obj = next((c for c in target_conns if c.get("id") == r["connection_id"]), None)
+        if not conn_obj:
+            continue
+        enriched_conn = _enrich_connection(target, conn_obj, my_user_id=me_id)
+        enriched_paths.append({
+            "target": _enrich_target(target),
+            "target_id": r["target_id"],
+            "connection": enriched_conn,
+            "first_seen_at": r["first_seen_at"],
+            "last_seen_at": r["last_seen_at"],
+        })
+        seen_targets.add(r["target_id"])
+
+    me_for_template, _ = fetch_me()
+    if me_for_template:
+        me_for_template = dict(me_for_template, owner_id=me_id)
+    owners_list = db_unique_owners()
+
+    last_sync_completed = db_app_state_get("last_sync_completed_at")
+    try:
+        last_sync_completed = int(last_sync_completed) if last_sync_completed else None
+    except (TypeError, ValueError):
+        last_sync_completed = None
+
+    return render_template(
+        "new_paths.html",
+        paths=enriched_paths,
+        total=len(enriched_paths),
+        since=since_param,
+        since_label=since_label,
+        min_score=min_score,
+        owner_filter=owner_filter,
+        owners_list=owners_list,
+        me=me_for_template,
+        last_sync_completed=last_sync_completed,
+        active="new_paths",
+        api_key_set=bool(API_KEY),
+    )
+
+
 @app.route("/sync/status", methods=["GET"])
 def sync_status():
     """JSON snapshot of background sync state. Polled by the nav status pill."""
@@ -1068,9 +1675,18 @@ def sync_status():
 
 @app.route("/sync/start", methods=["POST"])
 def sync_start():
-    """Manually trigger a sync. Idempotent if one is already running."""
-    started = start_sync()
-    return jsonify({"started": started, "state": sync_progress_snapshot()})
+    """Manually trigger a sync. ?force=1 re-fetches every target regardless of cache age.
+
+    Idempotent if one is already running.
+    """
+    force = request.args.get("force") == "1" or (request.get_json(silent=True) or {}).get("force") is True
+    started = start_sync(force_all=force)
+    return jsonify({"started": started, "force": force, "state": sync_progress_snapshot()})
+
+
+# Kick off the scheduled-sync daemon on module import (fires every
+# SYNC_INTERVAL_HOURS in addition to the auto-trigger on first page load).
+start_scheduled_sync()
 
 
 if __name__ == "__main__":

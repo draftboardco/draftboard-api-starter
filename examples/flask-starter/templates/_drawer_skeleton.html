@@ -150,5 +150,66 @@
     }
     showToast('Body filled with plain text.');
   };
+
+  // "Assigned to teammate" dropdown — show/hide on click. Auto-closes on outside click.
+  window.toggleAssignMenu = function (e, btn) {
+    e.preventDefault();
+    e.stopPropagation();
+    var wrapper = btn.parentElement;
+    var menu = wrapper.querySelector('ul');
+    if (!menu) return;
+    // Close any other open assign menus first
+    document.querySelectorAll('[data-no-drawer] > ul:not(.hidden)').forEach(function (m) {
+      if (m !== menu) m.classList.add('hidden');
+    });
+    menu.classList.toggle('hidden');
+  };
+
+  // Click outside any open assign menu → close it
+  document.addEventListener('click', function (e) {
+    document.querySelectorAll('[data-no-drawer] > ul:not(.hidden)').forEach(function (menu) {
+      if (!menu.parentElement.contains(e.target)) menu.classList.add('hidden');
+    });
+  });
+
+  // Assign-to-teammate: open Gmail compose for an email TO the teammate asking
+  // them to ping their connector for an intro. Plain text only — we don't
+  // currently have the teammate's email address (separate API gap).
+  window.assignToTeammate = function (e, link) {
+    e.preventDefault();
+    var subject = link.getAttribute('data-subject') || '';
+    var body = link.getAttribute('data-plain-body') || '';
+    var url = 'https://mail.google.com/mail/?view=cm&fs=1' +
+              '&su=' + encodeURIComponent(subject) +
+              '&body=' + encodeURIComponent(body);
+    window.open(url, '_blank');
+    // Close the dropdown
+    var menu = link.closest('ul');
+    if (menu) menu.classList.add('hidden');
+    showToast('Drafted email to teammate. Add their email address in the "To" field before sending.', 6000);
+  };
+
+  // Account-drawer left-column target click → swap the right-column connectors
+  // panel without losing the targets list. Lives here (not in the drawer
+  // template) because <script> tags inserted via innerHTML don't execute.
+  window.selectAccountTarget = function (btn, targetId) {
+    var rightCol = document.getElementById('account-drawer-right');
+    if (!rightCol) return;
+    document.querySelectorAll('[data-account-target-id]').forEach(function (el) {
+      el.classList.remove('bg-indigo-50', 'border-indigo-500');
+      el.classList.add('border-transparent');
+    });
+    btn.classList.add('bg-indigo-50', 'border-indigo-500');
+    btn.classList.remove('border-transparent');
+    rightCol.innerHTML = '<div class="p-12 text-center text-slate-500">Loading paths…</div>';
+    fetch('/target/' + encodeURIComponent(targetId) + '/connectors-panel',
+          { headers: { 'Accept': 'text/html' } })
+      .then(function (r) { return r.text(); })
+      .then(function (html) { rightCol.innerHTML = html; })
+      .catch(function (e) {
+        rightCol.innerHTML = '<div class="p-6 text-rose-700">Failed: ' +
+          (e && e.message ? e.message : e) + '</div>';
+      });
+  };
 })();
 </script>

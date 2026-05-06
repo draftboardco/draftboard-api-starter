@@ -86,29 +86,6 @@
   </div>
 </div>
 
-<script>
-(function () {
-  // Switch which target is selected on the left, and fetch the new connectors panel for the right.
-  window.selectAccountTarget = function (btn, targetId) {
-    var rightCol = document.getElementById('account-drawer-right');
-    if (!rightCol) return;
-    // Update visual selection
-    document.querySelectorAll('[data-account-target-id]').forEach(function (el) {
-      el.classList.remove('bg-indigo-50', 'border-indigo-500');
-      el.classList.add('border-transparent');
-    });
-    btn.classList.add('bg-indigo-50', 'border-indigo-500');
-    btn.classList.remove('border-transparent');
-    // Loading state
-    rightCol.innerHTML = '<div class="p-12 text-center text-slate-500">Loading paths…</div>';
-    // Fetch new fragment
-    fetch('/target/' + encodeURIComponent(targetId) + '/connectors-panel', { headers: { 'Accept': 'text/html' } })
-      .then(function (r) { return r.text(); })
-      .then(function (html) { rightCol.innerHTML = html; })
-      .catch(function (e) {
-        rightCol.innerHTML = '<div class="p-6 text-rose-700">Failed: ' + (e && e.message ? e.message : e) + '</div>';
-      });
-  };
-})();
-</script>
+{# selectAccountTarget JS is defined in _drawer_skeleton.html (parent page),
+   not here — scripts inserted via innerHTML don't execute. #}
 

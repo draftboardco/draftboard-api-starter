@@ -24,13 +24,14 @@
           {% endif %}
         </p>
       </div>
-      <div class="flex items-center gap-2">
+      <div class="flex items-center gap-3 flex-wrap">
+        {% include "_owner_filter.html" %}
         {% if cache_age is not none %}
           <span class="text-[11px] text-slate-400">
             cached {{ cache_age }}s ago
           </span>
         {% endif %}
-        <a href="/accounts?refresh=1{% if query %}&q={{ query|urlencode }}{% endif %}"
+        <a href="/accounts?refresh=1{% if query %}&q={{ query|urlencode }}{% endif %}{% if owner_filter %}&owner={{ owner_filter }}{% endif %}"
            class="text-xs px-3 py-1.5 rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">
           Refresh
         </a>

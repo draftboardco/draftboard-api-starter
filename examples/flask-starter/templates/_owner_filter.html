@@ -1,0 +1,32 @@
+{# Owner filter pill. Required vars:
+     owners_list — list of {id, first, last, name, target_count}
+     owner_filter — current value of ?owner=...
+     me — dict with user_id (or None if /me unavailable)
+     active — "targets" or "accounts" — used to point the form action correctly
+#}
+{% if owners_list %}
+  {% set form_action = '/' if active == 'targets' else '/accounts' %}
+  {% set base_qs = ('q=' ~ (query|urlencode) ~ '&') if query else '' %}
+  <form method="GET" action="{{ form_action }}" class="inline-block">
+    {% if query %}<input type="hidden" name="q" value="{{ query }}">{% endif %}
+    <label class="inline-flex items-center gap-2 text-xs">
+      <span class="text-slate-500">Owner:</span>
+      <select name="owner" onchange="this.form.submit()"
+              class="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-indigo-500">
+        <option value="" {% if not owner_filter %}selected{% endif %}>All paths</option>
+        {% if me and me.owner_id %}
+          <option value="me" {% if owner_filter == 'me' or (owner_filter == me.owner_id) %}selected{% endif %}>
+            Owned by you{% if me.user_first %} ({{ me.user_first }}){% endif %}
+          </option>
+        {% endif %}
+        {% for o in owners_list %}
+          {% if not me or not me.owner_id or o.id != me.owner_id %}
+            <option value="{{ o.id }}" {% if owner_filter == o.id %}selected{% endif %}>
+              {{ o.name }} ({{ o.target_count }})
+            </option>
+          {% endif %}
+        {% endfor %}
+      </select>
+    </label>
+  </form>
+{% endif %}
