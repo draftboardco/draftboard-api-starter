@@ -104,8 +104,16 @@ TARGETS_CACHE_TTL = 300  # 5 minutes; Refresh button forces a re-fetch
 TAGS_CACHE_TTL = 600  # 10 minutes
 CONNECTIONS_CACHE_TTL = 24 * 3600  # 24 hours; SQLite-persisted connections
 ACCOUNT_FANOUT_LIMIT = 50  # max targets to fan out (mostly cache hits after sync)
-SYNC_CONCURRENCY = 5  # parallel /targets/{id}/connections fetches during bulk sync
+# Sync politeness — concurrency dropped from 5→2 + per-request delay added
+# after Draftboard's eng team flagged that bursting 5 parallel calls hit the
+# API too hard. Net rate ~3-4 req/sec instead of 5+.
+SYNC_CONCURRENCY = int(os.environ.get("SYNC_CONCURRENCY", "2"))
+SYNC_DELAY_SEC = float(os.environ.get("SYNC_DELAY_SEC", "0.3"))
 SYNC_INTERVAL_HOURS = float(os.environ.get("SYNC_INTERVAL_HOURS", "12"))  # background re-sync cadence
+# AUTO_SYNC_ENABLED gates BOTH the scheduled daemon AND the on-page-load
+# auto-trigger. Set to "false"/"0" to fully disable polling for read-only
+# testing on already-cached data. Manual /sync/start still works.
+AUTO_SYNC_ENABLED = os.environ.get("AUTO_SYNC_ENABLED", "true").strip().lower() not in ("false", "0", "no", "off")
 
 app = Flask(__name__)
 
@@ -205,6 +213,113 @@ def init_db():
                 updated_at INTEGER NOT NULL
             )
         """)
+
+        # Connector-first index: one row per (connector_key, target_id) pair.
+        # The Draftboard API mints a fresh `connection_id` for every
+        # (connector, target) combo — so to group "the same person across many
+        # targets" we use a stable `connector_key` (normalized LinkedIn URL,
+        # falling back to "name:firstname-lastname" when LinkedIn is missing).
+        # Migration first: if an older shape exists (no connector_key column),
+        # drop it so the CREATE TABLE below builds the new shape and the
+        # backfill repopulates from existing `connections` rows.
+        try:
+            cur = conn.execute("PRAGMA table_info(connector_paths)")
+            cols = {r[1] for r in cur.fetchall()}
+            if cols and "connector_key" not in cols:
+                conn.execute("DROP TABLE connector_paths")
+        except sqlite3.OperationalError:
+            pass
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS connector_paths (
+                connector_key TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                connection_id TEXT NOT NULL,
+                connector_first TEXT NOT NULL DEFAULT '',
+                connector_last TEXT NOT NULL DEFAULT '',
+                connector_linkedin TEXT NOT NULL DEFAULT '',
+                connector_title TEXT NOT NULL DEFAULT '',
+                connector_company TEXT NOT NULL DEFAULT '',
+                score INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (connector_key, target_id)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_connector_paths_key ON connector_paths(connector_key)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_connector_paths_score ON connector_paths(score DESC)")
+        conn.commit()
+
+
+def _compute_connector_key(connection):
+    """Stable identifier for a connector PERSON across all their (target, connection)
+    pairs. Prefers normalized LinkedIn URL; falls back to a hashed name.
+
+    Why we need this: Draftboard's API returns a fresh `connection_id` UUID for
+    every (connector, target) pair, so the same person Cory Moelis appears with
+    a different `id` for every target he can intro to. Grouping by `id` would
+    list each pair as a separate "connector". Grouping by `connector_key`
+    correctly clusters all of Cory's paths under one row in the Connections
+    list view.
+    """
+    linkedin = (connection.get("linkedinUrl") or "").strip()
+    if linkedin:
+        norm = _normalize_linkedin(linkedin)  # lowercase, no trailing slash
+        if norm:
+            return f"li:{norm}"
+    first = (connection.get("firstName") or "").strip().lower()
+    last = (connection.get("lastName") or "").strip().lower()
+    if first or last:
+        # Replace whitespace with dashes so the key is URL-safe.
+        return "name:" + re.sub(r"\s+", "-", f"{first}-{last}".strip("-"))
+    # Last resort — use the connection_id itself (unique per pair, which means
+    # this connector won't be deduped, but that's better than crashing).
+    return f"id:{connection.get('id') or 'unknown'}"
+
+
+def backfill_connector_paths():
+    """Populate connector_paths from existing rows in `connections`.
+
+    Always rebuilds when the table has rows missing connector_key (i.e. on
+    schema migration). Unlike discovered_paths, this is a pure index so
+    backfilling is fine — it's just rebuilding queryable structure from data
+    we already have.
+    """
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute("SELECT COUNT(*) FROM connector_paths")
+        existing = cur.fetchone()[0]
+        if existing > 0:
+            # Sanity: if every row has a connector_key already, skip. Otherwise rebuild.
+            cur = conn.execute("SELECT COUNT(*) FROM connector_paths WHERE connector_key = ''")
+            missing = cur.fetchone()[0]
+            if missing == 0:
+                return
+        conn.execute("DELETE FROM connector_paths")
+        cur = conn.execute("SELECT target_id, connections_json FROM connections WHERE error IS NULL")
+        rows = cur.fetchall()
+        for target_id, json_str in rows:
+            try:
+                conns = json.loads(json_str) or []
+            except Exception:
+                continue
+            for c in conns:
+                cid = c.get("id")
+                if not cid:
+                    continue
+                key = _compute_connector_key(c)
+                pos = c.get("position") or {}
+                conn.execute(
+                    "INSERT OR REPLACE INTO connector_paths "
+                    "(connector_key, target_id, connection_id, connector_first, connector_last, "
+                    " connector_linkedin, connector_title, connector_company, score) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        key, target_id, cid,
+                        c.get("firstName") or "",
+                        c.get("lastName") or "",
+                        c.get("linkedinUrl") or "",
+                        pos.get("title") or "",
+                        pos.get("companyName") or "",
+                        c.get("score") or 0,
+                    ),
+                )
         conn.commit()
 
 
@@ -298,6 +413,31 @@ def db_put_connections(target_id, connections, error):
                 "WHERE target_id = ? AND connection_id = ?",
                 (now, score, target_id, cid)
             )
+
+        # Connector-first index: refresh rows for this target. Delete-then-
+        # insert is simpler than diffing.
+        conn.execute("DELETE FROM connector_paths WHERE target_id = ?", (target_id,))
+        for c in (connections or []):
+            cid = c.get("id")
+            if not cid:
+                continue
+            key = _compute_connector_key(c)
+            pos = c.get("position") or {}
+            conn.execute(
+                "INSERT OR REPLACE INTO connector_paths "
+                "(connector_key, target_id, connection_id, connector_first, connector_last, "
+                " connector_linkedin, connector_title, connector_company, score) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    key, target_id, cid,
+                    c.get("firstName") or "",
+                    c.get("lastName") or "",
+                    c.get("linkedinUrl") or "",
+                    pos.get("title") or "",
+                    pos.get("companyName") or "",
+                    c.get("score") or 0,
+                ),
+            )
         conn.commit()
 
 
@@ -327,6 +467,89 @@ def db_query_new_paths(since_ts, min_score, owner_id=None, limit=200):
             }
             for r in cur.fetchall()
         ]
+
+
+def db_list_connectors(query=None, limit=200, offset=0):
+    """List unique connector PEOPLE (deduped by connector_key) who can intro to
+    at least one target. Sorted by intro_count desc, top_score desc.
+
+    `query` is a substring match against connector name + title + company.
+    """
+    args = []
+    where_sql = ""
+    if query:
+        like = f"%{query.lower()}%"
+        where_sql = (
+            " WHERE LOWER(connector_first || ' ' || connector_last) LIKE ? "
+            "    OR LOWER(connector_title) LIKE ? "
+            "    OR LOWER(connector_company) LIKE ? "
+        )
+        args.extend([like, like, like])
+    sql = (
+        "SELECT connector_key, "
+        "       MAX(connector_first) AS first, "
+        "       MAX(connector_last) AS last, "
+        "       MAX(connector_linkedin) AS linkedin, "
+        "       MAX(connector_title) AS title, "
+        "       MAX(connector_company) AS company, "
+        "       COUNT(DISTINCT target_id) AS intro_count, "
+        "       MAX(score) AS top_score "
+        "FROM connector_paths "
+        + where_sql +
+        "GROUP BY connector_key "
+        "ORDER BY intro_count DESC, top_score DESC "
+        "LIMIT ? OFFSET ?"
+    )
+    args.extend([limit, offset])
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(sql, args)
+        return [
+            {
+                "connector_key": r[0],
+                "first": r[1] or "",
+                "last": r[2] or "",
+                "name": (f"{r[1] or ''} {r[2] or ''}").strip() or "(unnamed)",
+                "linkedin": r[3] or "",
+                "title": r[4] or "",
+                "company": r[5] or "",
+                "intro_count": r[6],
+                "top_score": r[7],
+            }
+            for r in cur.fetchall()
+        ]
+
+
+def db_count_connectors(query=None):
+    args = []
+    where_sql = ""
+    if query:
+        like = f"%{query.lower()}%"
+        where_sql = (
+            " WHERE LOWER(connector_first || ' ' || connector_last) LIKE ? "
+            "    OR LOWER(connector_title) LIKE ? "
+            "    OR LOWER(connector_company) LIKE ? "
+        )
+        args.extend([like, like, like])
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT COUNT(DISTINCT connector_key) FROM connector_paths" + where_sql,
+            args,
+        )
+        return cur.fetchone()[0]
+
+
+def db_targets_for_connector(connector_key):
+    """All (target_id, connection_id, score) tuples this connector PERSON can
+    intro to. Sorted by score desc. `connection_id` is needed to find the
+    matching record inside the per-target cached JSON when rendering the drawer.
+    """
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT target_id, connection_id, score FROM connector_paths "
+            "WHERE connector_key = ? ORDER BY score DESC",
+            (connector_key,),
+        )
+        return [{"target_id": r[0], "connection_id": r[1], "score": r[2]} for r in cur.fetchall()]
 
 
 def db_app_state_get(key, default=None):
@@ -469,6 +692,7 @@ def db_intro_requests_for_target(target_id):
 # definition — Python doesn't hoist.)
 init_db()
 backfill_target_owners()
+backfill_connector_paths()
 
 
 def _auth_headers():
@@ -693,7 +917,8 @@ def fetch_target_connections(target_id, force=False):
 
 def _sync_one_target(t):
     """Fetch+cache connections for a single target; update sync state. Used by
-    the ThreadPoolExecutor in _sync_worker."""
+    the ThreadPoolExecutor in _sync_worker. Adds a small delay after each call
+    to keep request rate friendly (Draftboard's eng team flagged bursting)."""
     tid = t.get("id")
     if not tid:
         return
@@ -707,6 +932,8 @@ def _sync_one_target(t):
         _sync_state["completed"] += 1
         if err:
             _sync_state["errors"] += 1
+    if SYNC_DELAY_SEC > 0:
+        time.sleep(SYNC_DELAY_SEC)
 
 
 def _sync_worker(force_all=False):
@@ -782,8 +1009,14 @@ def _scheduled_sync_loop():
 
 
 def start_scheduled_sync():
-    """Spawn the scheduled sync daemon. Idempotent (no-op if already started)."""
+    """Spawn the scheduled sync daemon. Idempotent (no-op if already started).
+
+    Skipped entirely when AUTO_SYNC_ENABLED is false — useful for read-only
+    testing on already-cached data."""
     global _scheduled_thread
+    if not AUTO_SYNC_ENABLED:
+        print("[draftboard-starter] AUTO_SYNC_ENABLED=false — scheduled sync daemon NOT started.")
+        return
     if _scheduled_thread is not None and _scheduled_thread.is_alive():
         return
     _scheduled_thread = threading.Thread(target=_scheduled_sync_loop, daemon=True, name="scheduled-sync")
@@ -810,7 +1043,12 @@ def start_sync(force_all=False):
 
 
 def maybe_auto_start_sync(targets):
-    """Auto-start sync if we don't have full coverage and we're not already running."""
+    """Auto-start sync if we don't have full coverage and we're not already running.
+
+    Gated by AUTO_SYNC_ENABLED — set that env var to false/0 to fully disable
+    automatic polling (manual /sync/start still works)."""
+    if not AUTO_SYNC_ENABLED:
+        return
     with _sync_lock:
         if _sync_state["running"]:
             return
@@ -1572,6 +1810,124 @@ def toggle_intro_request():
         return jsonify({"error": "missing target_id or connection_id"}), 400
     new_state = db_intro_request_toggle(target_id, connection_id)
     return jsonify({"requested": new_state})
+
+
+@app.route("/connections", methods=["GET"])
+def connections_view():
+    """List of every connector who can intro to at least one target. Searchable,
+    paginated. Click any row → drawer with the targets they can intro to."""
+    q = (request.args.get("q") or "").strip()
+    try:
+        page = max(1, int(request.args.get("page") or "1"))
+    except ValueError:
+        page = 1
+    PAGE_SIZE = 100
+    total = db_count_connectors(query=q or None)
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = min(page, total_pages)
+    offset = (page - 1) * PAGE_SIZE
+    connectors = db_list_connectors(query=q or None, limit=PAGE_SIZE, offset=offset)
+
+    me_for_template, _ = fetch_me()
+    if me_for_template:
+        me_for_template = dict(me_for_template, owner_id=get_my_owner_id())
+
+    return render_template(
+        "connections.html",
+        connectors=connectors,
+        total_count=total,
+        showing_start=offset + 1 if total else 0,
+        showing_end=min(offset + PAGE_SIZE, total),
+        current_page=page,
+        total_pages=total_pages,
+        query=q,
+        me=me_for_template,
+        api_key_set=bool(API_KEY),
+        active="connections",
+    )
+
+
+@app.route("/connector/<path:connector_key>/drawer", methods=["GET"])
+def connector_drawer(connector_key):
+    """Drawer for a single connector PERSON — lists every target they can intro
+    to (across all the per-pair connection_ids the API mints), grouped by
+    company. Re-uses the connector-card UI but each card is one TARGET."""
+    paths = db_targets_for_connector(connector_key)
+    if not paths:
+        return ("<div class='p-6 text-rose-700'>No paths found for this connector. "
+                "It may have been removed since the last sync.</div>"), 404
+
+    targets_all, fetch_err = fetch_all_targets()
+    if fetch_err and not targets_all:
+        # The /targets API call failed (typical: 401/403 from a bad/expired key).
+        # Render an honest error inside the drawer so the user sees what happened
+        # instead of a silently-empty card list.
+        return (
+            "<div class='p-6 text-rose-700'>"
+            "<strong>Couldn't load target list:</strong> " + html.escape(fetch_err) +
+            "<p class='mt-2 text-sm'>The connector_paths index has the data, but we need the "
+            "Target metadata (name, title, company) to render each card. Refresh after fixing the "
+            "API key.</p>"
+            "</div>"
+        ), 200
+    target_map = {t.get("id"): t for t in targets_all}
+    me_id = get_my_owner_id()
+
+    connector_info = None
+    grouped = {}  # company_name (display) -> list of {target, card}
+    for p in paths:
+        target = target_map.get(p["target_id"])
+        if not target:
+            continue
+        # Look up the EXACT connection in the cached per-target JSON. We use
+        # the connection_id stored on this row (each (connector_person, target)
+        # pair has its own UUID that matches the JSON) rather than re-matching
+        # by linkedin URL, since linkedin is missing on some connections.
+        target_conns, _err = fetch_target_connections(p["target_id"])
+        conn_obj = next((c for c in target_conns if c.get("id") == p["connection_id"]), None)
+        if not conn_obj:
+            continue
+        if connector_info is None:
+            pos = conn_obj.get("position") or {}
+            connector_info = {
+                "key": connector_key,
+                "first": (conn_obj.get("firstName") or "").strip(),
+                "last": (conn_obj.get("lastName") or "").strip(),
+                "name": (
+                    (conn_obj.get("firstName") or "") + " " + (conn_obj.get("lastName") or "")
+                ).strip() or "(unnamed)",
+                "initials": _initials(conn_obj.get("firstName"), conn_obj.get("lastName")),
+                "linkedin": conn_obj.get("linkedinUrl") or "",
+                "title": pos.get("title") or "",
+                "company": pos.get("companyName") or "",
+            }
+        company = ((target.get("position") or {}).get("companyName") or "").strip() or "(unknown company)"
+        if company not in grouped:
+            grouped[company] = []
+        grouped[company].append({
+            "target": _enrich_target(target),
+            "target_id": p["target_id"],
+            "card": _enrich_connection(target, conn_obj, my_user_id=me_id),
+        })
+
+    # Sort companies by best score within group; sort items inside each group
+    # by score desc.
+    sorted_groups = []
+    for company, items in grouped.items():
+        items.sort(key=lambda x: x["card"]["score"], reverse=True)
+        sorted_groups.append({
+            "company": company,
+            "items": items,
+            "best_score": items[0]["card"]["score"] if items else 0,
+        })
+    sorted_groups.sort(key=lambda g: g["best_score"], reverse=True)
+
+    return render_template(
+        "_drawer_connector.html",
+        connector=connector_info,
+        groups=sorted_groups,
+        total_targets=len(paths),
+    )
 
 
 @app.route("/new-paths", methods=["GET"])

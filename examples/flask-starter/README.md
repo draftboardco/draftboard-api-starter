@@ -10,6 +10,7 @@ Use this as the reference for what you're building, or as a starting point you c
 |---|---|
 | `GET /` (Targets view) | Every target in your workspace, sorted by score, paginated 100/page, searchable. Click any row → drawer with paths to that target. Filter by which teammate owns the path. |
 | `GET /accounts` | Targets bundled by company, sorted by best path score, paginated 50/page. Click any row → two-column drawer (Targets on left, Mutual Connectors on right). Filter by owner. |
+| `GET /connections` | Every connector in your network who can intro to at least one target, sorted by intro count + top score. Searchable. Click any row → drawer showing the targets that connector can intro to, grouped by company, with Compose-email and Assign-to-teammate per target. |
 | `GET /new-paths` | Paths discovered recently (default: last 7 days, score ≥ 30). Filterable by lookback window, minimum score, and which teammate owns the path. Empty state has a "Force re-sync all paths" button to seed it from your existing data. |
 | `GET /import` | Paste LinkedIn URLs to add as new Targets, with tag suggestions pulled from your existing tags. |
 
@@ -87,6 +88,7 @@ The first page load takes ~1 minute on a workspace with thousands of targets (th
 | `connections` | One row per Target with the full JSON of `GET /targets/{id}/connections` and a `fetched_at` timestamp. 24-hour TTL. |
 | `target_owners` | Denormalized index of `(target_id, owner_id)` pairs with each owner's name and LinkedIn URL. Powers the owner filter. |
 | `discovered_paths` | One row per `(target_id, connection_id)` pair, with `first_seen_at` set on first discovery. Powers the New paths tab. **Never backfilled** — only fills as new sync data arrives. |
+| `connector_paths` | Connector-first index: one row per `(connector_key, target_id)` pair where `connector_key` is the connector's normalized LinkedIn URL (or name fallback). Lets the Connections view group all of "Cory Moelis"'s 60+ paths under one row even though the API mints a fresh `connection_id` for each (connector, target) pair. Backfilled from existing data on startup. |
 | `intro_requests` | Local-only "Mark as requested" state (currently hidden in the UI but the toggle endpoint and table are wired up). |
 | `app_state` | Key-value store. Currently records `last_sync_completed_at` for the "Since last sync" filter. |
 

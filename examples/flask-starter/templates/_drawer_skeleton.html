@@ -52,6 +52,12 @@
       openDrawer('/account/' + encodeURIComponent(accountEl.getAttribute('data-account-key')) + '/drawer');
       return;
     }
+    var connectorEl = e.target.closest('[data-connector-id]');
+    if (connectorEl) {
+      e.preventDefault();
+      openDrawer('/connector/' + encodeURIComponent(connectorEl.getAttribute('data-connector-id')) + '/drawer');
+      return;
+    }
   });
 
   // Esc closes drawer
