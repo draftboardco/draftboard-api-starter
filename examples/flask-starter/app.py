@@ -214,6 +214,19 @@ def init_db():
             )
         """)
 
+        # Persistent cache of /targets metadata. Until this table has data, the
+        # Targets/Accounts/New-paths views can't render (they need names, titles,
+        # companies). One successful fetch_all_targets() call populates it; from
+        # then on the app can run fully offline (AUTO_SYNC_ENABLED=false) without
+        # any API calls.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS targets_cache (
+                target_id TEXT PRIMARY KEY,
+                data_json TEXT NOT NULL,
+                fetched_at INTEGER NOT NULL
+            )
+        """)
+
         # Connector-first index: one row per (connector_key, target_id) pair.
         # The Draftboard API mints a fresh `connection_id` for every
         # (connector, target) combo — so to group "the same person across many
@@ -552,6 +565,36 @@ def db_targets_for_connector(connector_key):
         return [{"target_id": r[0], "connection_id": r[1], "score": r[2]} for r in cur.fetchall()]
 
 
+def db_save_targets_cache(targets):
+    """Persist the /targets list to SQLite. Idempotent — INSERT OR REPLACE per id."""
+    if not targets:
+        return
+    now = int(time.time())
+    with _db_lock, _db_connect() as conn:
+        for t in targets:
+            tid = t.get("id")
+            if not tid:
+                continue
+            conn.execute(
+                "INSERT OR REPLACE INTO targets_cache (target_id, data_json, fetched_at) VALUES (?, ?, ?)",
+                (tid, json.dumps(t), now),
+            )
+        conn.commit()
+
+
+def db_load_targets_cache():
+    """Read the persisted /targets list. Returns ([], None) when empty."""
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute("SELECT data_json FROM targets_cache")
+        rows = cur.fetchall()
+    if not rows:
+        return [], None
+    try:
+        return [json.loads(r[0]) for r in rows], None
+    except Exception as e:
+        return [], f"corrupt targets_cache: {e}"
+
+
 def db_app_state_get(key, default=None):
     with _db_lock, _db_connect() as conn:
         cur = conn.execute("SELECT value FROM app_state WHERE key = ?", (key,))
@@ -703,11 +746,10 @@ def _auth_headers():
 
 
 def fetch_me(force=False):
-    """GET /me -> the customer + the API-key owner's user record. Cached.
+    """GET /me -> the customer + the API-key owner's user record.
 
-    Returns (data_dict, error). data_dict has keys: customer (with id, name)
-    and user (with id, firstName, lastName, linkedinUrl). The user.id is
-    what shows up in Connection.owners[] for paths "owned by you".
+    Persists to app_state for offline use. When AUTO_SYNC_ENABLED is false or
+    the API key is missing, reads from SQLite (no API call).
     """
     now = time.time()
     if (
@@ -716,11 +758,32 @@ def fetch_me(force=False):
         and (now - _me_cache["fetched_at"]) < ME_CACHE_TTL
     ):
         return _me_cache["data"], _me_cache["error"]
-    if not API_KEY:
-        return None, "DRAFTBOARD_API_KEY not set."
+
+    def _from_sqlite():
+        raw = db_app_state_get("me_data")
+        if not raw:
+            return None, None
+        try:
+            return json.loads(raw), None
+        except Exception:
+            return None, None
+
+    if not AUTO_SYNC_ENABLED or not API_KEY:
+        cached, _err = _from_sqlite()
+        if cached:
+            _me_cache.update({"data": cached, "error": None, "fetched_at": now})
+            return cached, None
+        if not API_KEY:
+            return None, "DRAFTBOARD_API_KEY not set and no cached /me data."
+        return None, "AUTO_SYNC_ENABLED=false and /me not yet cached."
+
     try:
         r = requests.get(f"{API_BASE}/me", headers=_auth_headers(), timeout=10)
         if r.status_code != 200:
+            cached, _err = _from_sqlite()
+            if cached:
+                _me_cache.update({"data": cached, "error": None, "fetched_at": now})
+                return cached, None
             err = f"GET /me returned {r.status_code}."
             _me_cache.update({"data": None, "error": err, "fetched_at": now})
             return None, err
@@ -735,9 +798,14 @@ def fetch_me(force=False):
             "user_last": user.get("lastName") or "",
             "user_linkedin": user.get("linkedinUrl") or "",
         }
+        db_app_state_set("me_data", json.dumps(result))
         _me_cache.update({"data": result, "error": None, "fetched_at": now})
         return result, None
     except requests.RequestException as e:
+        cached, _err = _from_sqlite()
+        if cached:
+            _me_cache.update({"data": cached, "error": None, "fetched_at": now})
+            return cached, None
         return None, f"Network error fetching /me: {e}"
 
 
@@ -777,7 +845,10 @@ def get_my_owner_id():
 
 
 def fetch_tags(force=False):
-    """GET /tags -> list of tag titles. Cached. Returns (list, error_or_None)."""
+    """GET /tags -> list of tag titles. Persisted to app_state for offline use.
+
+    Returns ([], err) when AUTO_SYNC_ENABLED=false and nothing's cached — the
+    import page just shows no suggestion chips."""
     now = time.time()
     if (
         not force
@@ -786,8 +857,22 @@ def fetch_tags(force=False):
     ):
         return _tags_cache["data"], _tags_cache["error"]
 
-    if not API_KEY:
-        return [], "DRAFTBOARD_API_KEY not set — suggestion chips will be empty."
+    def _from_sqlite():
+        raw = db_app_state_get("tags_data")
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:
+            return None
+
+    if not AUTO_SYNC_ENABLED or not API_KEY:
+        cached = _from_sqlite()
+        if cached is not None:
+            _tags_cache.update({"data": cached, "error": None, "fetched_at": now})
+            return cached, None
+        return [], "Tags not yet cached (offline mode)."
+
     try:
         r = requests.get(
             f"{API_BASE}/tags",
@@ -795,25 +880,34 @@ def fetch_tags(force=False):
             params={"resultPerPage": 200},
             timeout=10,
         )
-        if r.status_code == 401:
-            return [], "API key was rejected (401). Suggestion chips will be empty."
         if r.status_code != 200:
+            cached = _from_sqlite()
+            if cached is not None:
+                _tags_cache.update({"data": cached, "error": None, "fetched_at": now})
+                return cached, None
             return [], f"GET /tags returned {r.status_code}."
         data = r.json()
         tags = [t.get("title") for t in (data.get("tags") or []) if t.get("title")]
+        db_app_state_set("tags_data", json.dumps(tags))
         _tags_cache.update({"data": tags, "error": None, "fetched_at": now})
         return tags, None
     except requests.RequestException as e:
-        err = f"Network error fetching tags: {e}"
-        _tags_cache.update({"data": [], "error": err, "fetched_at": now})
-        return [], err
+        cached = _from_sqlite()
+        if cached is not None:
+            _tags_cache.update({"data": cached, "error": None, "fetched_at": now})
+            return cached, None
+        return [], f"Network error fetching tags: {e}"
 
 
 def fetch_all_targets(force=False):
-    """Paginate GET /targets and return (list, error_or_None). Cached.
+    """Get the /targets list. Persists results to SQLite so the app can run
+    fully offline once bootstrapped.
 
-    Loops pageNumber until nextPage == 0. Pulls 200/page (vs default 20) to
-    cut the number of round-trips on big workspaces.
+    Source priority:
+      1. In-memory cache, if fresh (<5 min old)
+      2. If AUTO_SYNC_ENABLED is false → SQLite only, no API call ever
+      3. API call → on success, persist to SQLite + memory
+      4. API failure → fall back to SQLite (stale-but-better-than-nothing)
     """
     now = time.time()
     if (
@@ -823,9 +917,23 @@ def fetch_all_targets(force=False):
     ):
         return _targets_cache["data"], _targets_cache["error"]
 
-    if not API_KEY:
-        return [], "DRAFTBOARD_API_KEY not set."
+    # Offline mode (or no key): read from SQLite, no API call.
+    if not AUTO_SYNC_ENABLED or not API_KEY:
+        sqlite_targets, sqlite_err = db_load_targets_cache()
+        if sqlite_targets:
+            _targets_cache.update({"data": sqlite_targets, "error": None, "fetched_at": now})
+            return sqlite_targets, None
+        if not API_KEY:
+            return [], "No API key set and no cached target list in SQLite. Add a key OR populate targets_cache."
+        # AUTO_SYNC_ENABLED is false but SQLite is empty.
+        return [], (
+            "AUTO_SYNC_ENABLED=false and targets_cache is empty. The app can't render "
+            "Targets/Accounts/New-paths views without target metadata. Either set "
+            "AUTO_SYNC_ENABLED=true once to bootstrap from /targets, or pre-populate the "
+            "targets_cache table."
+        )
 
+    # Online mode — try the API, persist on success, fall back to SQLite on failure.
     targets = []
     page = 1
     try:
@@ -836,9 +944,12 @@ def fetch_all_targets(force=False):
                 params={"pageNumber": page, "resultPerPage": 200},
                 timeout=30,
             )
-            if r.status_code == 401:
-                return [], "API key was rejected (401)."
             if r.status_code != 200:
+                # API failure — fall back to SQLite if we have anything cached.
+                sqlite_targets, _ = db_load_targets_cache()
+                if sqlite_targets:
+                    _targets_cache.update({"data": sqlite_targets, "error": None, "fetched_at": now})
+                    return sqlite_targets, f"API returned {r.status_code}; using cached target list from SQLite."
                 return [], f"GET /targets returned {r.status_code}."
             data = r.json()
             page_targets = data.get("targets") or []
@@ -849,11 +960,16 @@ def fetch_all_targets(force=False):
             page = next_page
             if page > 50:
                 break
+        # Persist the fresh list so we can survive future API outages.
+        db_save_targets_cache(targets)
         _targets_cache.update({"data": targets, "error": None, "fetched_at": now})
         return targets, None
     except requests.RequestException as e:
-        err = f"Network error fetching targets: {e}"
-        return [], err
+        sqlite_targets, _ = db_load_targets_cache()
+        if sqlite_targets:
+            _targets_cache.update({"data": sqlite_targets, "error": None, "fetched_at": now})
+            return sqlite_targets, f"Network error; using cached target list."
+        return [], f"Network error fetching targets: {e}"
 
 
 def cache_age_seconds():
@@ -867,7 +983,9 @@ def fetch_target_connections(target_id, force=False):
     """Paginate GET /targets/{id}/connections. SQLite-cached per-target.
 
     Returns (list, error_or_None). When `force=False`, returns the cached row
-    if it's within CONNECTIONS_CACHE_TTL seconds.
+    if it's within CONNECTIONS_CACHE_TTL seconds. When AUTO_SYNC_ENABLED is
+    false OR there's no API key, returns cached data even if stale (better
+    than nothing) and never makes an API call.
     """
     now = time.time()
     cached_data, fetched_at, cached_error = db_get_connections(target_id)
@@ -879,8 +997,11 @@ def fetch_target_connections(target_id, force=False):
     ):
         return cached_data, None
 
-    if not API_KEY:
-        return [], "DRAFTBOARD_API_KEY not set."
+    # Offline mode — never call the API. Return whatever we have, even stale.
+    if not AUTO_SYNC_ENABLED or not API_KEY:
+        if cached_data is not None:
+            return cached_data, None
+        return [], "Connections not cached for this target (offline mode)."
 
     connections = []
     page = 1

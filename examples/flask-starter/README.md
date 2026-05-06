@@ -89,8 +89,25 @@ The first page load takes ~1 minute on a workspace with thousands of targets (th
 | `target_owners` | Denormalized index of `(target_id, owner_id)` pairs with each owner's name and LinkedIn URL. Powers the owner filter. |
 | `discovered_paths` | One row per `(target_id, connection_id)` pair, with `first_seen_at` set on first discovery. Powers the New paths tab. **Never backfilled** — only fills as new sync data arrives. |
 | `connector_paths` | Connector-first index: one row per `(connector_key, target_id)` pair where `connector_key` is the connector's normalized LinkedIn URL (or name fallback). Lets the Connections view group all of "Cory Moelis"'s 60+ paths under one row even though the API mints a fresh `connection_id` for each (connector, target) pair. Backfilled from existing data on startup. |
+| `targets_cache` | Persisted /targets metadata (one row per target, full JSON). Populated on every successful `fetch_all_targets()` call. With this populated, the app runs entirely from SQLite and survives `AUTO_SYNC_ENABLED=false`. Until first bootstrap, the Targets / Accounts / New-paths views show empty states. |
 | `intro_requests` | Local-only "Mark as requested" state (currently hidden in the UI but the toggle endpoint and table are wired up). |
 | `app_state` | Key-value store. Currently records `last_sync_completed_at` for the "Since last sync" filter. |
+
+## Running fully offline
+
+Once `targets_cache` is populated by at least one successful sync, the app
+can run with **zero API calls** by setting `AUTO_SYNC_ENABLED=false`. In that
+mode:
+
+- `fetch_all_targets()`, `fetch_me()`, `fetch_tags()` all read exclusively
+  from SQLite — no HTTP requests to Draftboard's API.
+- `fetch_target_connections()` returns cached data (even stale), no API call.
+- The scheduled sync daemon doesn't start.
+- The on-page-load auto-trigger is gated off.
+- Manual `/sync/start` still works if you explicitly want to refresh.
+
+This is useful for read-only testing, demoing on a flight, or when you've
+hit Draftboard's rate limits and need the app to keep working.
 
 ## What it's missing (deliberately)
 
