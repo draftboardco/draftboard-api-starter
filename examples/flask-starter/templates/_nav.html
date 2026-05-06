@@ -1,0 +1,108 @@
+<nav class="mb-6 flex items-center justify-between border-b border-slate-200 pb-3 gap-3 flex-wrap">
+  <span class="text-sm font-semibold tracking-tight text-slate-900">Draftboard API starter</span>
+
+  <div class="flex items-center gap-3 flex-wrap">
+    <!-- Sync status pill (filled in by JS) -->
+    <div id="sync-status-pill" class="hidden text-xs">
+      <!-- populated dynamically -->
+    </div>
+
+    <div class="flex gap-1">
+      <a href="/"
+         class="px-3 py-1.5 text-sm rounded-md transition {% if active == 'targets' %}bg-indigo-100 text-indigo-700 font-medium{% else %}text-slate-600 hover:bg-slate-100{% endif %}">
+        Targets
+      </a>
+      <a href="/accounts"
+         class="px-3 py-1.5 text-sm rounded-md transition {% if active == 'accounts' %}bg-indigo-100 text-indigo-700 font-medium{% else %}text-slate-600 hover:bg-slate-100{% endif %}">
+        Accounts
+      </a>
+      <a href="/import"
+         class="px-3 py-1.5 text-sm rounded-md transition {% if active == 'import' %}bg-indigo-100 text-indigo-700 font-medium{% else %}text-slate-600 hover:bg-slate-100{% endif %}">
+        Import
+      </a>
+    </div>
+  </div>
+</nav>
+
+<script>
+(function () {
+  var pill = document.getElementById('sync-status-pill');
+  if (!pill) return;
+
+  var pollTimer = null;
+  var lastEndedAt = 0;
+  var hideTimer = null;
+
+  function render(state) {
+    if (!state || (state.total === 0 && !state.running)) {
+      pill.classList.add('hidden');
+      return;
+    }
+    pill.classList.remove('hidden');
+    var pct = state.percent || 0;
+    if (state.running) {
+      pill.innerHTML =
+        '<div class="flex items-center gap-2 px-3 py-1.5 rounded-md bg-indigo-50 border border-indigo-200 text-indigo-800">' +
+          '<span class="inline-block w-2 h-2 rounded-full bg-indigo-500 animate-pulse"></span>' +
+          '<span>Syncing paths <strong>' + state.completed + ' / ' + state.total + '</strong> ' +
+          '<span class="text-indigo-500">(' + pct + '%)</span></span>' +
+          (state.last_target_name ? '<span class="text-indigo-500 truncate max-w-[200px]">— ' + escapeHtml(state.last_target_name) + '</span>' : '') +
+        '</div>';
+    } else if (state.ended_at && state.ended_at > lastEndedAt) {
+      lastEndedAt = state.ended_at;
+      var msg = state.errors > 0
+        ? '✓ Synced ' + state.completed + ' / ' + state.total + ' (' + state.errors + ' errors)'
+        : '✓ All ' + state.total + ' paths synced — drawers are now instant';
+      pill.innerHTML =
+        '<div class="flex items-center gap-2 px-3 py-1.5 rounded-md bg-emerald-50 border border-emerald-200 text-emerald-800">' +
+          '<span>' + msg + '</span>' +
+          '<button type="button" onclick="resyncPaths()" class="text-emerald-700 hover:underline">Re-sync</button>' +
+        '</div>';
+      // Auto-hide success pill after 30s; keep it visible if there were errors
+      if (hideTimer) clearTimeout(hideTimer);
+      if (state.errors === 0) {
+        hideTimer = setTimeout(function () { pill.classList.add('hidden'); }, 30000);
+      }
+    } else {
+      // Not running, never started → hide
+      pill.classList.add('hidden');
+    }
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  function poll() {
+    fetch('/sync/status')
+      .then(function (r) { return r.json(); })
+      .then(function (state) {
+        render(state);
+        // Stop polling once sync completes
+        if (!state.running && pollTimer) {
+          clearInterval(pollTimer);
+          pollTimer = null;
+        }
+      })
+      .catch(function () {});
+  }
+
+  function startPolling() {
+    if (pollTimer) return;
+    pollTimer = setInterval(poll, 2500);
+  }
+
+  window.resyncPaths = function () {
+    fetch('/sync/start', { method: 'POST' })
+      .then(function (r) { return r.json(); })
+      .then(function () { poll(); startPolling(); });
+  };
+
+  // Initial check on page load — kicks off polling if a sync is running.
+  poll();
+  // Brief delayed second check to catch a sync that auto-started during the page render
+  setTimeout(function () { poll(); startPolling(); }, 800);
+})();
+</script>

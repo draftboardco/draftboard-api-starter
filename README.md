@@ -39,6 +39,7 @@ Same as claude.ai web — paste `CONTEXT.md` as a system prompt or custom instru
 - `CONTEXT.md` — the main artifact. Your AI's full briefing on Draftboard plus a step-by-step walkthrough of the recommended first build (a paste-import + daily-sync + 3-view dashboard that mirrors the Draftboard UI in the user's own stack). Includes the API reference, capacity caps, and what the API can't do.
 - `claude-skill/SKILL.md` — Claude Code skill version (same content + skill frontmatter).
 - `cursor-rules/draftboard.mdc` — Cursor rules version (same content + Cursor frontmatter).
+- `examples/flask-starter/` — a working reference implementation in Python + Flask. Implements the full foundation app from `CONTEXT.md`: import page, daily sync, Targets/Accounts views, two-column path detail drawer, Compose-email button. Run it with your own API key in ~5 commands. See [`examples/flask-starter/README.md`](examples/flask-starter/README.md) for setup.
 
 ## What this is not
 

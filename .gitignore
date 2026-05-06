@@ -7,3 +7,10 @@ node_modules/
 .venv/
 __pycache__/
 *.pyc
+# SQLite caches and logs from the Flask example — never commit (contains user data)
+data.db
+data.db-shm
+data.db-wal
+server.log
+*.sqlite
+*.sqlite3

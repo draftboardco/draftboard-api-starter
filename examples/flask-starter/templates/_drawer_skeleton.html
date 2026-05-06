@@ -1,0 +1,154 @@
+<!-- Drawer + backdrop. Hidden by default; shown by openDrawer(url) JS. -->
+<div id="drawer-backdrop" class="hidden fixed inset-0 bg-black/30 z-40 transition-opacity"
+     onclick="closeDrawer()"></div>
+<aside id="drawer"
+       class="hidden fixed top-0 right-0 h-full w-full max-w-4xl bg-white z-50 shadow-2xl overflow-y-auto"
+       aria-label="Detail drawer">
+  <div id="drawer-content">
+    <!-- filled by JS -->
+  </div>
+</aside>
+
+<script>
+(function () {
+  function openDrawer(url) {
+    var drawer = document.getElementById('drawer');
+    var backdrop = document.getElementById('drawer-backdrop');
+    var content = document.getElementById('drawer-content');
+    drawer.classList.remove('hidden');
+    backdrop.classList.remove('hidden');
+    content.innerHTML = '<div class="p-12 text-center text-slate-500">Loading...</div>';
+    fetch(url, { headers: { 'Accept': 'text/html' } })
+      .then(function (r) { return r.text(); })
+      .then(function (html) { content.innerHTML = html; })
+      .catch(function (e) {
+        content.innerHTML = '<div class="p-6 text-rose-700">Failed to load: ' + (e && e.message ? e.message : e) + '</div>';
+      });
+  }
+
+  function closeDrawer() {
+    document.getElementById('drawer').classList.add('hidden');
+    document.getElementById('drawer-backdrop').classList.add('hidden');
+  }
+
+  // Expose globally so inline onclick handlers in the partials can call them.
+  window.openDrawer = openDrawer;
+  window.closeDrawer = closeDrawer;
+
+  // Delegated click handler — any element with [data-target-id] or [data-account-key]
+  // opens the matching drawer. Stop propagation on links inside so they still work.
+  document.addEventListener('click', function (e) {
+    var noDrawer = e.target.closest('[data-no-drawer]');
+    if (noDrawer) return;
+    var targetEl = e.target.closest('[data-target-id]');
+    if (targetEl) {
+      e.preventDefault();
+      openDrawer('/target/' + encodeURIComponent(targetEl.getAttribute('data-target-id')) + '/drawer');
+      return;
+    }
+    var accountEl = e.target.closest('[data-account-key]');
+    if (accountEl) {
+      e.preventDefault();
+      openDrawer('/account/' + encodeURIComponent(accountEl.getAttribute('data-account-key')) + '/drawer');
+      return;
+    }
+  });
+
+  // Esc closes drawer
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') closeDrawer();
+  });
+
+  // Helper used by the drawer partials' Copy buttons
+  window.copyText = function (btn) {
+    var el = btn.closest('[data-draft]');
+    if (!el) return;
+    var text = el.getAttribute('data-draft');
+    navigator.clipboard.writeText(text).then(function () {
+      var orig = btn.textContent;
+      btn.textContent = 'Copied!';
+      setTimeout(function () { btn.textContent = orig; }, 1200);
+    });
+  };
+
+  // Toggle "Mark as requested" — POSTs to /intro_requests/toggle (button is hidden
+  // for now, but the handler stays here so we can re-enable without code changes).
+  window.toggleRequested = function (btn) {
+    var targetId = btn.getAttribute('data-target-id');
+    var connectionId = btn.getAttribute('data-connection-id');
+    btn.disabled = true;
+    fetch('/intro_requests/toggle', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target_id: targetId, connection_id: connectionId }),
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        btn.disabled = false;
+        if (data.requested) {
+          btn.textContent = '✓ Requested';
+          btn.classList.remove('bg-indigo-600', 'hover:bg-indigo-700', 'text-white');
+          btn.classList.add('bg-emerald-100', 'text-emerald-800', 'border', 'border-emerald-300');
+        } else {
+          btn.textContent = 'Mark as requested';
+          btn.classList.remove('bg-emerald-100', 'text-emerald-800', 'border', 'border-emerald-300');
+          btn.classList.add('bg-indigo-600', 'hover:bg-indigo-700', 'text-white');
+        }
+      })
+      .catch(function () { btn.disabled = false; });
+  };
+
+  // Toast helper — used by the Compose-email button to confirm clipboard state.
+  function showToast(msg, ms) {
+    var t = document.getElementById('app-toast');
+    if (!t) {
+      t = document.createElement('div');
+      t.id = 'app-toast';
+      t.className = 'fixed bottom-6 left-1/2 -translate-x-1/2 px-4 py-2 rounded-lg bg-slate-900 text-white text-sm shadow-lg z-[100] max-w-md text-center';
+      document.body.appendChild(t);
+    }
+    t.textContent = msg;
+    t.style.display = 'block';
+    clearTimeout(t._hideTimer);
+    t._hideTimer = setTimeout(function () { t.style.display = 'none'; }, ms || 4000);
+  }
+  window.showToast = showToast;
+
+  // Compose email: ALWAYS open Gmail with the plain-text body filled in via the
+  // URL (so the email is immediately usable). In parallel, try to copy a
+  // formatted HTML version (with the target's name hyperlinked to LinkedIn)
+  // to the clipboard — the user can paste over the body if they want the
+  // upgraded version, but they don't have to.
+  window.composeEmail = function (e, link) {
+    e.preventDefault();
+    var subject = link.getAttribute('data-subject') || '';
+    var plainBody = link.getAttribute('data-plain-body') || '';
+    var htmlBody = link.getAttribute('data-html-body') || '';
+    var fallbackBody = link.getAttribute('data-fallback-body') || plainBody;
+
+    // Always open Gmail with the plain-text body in the URL.
+    var params = 'view=cm&fs=1&su=' + encodeURIComponent(subject) +
+                 '&body=' + encodeURIComponent(fallbackBody);
+    window.open('https://mail.google.com/mail/?' + params, '_blank');
+
+    // Try to copy the HTML version to clipboard as an optional upgrade.
+    if (navigator.clipboard && window.ClipboardItem && htmlBody) {
+      try {
+        var item = new ClipboardItem({
+          'text/html': new Blob([htmlBody], { type: 'text/html' }),
+          'text/plain': new Blob([plainBody], { type: 'text/plain' }),
+        });
+        navigator.clipboard.write([item]).then(function () {
+          showToast('Body filled. Hyperlinked version is on your clipboard — paste over the body (Cmd/Ctrl+V) if you want the link version.', 6000);
+        }).catch(function () {
+          showToast('Body filled with plain text.');
+        });
+        return;
+      } catch (err) {
+        // ClipboardItem constructor can throw on older browsers — fall through
+      }
+    }
+    showToast('Body filled with plain text.');
+  };
+})();
+</script>

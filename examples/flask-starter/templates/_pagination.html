@@ -1,0 +1,27 @@
+{% if total_pages > 1 %}
+  <nav class="mt-6 flex items-center justify-between text-xs text-slate-600">
+    <div>
+      Showing <strong>{{ showing_start }}</strong>–<strong>{{ showing_end }}</strong> of <strong>{{ total_count }}</strong>
+    </div>
+    <div class="flex items-center gap-1">
+      {% set base_qs %}{% if query %}q={{ query|urlencode }}&amp;{% endif %}{% endset %}
+      {% if current_page > 1 %}
+        <a href="?{{ base_qs }}page={{ current_page - 1 }}"
+           class="px-2 py-1 rounded border border-slate-300 bg-white hover:bg-slate-50">← Prev</a>
+      {% else %}
+        <span class="px-2 py-1 rounded border border-slate-200 bg-slate-50 text-slate-400">← Prev</span>
+      {% endif %}
+      <span class="px-3 py-1 text-slate-700">Page <strong>{{ current_page }}</strong> of <strong>{{ total_pages }}</strong></span>
+      {% if current_page < total_pages %}
+        <a href="?{{ base_qs }}page={{ current_page + 1 }}"
+           class="px-2 py-1 rounded border border-slate-300 bg-white hover:bg-slate-50">Next →</a>
+      {% else %}
+        <span class="px-2 py-1 rounded border border-slate-200 bg-slate-50 text-slate-400">Next →</span>
+      {% endif %}
+    </div>
+  </nav>
+{% else %}
+  <div class="mt-4 text-xs text-slate-500 text-center">
+    Showing <strong>{{ showing_end }}</strong> of <strong>{{ total_count }}</strong>
+  </div>
+{% endif %}

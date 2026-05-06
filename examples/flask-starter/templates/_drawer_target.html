@@ -1,0 +1,73 @@
+{# Single-column target drawer (opened by clicking a row on the Targets page).
+   Required vars:
+     target  — enriched target
+     target_id — UUID
+     connections — list of enriched connections
+     error — error string or None
+#}
+<div class="p-6">
+  <header class="flex items-start justify-between gap-3 mb-5 pb-4 border-b border-slate-200">
+    <div class="flex items-center gap-3 min-w-0">
+      <div class="flex-shrink-0 w-12 h-12 rounded-full bg-indigo-100 text-indigo-700 flex items-center justify-center text-base font-semibold">
+        {{ target.initials }}
+      </div>
+      <div class="min-w-0">
+        <div class="text-lg font-semibold text-slate-900 truncate">{{ target.name }}</div>
+        <div class="text-sm text-slate-500 truncate">
+          {% if target.title %}{{ target.title }}{% endif %}
+          {% if target.title and target.company %} · {% endif %}
+          {% if target.company %}
+            <a data-no-drawer href="#" onclick="event.stopPropagation(); openDrawer('/account/' + encodeURIComponent('{{ target.company|e }}') + '/drawer'); return false;"
+               class="hover:text-indigo-700 hover:underline">{{ target.company }}</a>
+          {% endif %}
+        </div>
+        {% if target.tags %}
+          <div class="mt-1 flex flex-wrap gap-1">
+            {% for tag in target.tags %}
+              <span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-600">{{ tag }}</span>
+            {% endfor %}
+          </div>
+        {% endif %}
+      </div>
+    </div>
+    <button data-no-drawer onclick="closeDrawer()"
+            class="text-slate-400 hover:text-slate-900 text-2xl leading-none">&times;</button>
+  </header>
+
+  <div class="mb-5 flex items-center gap-6 text-sm">
+    <div>
+      <div class="text-2xl font-bold">{{ target.score }}</div>
+      <div class="text-[10px] text-slate-500 uppercase tracking-wide">top score</div>
+    </div>
+    <div>
+      <div class="text-2xl font-bold">{{ connections|length }}</div>
+      <div class="text-[10px] text-slate-500 uppercase tracking-wide">paths</div>
+    </div>
+    {% if target.linkedinUrl %}
+      <a data-no-drawer href="{{ target.linkedinUrl }}" target="_blank" rel="noopener"
+         class="ml-auto text-xs text-indigo-600 hover:underline">View on LinkedIn ↗</a>
+    {% endif %}
+  </div>
+
+  {% if error %}
+    <div class="mb-4 rounded border border-rose-300 bg-rose-50 p-3 text-sm text-rose-800">
+      <strong>Couldn't load paths:</strong> {{ error }}
+    </div>
+  {% endif %}
+
+  {% if connections %}
+    <h3 class="text-xs font-semibold uppercase tracking-wider text-slate-500 mb-3">
+      Paths to this target ({{ connections|length }})
+    </h3>
+    <div class="space-y-3">
+      {% for c in connections %}
+        {% include "_connector_card.html" with context %}
+      {% endfor %}
+    </div>
+  {% else %}
+    <div class="text-center py-12 text-sm text-slate-500">
+      No paths mapped yet for this target.<br>
+      New imports take up to ~24 hours to fully map.
+    </div>
+  {% endif %}
+</div>

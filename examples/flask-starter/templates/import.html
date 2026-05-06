@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Draftboard — Import targets</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+  <div class="max-w-2xl mx-auto px-6 py-10">
+    {% include "_nav.html" %}
+
+    <header class="mb-8">
+      <h1 class="text-2xl font-semibold tracking-tight">Import targets</h1>
+      <p class="text-sm text-slate-500 mt-1">
+        Paste LinkedIn URLs of prospects you want Draftboard to map warm intros for.
+      </p>
+    </header>
+
+    {% if not api_key_set %}
+      <div class="mb-6 rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+        <strong>DRAFTBOARD_API_KEY is not set.</strong>
+        The form will render, but submitting will not actually call the Draftboard API.
+        Set <code class="font-mono">DRAFTBOARD_API_KEY=db-api_&lt;UUID&gt;</code> and restart the server.
+      </div>
+    {% endif %}
+
+    <form method="POST" action="/import" class="space-y-6 bg-white border border-slate-200 rounded-lg p-6 shadow-sm">
+      <!-- LinkedIn URLs textarea -->
+      <div>
+        <label for="linkedin_urls" class="block text-sm font-medium text-slate-700 mb-1">
+          Paste their LinkedIn URLs
+        </label>
+        <p class="text-xs text-slate-500 mb-2">
+          Comma- or newline-separated. We accept <code>linkedin.com/in/&hellip;</code>,
+          <code>www.linkedin.com/in/&hellip;</code>, or full <code>https://</code> URLs &mdash; we normalize on submit.
+        </p>
+        <textarea
+          id="linkedin_urls"
+          name="linkedin_urls"
+          rows="6"
+          class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 font-mono"
+          placeholder="https://www.linkedin.com/in/janedoe&#10;https://www.linkedin.com/in/johnsmith"
+        >{{ prev_urls or '' }}</textarea>
+      </div>
+
+      <!-- Capacity warning -->
+      <div class="rounded-md border border-blue-200 bg-blue-50 px-4 py-3 text-xs text-blue-900">
+        <strong>Capacity:</strong> Core plans cap at ~<strong>300</strong> active targets/month.
+        Growth plans cap at ~<strong>1,000</strong>/month. Enterprise is custom.
+        The API does not expose your remaining capacity &mdash; check
+        <em>Settings &rarr; Billing</em> in Draftboard if you&rsquo;re unsure.
+      </div>
+
+      <!-- Tags section -->
+      <div>
+        <div class="flex items-center justify-between mb-1">
+          <label for="tags" class="block text-sm font-medium text-slate-700">Tags</label>
+          {% if tag_error %}
+            <span class="text-xs text-amber-700">{{ tag_error }}</span>
+          {% endif %}
+        </div>
+
+        {% if suggested_tags %}
+          <p class="text-xs text-slate-500 mb-2">Click a chip to add one of your existing tags:</p>
+          <div id="tag-chips" class="flex flex-wrap gap-2 mb-3">
+            {% for t in suggested_tags %}
+              <button type="button"
+                      data-tag="{{ t }}"
+                      class="tag-chip px-2.5 py-1 rounded-full text-xs border border-slate-300 bg-slate-50 hover:bg-indigo-50 hover:border-indigo-400 transition">
+                {{ t }}
+              </button>
+            {% endfor %}
+          </div>
+        {% else %}
+          <p class="text-xs text-slate-500 mb-2">
+            No suggested tags loaded yet. You can still type new tags below.
+          </p>
+        {% endif %}
+
+        <input
+          id="tags"
+          name="tags"
+          type="text"
+          value="{{ prev_tags or '' }}"
+          class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+          placeholder="e.g. Q3-Prospects, Mid-Market"
+        />
+
+        <!-- Tags-write-once warning (required by doc Step 2) -->
+        <p class="mt-2 text-xs text-slate-600">
+          <strong>Tags can&rsquo;t be changed after import.</strong>
+          Pick carefully &mdash; re-importing the same URL with new tags doesn&rsquo;t update existing tags.
+        </p>
+
+        <div class="mt-3 flex items-center gap-2">
+          <input id="no_tags" name="no_tags" type="checkbox"
+                 class="h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500" />
+          <label for="no_tags" class="text-xs text-slate-700">
+            I don&rsquo;t want to add any tags
+          </label>
+        </div>
+      </div>
+
+      <div class="pt-2">
+        <button type="submit"
+                class="inline-flex items-center justify-center rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2">
+          Import targets
+        </button>
+        <span class="ml-3 text-xs text-slate-500">
+          We&rsquo;ll start mapping paths immediately. Full results land within ~24h.
+        </span>
+      </div>
+    </form>
+
+    <!-- Results panel -->
+    {% if result %}
+      <section class="mt-8 bg-white border border-slate-200 rounded-lg p-6 shadow-sm">
+        <h2 class="text-lg font-semibold mb-3">Result</h2>
+
+        {% if result.warning %}
+          <div class="mb-4 rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+            {{ result.warning }}
+          </div>
+        {% endif %}
+
+        {% if result.ok %}
+          <p class="text-sm text-slate-700 mb-2">
+            Submitted <strong>{{ result.submitted_count }}</strong> URL(s).
+            Imported <strong>{{ result.imported }}</strong>.
+            Not imported <strong>{{ result.notImported }}</strong>.
+          </p>
+          <p class="text-xs text-slate-500 mb-3">
+            They&rsquo;ll be fully mapped within ~24 hours &mdash; check back tomorrow.
+          </p>
+          <a href="/" class="inline-flex items-center text-xs px-3 py-1.5 rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">
+            ← Back to Targets
+          </a>
+        {% else %}
+          <p class="text-sm text-rose-700 mb-2">Import did not complete.</p>
+        {% endif %}
+
+        {% if result.errors %}
+          <div class="mt-2">
+            <h3 class="text-xs font-semibold uppercase text-slate-500 mb-1">Errors</h3>
+            <ul class="list-disc list-inside text-sm text-rose-700 space-y-1">
+              {% for e in result.errors %}
+                <li>{{ e }}</li>
+              {% endfor %}
+            </ul>
+          </div>
+        {% endif %}
+
+        {% if result.tags_used %}
+          <div class="mt-3 text-xs text-slate-500">
+            Tags applied: {{ result.tags_used | join(', ') }}
+          </div>
+        {% endif %}
+
+        {% if result.urls %}
+          <details class="mt-3">
+            <summary class="text-xs text-slate-500 cursor-pointer">Normalized URLs ({{ result.urls|length }})</summary>
+            <ul class="mt-2 text-xs font-mono text-slate-600 space-y-0.5">
+              {% for u in result.urls %}<li>{{ u }}</li>{% endfor %}
+            </ul>
+          </details>
+        {% endif %}
+      </section>
+    {% endif %}
+
+    <footer class="mt-10 text-xs text-slate-400">
+      Step 2 of 7 &mdash; Draftboard API starter.
+    </footer>
+  </div>
+
+  <script>
+    // Tag chip click → append to the tags input.
+    document.querySelectorAll('.tag-chip').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var input = document.getElementById('tags');
+        var current = input.value.trim();
+        var tag = btn.getAttribute('data-tag');
+        var parts = current ? current.split(/\s*,\s*/).filter(Boolean) : [];
+        if (parts.indexOf(tag) === -1) parts.push(tag);
+        input.value = parts.join(', ');
+        // uncheck "no tags" if user is adding one
+        var nt = document.getElementById('no_tags');
+        if (nt) nt.checked = false;
+        input.focus();
+      });
+    });
+
+    // "I don't want to add any tags" → clear and disable the input.
+    var noTagsBox = document.getElementById('no_tags');
+    var tagsInput = document.getElementById('tags');
+    if (noTagsBox && tagsInput) {
+      noTagsBox.addEventListener('change', function () {
+        if (noTagsBox.checked) {
+          tagsInput.value = '';
+          tagsInput.disabled = true;
+        } else {
+          tagsInput.disabled = false;
+        }
+      });
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Draftboard — Targets</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+  <div class="max-w-4xl mx-auto px-6 py-10">
+    {% include "_nav.html" %}
+
+    <header class="mb-6 flex items-center justify-between flex-wrap gap-3">
+      <div>
+        <h1 class="text-2xl font-semibold tracking-tight">Targets</h1>
+        <p class="text-sm text-slate-500 mt-1">
+          {% if query %}
+            <strong>{{ total_count }}</strong> match{{ '' if total_count == 1 else 'es' }} for &ldquo;{{ query }}&rdquo;
+            <a href="/" class="ml-2 text-indigo-600 hover:underline">clear</a>
+          {% elif total_count > 0 %}
+            <strong>{{ total_count }}</strong> target{{ '' if total_count == 1 else 's' }} in your Draftboard workspace, sorted by score.
+          {% else %}
+            Your imported prospects will live here. Sorted by relationship strength.
+          {% endif %}
+        </p>
+      </div>
+      <div class="flex items-center gap-2">
+        {% if cache_age is not none %}
+          <span class="text-[11px] text-slate-400">
+            cached {{ cache_age }}s ago
+          </span>
+        {% endif %}
+        <a href="/?refresh=1{% if query %}&q={{ query|urlencode }}{% endif %}"
+           class="text-xs px-3 py-1.5 rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">
+          Refresh
+        </a>
+        <a href="/import"
+           class="text-xs px-3 py-1.5 rounded-md bg-indigo-600 text-white hover:bg-indigo-700">
+          + Import targets
+        </a>
+      </div>
+    </header>
+
+    <!-- Search bar -->
+    <form method="GET" action="/" class="mb-4">
+      <div class="relative">
+        <input type="search" name="q" value="{{ query or '' }}"
+               placeholder="Search by name, title, company, or tag..."
+               class="w-full rounded-md border border-slate-300 bg-white px-3 py-2 pr-20 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500" />
+        <button type="submit"
+                class="absolute right-1 top-1 bottom-1 px-3 text-xs rounded bg-slate-900 text-white hover:bg-slate-700">
+          Search
+        </button>
+      </div>
+    </form>
+
+    {% if not api_key_set %}
+      <div class="mb-6 rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+        <strong>DRAFTBOARD_API_KEY is not set.</strong>
+        Set <code class="font-mono">DRAFTBOARD_API_KEY=db-api_&lt;UUID&gt;</code> and restart the server to load real data.
+      </div>
+    {% endif %}
+
+    {% if error %}
+      <div class="mb-6 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">
+        <strong>Couldn't load targets:</strong> {{ error }}
+      </div>
+    {% endif %}
+
+    {% if total_count == 0 and not error %}
+      <!-- Empty state (or no search matches) -->
+      <div class="rounded-lg border border-dashed border-slate-300 bg-white py-16 px-6 text-center">
+        {% if query %}
+          <p class="text-base font-medium text-slate-700">No matches for &ldquo;{{ query }}&rdquo;.</p>
+          <p class="mt-2 text-sm text-slate-500">Try a different search, or <a href="/" class="text-indigo-600 hover:underline">clear</a> to see all targets.</p>
+        {% else %}
+          <p class="text-base font-medium text-slate-700">No targets yet.</p>
+          <p class="mt-2 text-sm text-slate-500 max-w-md mx-auto">
+            Import a list of LinkedIn URLs and Draftboard will start mapping warm-intro
+            paths through your network. New targets take up to ~24h to fully map.
+          </p>
+          <a href="/import"
+             class="mt-5 inline-flex items-center justify-center rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow hover:bg-indigo-700">
+            Import your first targets
+          </a>
+        {% endif %}
+      </div>
+    {% else %}
+      <!-- Targets list -->
+      <ul class="bg-white border border-slate-200 rounded-lg divide-y divide-slate-200 shadow-sm">
+        {% for t in targets %}
+          <li data-target-id="{{ t.id }}"
+              class="px-5 py-4 flex items-center gap-4 hover:bg-indigo-50 cursor-pointer transition">
+            <!-- Initials avatar -->
+            <div class="flex-shrink-0 w-10 h-10 rounded-full bg-indigo-100 text-indigo-700 flex items-center justify-center text-sm font-semibold">
+              {{ t.initials }}
+            </div>
+
+            <!-- Name + position -->
+            <div class="flex-1 min-w-0">
+              <div class="flex items-center gap-2 flex-wrap">
+                <span class="text-sm font-semibold text-slate-900 truncate">{{ t.name }}</span>
+                {% if t.linkedinUrl %}
+                  <a data-no-drawer href="{{ t.linkedinUrl }}" target="_blank" rel="noopener"
+                     onclick="event.stopPropagation()"
+                     class="text-[10px] text-slate-400 hover:text-indigo-700">↗ LinkedIn</a>
+                {% endif %}
+                {% if t.status and t.status != 'new' %}
+                  <span class="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded-full bg-slate-100 text-slate-600">{{ t.status }}</span>
+                {% endif %}
+              </div>
+              <div class="text-xs text-slate-500 truncate">
+                {% if t.title %}{{ t.title }}{% endif %}
+                {% if t.title and t.company %} · {% endif %}
+                {% if t.company %}{{ t.company }}{% endif %}
+              </div>
+              {% if t.tags %}
+                <div class="mt-1.5 flex flex-wrap gap-1">
+                  {% for tag in t.tags %}
+                    <span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-600">{{ tag }}</span>
+                  {% endfor %}
+                </div>
+              {% endif %}
+            </div>
+
+            <!-- Score + connection count -->
+            <div class="flex-shrink-0 flex items-center gap-3 text-xs">
+              <div class="text-right">
+                <div class="font-semibold text-slate-900">{{ t.score }}</div>
+                <div class="text-[10px] text-slate-500 uppercase tracking-wide">score</div>
+              </div>
+              <div class="text-right">
+                <div class="font-semibold text-slate-900">{{ t.connections_number }}</div>
+                <div class="text-[10px] text-slate-500 uppercase tracking-wide">paths</div>
+              </div>
+              <span class="text-slate-300 text-lg">›</span>
+            </div>
+          </li>
+        {% endfor %}
+      </ul>
+
+      {% include "_pagination.html" %}
+    {% endif %}
+
+    <footer class="mt-10 text-xs text-slate-400 text-center">
+      Draftboard API starter · Targets view · Click any row to see paths
+    </footer>
+  </div>
+
+  {% include "_drawer_skeleton.html" %}
+</body>
+</html>

@@ -1,0 +1,41 @@
+{# Right-column "Mutual Connections" panel.
+   Required vars:
+     panel — dict with keys: target (enriched), target_id, connections (list), error
+#}
+<div class="px-5 py-4">
+  <div class="flex items-center gap-2 mb-3">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-4 h-4 text-slate-500">
+      <path d="M16 11c1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3 1.34 3 3 3zm-8 0c1.66 0 3-1.34 3-3S9.66 5 8 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/>
+    </svg>
+    <h3 class="text-xs font-semibold uppercase tracking-wider text-slate-500">
+      Mutual Connections
+      {% if panel.connections %}({{ panel.connections|length }}){% endif %}
+    </h3>
+  </div>
+
+  {% if panel.target %}
+    <div class="mb-4 px-3 py-2 rounded-md bg-indigo-50/50 border border-indigo-100 text-xs text-slate-600">
+      Showing connectors who can intro to <strong class="text-slate-900">{{ panel.target.name }}</strong>
+      {% if panel.target.title %}({{ panel.target.title }}){% endif %}
+    </div>
+  {% endif %}
+
+  {% if panel.error %}
+    <div class="mb-3 rounded border border-rose-300 bg-rose-50 p-3 text-sm text-rose-800">
+      <strong>Couldn't load paths:</strong> {{ panel.error }}
+    </div>
+  {% endif %}
+
+  {% if panel.connections %}
+    <div class="space-y-3">
+      {% for c in panel.connections %}
+        {% include "_connector_card.html" with context %}
+      {% endfor %}
+    </div>
+  {% elif not panel.error %}
+    <div class="text-center py-12 text-sm text-slate-500">
+      No paths mapped yet for this target.<br>
+      New imports take up to ~24h to fully map.
+    </div>
+  {% endif %}
+</div>
