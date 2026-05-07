@@ -92,6 +92,22 @@ The first page load takes ~1 minute on a workspace with thousands of targets (th
 | `targets_cache` | Persisted /targets metadata (one row per target, full JSON). Populated on every successful `fetch_all_targets()` call. With this populated, the app runs entirely from SQLite and survives `AUTO_SYNC_ENABLED=false`. Until first bootstrap, the Targets / Accounts / New-paths views show empty states. |
 | `intro_requests` | Local-only "Mark as requested" state (currently hidden in the UI but the toggle endpoint and table are wired up). |
 | `app_state` | Key-value store. Currently records `last_sync_completed_at` for the "Since last sync" filter. |
+| `linkedin_resolutions` | Per-email cache for the LinkedIn resolver. One row per `email` with the resolved URL, confidence, source (apollo / cse / none), and reasoning. 30-day TTL. Avoids re-paying for Apollo/Google CSE/OpenAI calls when the same person gets resolved twice. |
+
+## LinkedIn resolver setup
+
+When the Google Workspace integration is connected, the Candidates page lists high-engagement contacts pulled from your Gmail and Calendar. To import any of them as a Draftboard Target you need their LinkedIn URL — the resolver finds it for you so you don't have to copy-paste.
+
+Two methods, tried in order:
+
+1. **Apollo `/people/match`** — fastest. POST `(email, first_name, last_name)`, get the LinkedIn URL back when Apollo knows the person. Hits ~50–70% of business contacts.
+2. **Google Custom Search + gpt-4o-mini** — fallback. Searches `"{first_name} {company} linkedin"`, recovers profile URLs (also from `linkedin.com/posts/...` URLs that Google ranks above the actual profile), dedupes results with snippet merging to bypass LinkedIn's cookie-consent boilerplate, and asks gpt-4o-mini to pick the right candidate.
+
+If both methods miss, the candidate row stays usable — you paste the LinkedIn URL manually before clicking Import.
+
+**All three keys are optional.** Configure none, some, or all via the in-app wizard at [`/settings/linkedin-resolver`](http://localhost:5050/settings/linkedin-resolver) — it has step-by-step setup links for Apollo, Google CSE, and OpenAI. Or set `APOLLO_API_KEY`, `GOOGLE_CSE_API_KEY`, `GOOGLE_CSE_ID`, and `OPENAI_API_KEY` in `.env` (see `env.example`). Wizard saves to `~/.draftboard-secrets/draftboard-api-starter-resolver.json` (mode 0600, owner-only).
+
+Resolutions are cached in SQLite for 30 days so re-resolving the same email is free. The wizard's "Test it" panel calls the resolver with `force: true` so you can verify your keys without waiting for a cache miss.
 
 ## Running fully offline
 

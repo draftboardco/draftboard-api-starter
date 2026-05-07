@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Draftboard — LinkedIn resolver setup</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    {% include "_nav.html" %}
+
+    <header class="mb-8">
+      <h1 class="text-2xl font-semibold tracking-tight">LinkedIn resolver setup</h1>
+      <p class="text-sm text-slate-500 mt-1">
+        Look up the LinkedIn profile of any person you have a name + email for, so you can import them as a Target with one click.
+      </p>
+    </header>
+
+    {% if saved %}
+      <div class="mb-6 rounded-md border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
+        Keys saved.
+      </div>
+    {% endif %}
+    {% if cleared %}
+      <div class="mb-6 rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+        Cleared selected keys.
+      </div>
+    {% endif %}
+
+    <!-- What this does -->
+    <section class="mb-6 rounded-lg border border-slate-200 bg-white p-6 shadow-sm">
+      <h2 class="text-lg font-semibold mb-2">What this does</h2>
+      <p class="text-sm text-slate-700 mb-3">
+        When you connect Gmail + Calendar (separate setup), the app finds high-engagement contacts and shows them on the Candidates page. To import any of them as a Draftboard Target, we need their LinkedIn URL. This page configures how we find that URL automatically.
+      </p>
+      <p class="text-sm text-slate-700 mb-3">
+        We try two methods, in order:
+      </p>
+      <ol class="list-decimal list-inside text-sm text-slate-700 space-y-1 mb-3">
+        <li><strong>Apollo</strong> — fastest. One API call, returns the LinkedIn URL directly when Apollo knows the person. Hits 50–70% of business contacts.</li>
+        <li><strong>Google search + AI ranking</strong> — fallback. Searches the web for "{first name} {company} linkedin", then asks gpt-4o-mini to pick the right profile. Slower but cheap.</li>
+      </ol>
+      <p class="text-sm text-slate-700">
+        All three keys are <strong>optional</strong>. Leave any blank and we just skip that method. If neither method finds the URL, the candidate row stays usable — you can paste a LinkedIn URL manually before importing.
+      </p>
+      <div class="mt-4 rounded-md border border-blue-200 bg-blue-50 px-4 py-3 text-xs text-blue-900">
+        <strong>Privacy:</strong> every lookup runs locally on your laptop. Names + emails go to Apollo and Google CSE per-call as needed. Draftboard's servers never see this data.
+      </div>
+    </section>
+
+    <!-- Status summary -->
+    <section class="mb-6 rounded-lg border border-slate-200 bg-white p-6 shadow-sm">
+      <h2 class="text-lg font-semibold mb-3">Status</h2>
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
+        <div class="flex items-center justify-between rounded-md border border-slate-200 px-3 py-2">
+          <span>Apollo</span>
+          {% if status.apollo_ready %}
+            <span class="text-emerald-700 font-medium">✓ Ready</span>
+          {% else %}
+            <span class="text-slate-400">Not configured</span>
+          {% endif %}
+        </div>
+        <div class="flex items-center justify-between rounded-md border border-slate-200 px-3 py-2">
+          <span>Google search + AI ranking</span>
+          {% if status.cse_ready %}
+            <span class="text-emerald-700 font-medium">✓ Ready</span>
+          {% else %}
+            <span class="text-slate-400">Not configured</span>
+          {% endif %}
+        </div>
+      </div>
+      {% if not status.any_ready %}
+        <p class="mt-3 text-xs text-amber-700">
+          No methods configured yet. Paste at least one set of keys below — Apollo alone is usually enough.
+        </p>
+      {% endif %}
+    </section>
+
+    <form method="POST" action="/settings/linkedin-resolver" class="space-y-6">
+
+      <!-- Apollo -->
+      <section class="rounded-lg border border-slate-200 bg-white p-6 shadow-sm">
+        <div class="flex items-baseline justify-between mb-2">
+          <h2 class="text-lg font-semibold">1. Apollo</h2>
+          <span class="text-xs text-slate-500">Recommended — fastest method</span>
+        </div>
+        <p class="text-sm text-slate-700 mb-3">
+          Apollo's <code class="text-xs bg-slate-100 rounded px-1">/people/match</code> endpoint accepts an email + name and returns the LinkedIn URL when it knows the person. Setup time: ~2 minutes.
+        </p>
+        <ol class="list-decimal list-inside text-sm text-slate-700 space-y-1 mb-3">
+          <li>Sign up at <a href="https://www.apollo.io/sign-up" target="_blank" rel="noopener" class="text-indigo-600 underline">apollo.io</a> (free tier exists).</li>
+          <li>Open <strong>Settings → Integrations → API</strong>.</li>
+          <li>Click <strong>Create New Key</strong> and copy the value.</li>
+          <li>Paste it below and Save.</li>
+        </ol>
+        <label for="apollo_api_key" class="block text-sm font-medium text-slate-700 mb-1">Apollo API key</label>
+        <input
+          type="password"
+          id="apollo_api_key"
+          name="apollo_api_key"
+          autocomplete="off"
+          placeholder="{% if status.apollo_present %}•••••••• (configured — paste a new key to replace){% else %}paste your Apollo API key{% endif %}"
+          class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+        />
+        {% if status.apollo_present %}
+          <label class="mt-2 inline-flex items-center text-xs text-slate-600 gap-1">
+            <input type="checkbox" name="clear_apollo_api_key" value="1" />
+            Clear the saved Apollo key
+          </label>
+        {% endif %}
+      </section>
+
+      <!-- Google CSE -->
+      <section class="rounded-lg border border-slate-200 bg-white p-6 shadow-sm">
+        <div class="flex items-baseline justify-between mb-2">
+          <h2 class="text-lg font-semibold">2. Google Custom Search</h2>
+          <span class="text-xs text-slate-500">Fallback when Apollo misses</span>
+        </div>
+        <p class="text-sm text-slate-700 mb-3">
+          Search the web for the person's LinkedIn profile. Free for the first 100 lookups per day. Setup time: ~5 minutes.
+        </p>
+        <ol class="list-decimal list-inside text-sm text-slate-700 space-y-1 mb-3">
+          <li>Open <a href="https://programmablesearchengine.google.com/" target="_blank" rel="noopener" class="text-indigo-600 underline">programmablesearchengine.google.com</a> and click <strong>Add</strong>.</li>
+          <li>Name it anything (e.g. "LinkedIn finder"). Toggle <strong>Search the entire web</strong> on. Click <strong>Create</strong>.</li>
+          <li>On the resulting page, copy the <strong>Search engine ID</strong> (looks like a long alphanumeric string).</li>
+          <li>Open <a href="https://console.cloud.google.com/apis/library/customsearch.googleapis.com" target="_blank" rel="noopener" class="text-indigo-600 underline">Custom Search API in Google Cloud Console</a>, click <strong>Enable</strong>.</li>
+          <li>Go to <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener" class="text-indigo-600 underline">Credentials</a> → <strong>Create Credentials → API key</strong>. Copy the key.</li>
+          <li>Paste both below and Save.</li>
+        </ol>
+        <label for="google_cse_api_key" class="block text-sm font-medium text-slate-700 mb-1">Google CSE API key</label>
+        <input
+          type="password"
+          id="google_cse_api_key"
+          name="google_cse_api_key"
+          autocomplete="off"
+          placeholder="{% if status.cse_key_present %}•••••••• (configured){% else %}paste your Google Cloud API key{% endif %}"
+          class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+        />
+        {% if status.cse_key_present %}
+          <label class="mt-2 inline-flex items-center text-xs text-slate-600 gap-1">
+            <input type="checkbox" name="clear_google_cse_api_key" value="1" />
+            Clear the saved CSE API key
+          </label>
+        {% endif %}
+
+        <label for="google_cse_id" class="block text-sm font-medium text-slate-700 mb-1 mt-4">Google CSE search-engine ID (cx)</label>
+        <input
+          type="text"
+          id="google_cse_id"
+          name="google_cse_id"
+          autocomplete="off"
+          placeholder="{% if status.cse_id_present %}•••••••• (configured){% else %}paste your Custom Search engine ID{% endif %}"
+          class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+        />
+        {% if status.cse_id_present %}
+          <label class="mt-2 inline-flex items-center text-xs text-slate-600 gap-1">
+            <input type="checkbox" name="clear_google_cse_id" value="1" />
+            Clear the saved CSE ID
+          </label>
+        {% endif %}
+      </section>
+
+      <!-- OpenAI -->
+      <section class="rounded-lg border border-slate-200 bg-white p-6 shadow-sm">
+        <div class="flex items-baseline justify-between mb-2">
+          <h2 class="text-lg font-semibold">3. OpenAI</h2>
+          <span class="text-xs text-slate-500">Only used with Google Custom Search</span>
+        </div>
+        <p class="text-sm text-slate-700 mb-3">
+          gpt-4o-mini ranks the top Google results to pick the right LinkedIn profile. Cost: roughly $0.0001 per lookup.
+        </p>
+        <ol class="list-decimal list-inside text-sm text-slate-700 space-y-1 mb-3">
+          <li>Open <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener" class="text-indigo-600 underline">platform.openai.com/api-keys</a>.</li>
+          <li>Click <strong>Create new secret key</strong>, name it (e.g. "Draftboard starter"), copy the value.</li>
+          <li>Paste below and Save.</li>
+        </ol>
+        <label for="openai_api_key" class="block text-sm font-medium text-slate-700 mb-1">OpenAI API key</label>
+        <input
+          type="password"
+          id="openai_api_key"
+          name="openai_api_key"
+          autocomplete="off"
+          placeholder="{% if status.openai_present %}•••••••• (configured){% else %}paste your OpenAI API key (starts with sk-…){% endif %}"
+          class="w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+        />
+        {% if status.openai_present %}
+          <label class="mt-2 inline-flex items-center text-xs text-slate-600 gap-1">
+            <input type="checkbox" name="clear_openai_api_key" value="1" />
+            Clear the saved OpenAI key
+          </label>
+        {% endif %}
+      </section>
+
+      <div class="flex items-center justify-between">
+        <p class="text-xs text-slate-500">
+          Saved to <code class="text-xs bg-slate-100 rounded px-1">{{ secrets_path }}</code> (read-only by you).
+        </p>
+        <button
+          type="submit"
+          class="rounded-md bg-indigo-600 hover:bg-indigo-500 px-4 py-2 text-sm font-medium text-white shadow-sm">
+          Save
+        </button>
+      </div>
+    </form>
+
+    <!-- Test -->
+    <section class="mt-10 rounded-lg border border-slate-200 bg-white p-6 shadow-sm">
+      <h2 class="text-lg font-semibold mb-2">Test it</h2>
+      <p class="text-sm text-slate-700 mb-3">
+        Paste a name + email of someone whose LinkedIn URL you already know — confirm the resolver returns the right URL.
+      </p>
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+        <input
+          type="text"
+          id="test_name"
+          placeholder="Full name (e.g. Jane Doe)"
+          class="rounded-md border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+        />
+        <input
+          type="email"
+          id="test_email"
+          placeholder="email@company.com"
+          class="rounded-md border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+        />
+      </div>
+      <button
+        type="button"
+        id="test_btn"
+        class="rounded-md bg-slate-900 hover:bg-slate-800 px-4 py-2 text-sm font-medium text-white shadow-sm disabled:opacity-50">
+        Resolve
+      </button>
+      <div id="test_result" class="mt-4"></div>
+    </section>
+  </div>
+
+  <script>
+    (function () {
+      var btn = document.getElementById('test_btn');
+      var nameEl = document.getElementById('test_name');
+      var emailEl = document.getElementById('test_email');
+      var out = document.getElementById('test_result');
+
+      function escapeHtml(s) {
+        return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+          return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+        });
+      }
+
+      function badgeColor(conf) {
+        if (conf === 'high') return 'bg-emerald-100 text-emerald-800';
+        if (conf === 'medium') return 'bg-amber-100 text-amber-800';
+        if (conf === 'low') return 'bg-orange-100 text-orange-800';
+        return 'bg-slate-100 text-slate-700';
+      }
+
+      btn.addEventListener('click', function () {
+        var name = nameEl.value.trim();
+        var email = emailEl.value.trim();
+        if (!name || !email) {
+          out.innerHTML = '<div class="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900">Name and email are both required.</div>';
+          return;
+        }
+        btn.disabled = true;
+        btn.textContent = 'Resolving…';
+        out.innerHTML = '';
+        fetch('/candidates/resolve', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: name, email: email, force: true }),
+        })
+          .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+          .then(function (resp) {
+            if (!resp.ok) {
+              out.innerHTML = '<div class="rounded-md border border-rose-300 bg-rose-50 px-3 py-2 text-sm text-rose-900">' + escapeHtml(resp.body.error || 'Request failed') + '</div>';
+              return;
+            }
+            var b = resp.body;
+            var conf = b.confidence || 'none';
+            var src = b.source || 'none';
+            var url = b.linkedin_url;
+            var html = '<div class="rounded-md border border-slate-200 bg-slate-50 px-4 py-3 text-sm">';
+            if (url) {
+              html += '<div class="mb-2"><a href="' + escapeHtml(url) + '" target="_blank" rel="noopener" class="text-indigo-600 underline font-medium">' + escapeHtml(url) + '</a></div>';
+            } else {
+              html += '<div class="mb-2 text-slate-500">No LinkedIn URL found.</div>';
+            }
+            html += '<div class="flex flex-wrap gap-2 text-xs mb-2">';
+            html += '<span class="rounded-full px-2 py-0.5 ' + badgeColor(conf) + '">confidence: ' + escapeHtml(conf) + '</span>';
+            html += '<span class="rounded-full px-2 py-0.5 bg-slate-100 text-slate-700">source: ' + escapeHtml(src) + '</span>';
+            if (b.full_name) html += '<span class="rounded-full px-2 py-0.5 bg-slate-100 text-slate-700">name: ' + escapeHtml(b.full_name) + '</span>';
+            html += '</div>';
+            if (b.reasoning) html += '<div class="text-xs text-slate-600 italic">' + escapeHtml(b.reasoning) + '</div>';
+            if (b.error) html += '<div class="text-xs text-rose-700 mt-1">error: ' + escapeHtml(b.error) + '</div>';
+            html += '</div>';
+            out.innerHTML = html;
+          })
+          .catch(function (err) {
+            out.innerHTML = '<div class="rounded-md border border-rose-300 bg-rose-50 px-3 py-2 text-sm text-rose-900">' + escapeHtml(err.message || 'Network error') + '</div>';
+          })
+          .finally(function () {
+            btn.disabled = false;
+            btn.textContent = 'Resolve';
+          });
+      });
+    })();
+  </script>
+</body>
+</html>

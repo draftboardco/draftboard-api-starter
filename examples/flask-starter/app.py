@@ -30,7 +30,25 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, render_template, request, jsonify, redirect, url_for
 import requests
 
+from linkedin_resolver import resolve_linkedin
+
 API_BASE = "https://intros.draftboard.com/api/v1/integration"
+
+# Where the LinkedIn resolver wizard saves the customer's Apollo / Google CSE /
+# OpenAI keys when env vars aren't set. Mirrors the storage pattern used for
+# the Draftboard API key (~/.draftboard-secrets/draftboard-api-starter).
+RESOLVER_SECRETS_PATH = os.path.expanduser(
+    "~/.draftboard-secrets/draftboard-api-starter-resolver.json"
+)
+RESOLVER_KEY_NAMES = ("apollo_api_key", "google_cse_api_key", "google_cse_id", "openai_api_key")
+RESOLVER_ENV_MAP = {
+    "apollo_api_key":     "APOLLO_API_KEY",
+    "google_cse_api_key": "GOOGLE_CSE_API_KEY",
+    "google_cse_id":      "GOOGLE_CSE_ID",
+    "openai_api_key":     "OPENAI_API_KEY",
+}
+# Cache hits within this window skip re-paying for Apollo/CSE/OpenAI calls.
+RESOLUTION_CACHE_TTL = 30 * 24 * 3600  # 30 days
 
 
 def _load_api_key():
@@ -89,6 +107,64 @@ def _load_api_key():
             pass
 
     return "", None
+
+
+def _load_resolver_keys() -> dict:
+    """Load the LinkedIn-resolver API keys, preferring env vars over the
+    secrets file. Returns a dict with all four `RESOLVER_KEY_NAMES`; missing
+    keys are empty strings.
+
+    Priority per key:
+      1. Environment variable (APOLLO_API_KEY etc.)
+      2. ~/.draftboard-secrets/draftboard-api-starter-resolver.json
+    """
+    keys = {name: "" for name in RESOLVER_KEY_NAMES}
+    file_data = {}
+    if os.path.exists(RESOLVER_SECRETS_PATH):
+        try:
+            with open(RESOLVER_SECRETS_PATH) as f:
+                file_data = json.load(f) or {}
+        except (OSError, ValueError):
+            file_data = {}
+    for name in RESOLVER_KEY_NAMES:
+        env_val = os.environ.get(RESOLVER_ENV_MAP[name], "").strip()
+        if env_val:
+            keys[name] = env_val
+        else:
+            keys[name] = (file_data.get(name) or "").strip()
+    return keys
+
+
+def _save_resolver_keys(updates: dict) -> None:
+    """Merge `updates` into the resolver secrets JSON file. Empty-string values
+    leave existing keys unchanged (use a literal "__clear__" sentinel to wipe
+    a key). Creates the secrets dir if it doesn't exist."""
+    existing = {}
+    if os.path.exists(RESOLVER_SECRETS_PATH):
+        try:
+            with open(RESOLVER_SECRETS_PATH) as f:
+                existing = json.load(f) or {}
+        except (OSError, ValueError):
+            existing = {}
+    for name in RESOLVER_KEY_NAMES:
+        if name not in updates:
+            continue
+        val = updates[name]
+        if val == "__clear__":
+            existing.pop(name, None)
+        elif val:
+            existing[name] = val
+        # else: empty string — leave existing untouched
+
+    secrets_dir = os.path.dirname(RESOLVER_SECRETS_PATH)
+    os.makedirs(secrets_dir, exist_ok=True)
+    # Write to a temp file then rename (atomic on POSIX) so a crash mid-write
+    # can't truncate the file. 0o600 perms — only the owner can read.
+    tmp = RESOLVER_SECRETS_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(existing, f, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, RESOLVER_SECRETS_PATH)
 
 
 API_KEY, _api_key_source = _load_api_key()
@@ -258,6 +334,25 @@ def init_db():
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_connector_paths_key ON connector_paths(connector_key)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_connector_paths_score ON connector_paths(score DESC)")
+
+        # LinkedIn resolution cache. One row per email — when /candidates/resolve
+        # finds a person's LinkedIn URL via Apollo or Google CSE, we cache the
+        # answer here so subsequent calls don't re-pay for API credits.
+        # `error` lets us cache "we tried and got nothing" to avoid retrying
+        # hopeless lookups on every page render.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS linkedin_resolutions (
+                email TEXT PRIMARY KEY,
+                name TEXT,
+                linkedin_url TEXT,
+                full_name TEXT,
+                confidence TEXT,
+                source TEXT,
+                reasoning TEXT,
+                resolved_at INTEGER NOT NULL,
+                error TEXT
+            )
+        """)
         conn.commit()
 
 
@@ -607,6 +702,62 @@ def db_app_state_set(key, value):
         conn.execute(
             "INSERT OR REPLACE INTO app_state (key, value, updated_at) VALUES (?, ?, ?)",
             (key, str(value), int(time.time()))
+        )
+        conn.commit()
+
+
+def db_get_resolution(email: str, ttl_sec: int = RESOLUTION_CACHE_TTL):
+    """Return a cached resolution dict for this email, or None if missing /
+    expired. Email is normalized (lowercased) before lookup so 'Bogdan@X.com'
+    and 'bogdan@x.com' share a row."""
+    if not email:
+        return None
+    key = email.strip().lower()
+    cutoff = int(time.time()) - ttl_sec
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT name, linkedin_url, full_name, confidence, source, reasoning, resolved_at, error "
+            "FROM linkedin_resolutions WHERE email = ? AND resolved_at >= ?",
+            (key, cutoff),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "name": row[0],
+        "linkedin_url": row[1],
+        "full_name": row[2],
+        "confidence": row[3],
+        "source": row[4],
+        "reasoning": row[5],
+        "resolved_at": row[6],
+        "error": row[7],
+        "cached": True,
+    }
+
+
+def db_put_resolution(email: str, name: str, result: dict):
+    """Persist a resolver result. Always overwrites the existing row so a
+    later attempt with better keys can supersede an earlier negative cache."""
+    if not email:
+        return
+    key = email.strip().lower()
+    now = int(time.time())
+    with _db_lock, _db_connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO linkedin_resolutions "
+            "(email, name, linkedin_url, full_name, confidence, source, reasoning, resolved_at, error) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                key, name or "",
+                result.get("linkedin_url"),
+                result.get("full_name"),
+                result.get("confidence") or "none",
+                result.get("source") or "none",
+                result.get("reasoning") or "",
+                now,
+                result.get("error"),
+            ),
         )
         conn.commit()
 
@@ -2159,6 +2310,96 @@ def sync_start():
     force = request.args.get("force") == "1" or (request.get_json(silent=True) or {}).get("force") is True
     started = start_sync(force_all=force)
     return jsonify({"started": started, "force": force, "state": sync_progress_snapshot()})
+
+
+def _resolver_status(keys: dict) -> dict:
+    """Summarize which resolver methods are usable given the configured keys.
+    Drives the "Apollo: configured" / "Google search: not configured" labels
+    on the wizard."""
+    apollo_ready = bool(keys.get("apollo_api_key"))
+    cse_ready = bool(keys.get("google_cse_api_key") and keys.get("google_cse_id") and keys.get("openai_api_key"))
+    return {
+        "apollo_ready": apollo_ready,
+        "cse_ready": cse_ready,
+        "any_ready": apollo_ready or cse_ready,
+        # Surface presence (not the value) so the template can show "configured"
+        # without exposing the secret. Env-sourced keys are also reflected here.
+        "apollo_present": bool(keys.get("apollo_api_key")),
+        "cse_key_present": bool(keys.get("google_cse_api_key")),
+        "cse_id_present": bool(keys.get("google_cse_id")),
+        "openai_present": bool(keys.get("openai_api_key")),
+    }
+
+
+@app.route("/settings/linkedin-resolver", methods=["GET"])
+def linkedin_resolver_settings():
+    """Render the resolver-keys wizard. Shows which methods are currently
+    usable and a paste-and-save form for each key."""
+    keys = _load_resolver_keys()
+    return render_template(
+        "settings_linkedin_resolver.html",
+        status=_resolver_status(keys),
+        secrets_path=RESOLVER_SECRETS_PATH,
+        saved=request.args.get("saved") == "1",
+        cleared=request.args.get("cleared") == "1",
+    )
+
+
+@app.route("/settings/linkedin-resolver", methods=["POST"])
+def save_linkedin_resolver_settings():
+    """Persist any non-empty resolver keys to the secrets JSON file. Empty
+    fields leave existing values untouched. A `clear_<name>` checkbox wipes
+    the corresponding key."""
+    updates = {}
+    cleared_any = False
+    for name in RESOLVER_KEY_NAMES:
+        if request.form.get(f"clear_{name}") == "1":
+            updates[name] = "__clear__"
+            cleared_any = True
+        else:
+            val = (request.form.get(name) or "").strip()
+            if val:
+                updates[name] = val
+    if updates:
+        _save_resolver_keys(updates)
+    target = url_for("linkedin_resolver_settings") + ("?cleared=1" if cleared_any else "?saved=1")
+    return redirect(target)
+
+
+@app.route("/candidates/resolve", methods=["POST"])
+def candidates_resolve():
+    """Resolve a single (name, email) pair to a LinkedIn URL.
+
+    Body: {"name": "...", "email": "...", "force": false}
+    Returns: full resolver result dict + a `cached` flag.
+
+    Cache-first: a fresh row in `linkedin_resolutions` (within
+    RESOLUTION_CACHE_TTL) is returned immediately without calling Apollo or
+    Google. Pass `force: true` to skip the cache.
+    """
+    body = request.get_json(silent=True) or {}
+    name = (body.get("name") or "").strip()
+    email = (body.get("email") or "").strip()
+    force = bool(body.get("force"))
+
+    if not name or not email:
+        return jsonify({"error": "name and email are required"}), 400
+
+    if not force:
+        cached = db_get_resolution(email)
+        if cached is not None:
+            return jsonify(cached)
+
+    keys = _load_resolver_keys()
+    result = resolve_linkedin(
+        name, email,
+        apollo_key=keys.get("apollo_api_key") or None,
+        cse_key=keys.get("google_cse_api_key") or None,
+        cse_id=keys.get("google_cse_id") or None,
+        openai_key=keys.get("openai_api_key") or None,
+    )
+    db_put_resolution(email, name, result)
+    return jsonify({**result, "cached": False})
 
 
 # Kick off the scheduled-sync daemon on module import (fires every
