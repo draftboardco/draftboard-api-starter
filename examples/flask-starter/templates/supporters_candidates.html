@@ -462,7 +462,10 @@
 
         function nextChunk() {
           fetch('/candidates/unresolved')
-            .then(function (r) { return r.json(); })
+            .then(function (r) {
+              if (!r.ok) throw new Error('unresolved-list HTTP ' + r.status);
+              return r.json();
+            })
             .then(function (data) {
               var remaining = data.remaining || 0;
               if (!data.contacts || data.contacts.length === 0) {
@@ -477,7 +480,19 @@
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ contacts: data.contacts })
               })
-                .then(function (r) { return r.json(); })
+                .then(function (r) {
+                  // The batch endpoint returns 400 with {error: ...} for empty/oversized
+                  // payloads. Without this check, an error response would be parsed as
+                  // a normal result and the loop would re-fire forever — silently burning
+                  // API quota and CPU.
+                  if (!r.ok) {
+                    return r.json().catch(function () { return {}; })
+                      .then(function (body) {
+                        throw new Error('batch HTTP ' + r.status + ': ' + (body.error || 'unknown'));
+                      });
+                  }
+                  return r.json();
+                })
                 .then(function (resp) {
                   totalResolved += (resp.hits || 0);
                   bulkProgress.textContent =
@@ -486,7 +501,7 @@
                 });
             })
             .catch(function (e) {
-              bulkProgress.textContent = '✗ Error: ' + (e && e.message || 'unknown');
+              bulkProgress.textContent = '✗ Stopped: ' + (e && e.message || 'unknown error');
               bulkBtn.disabled = false;
               bulkBtn.textContent = 'Resolve all LinkedIn URLs →';
             });

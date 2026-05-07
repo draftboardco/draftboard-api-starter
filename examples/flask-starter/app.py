@@ -2991,12 +2991,21 @@ def db_query_candidates(limit=200, offset=0, query="", contributor="", source=""
         status_map = {r[0]: r[1] for r in status_cur.fetchall()}
         # 1st-degree connection lookup: build a set of normalized LinkedIn URLs
         # from the user's existing Draftboard connector_paths network.
-        # Powers the "1st-degree ✓" / "connect on LinkedIn first →" badge.
+        # Powers the "1st°" badge on candidate rows.
+        #
+        # Normalization is done in Python (not SQL) so it matches
+        # _normalize_linkedin exactly — that helper strips query strings + anchors
+        # in addition to lowercasing and dropping trailing slashes. SQL-side
+        # normalization would miss matches when connector_paths has tracking
+        # suffixes (e.g. ?utm_source=...) that the resolver's URL doesn't.
         firstdegree_cur = conn.execute(
-            "SELECT DISTINCT LOWER(RTRIM(connector_linkedin, '/')) "
-            "FROM connector_paths WHERE connector_linkedin != ''"
+            "SELECT DISTINCT connector_linkedin FROM connector_paths "
+            "WHERE connector_linkedin != ''"
         )
-        firstdegree_set = {r[0] for r in firstdegree_cur.fetchall() if r[0]}
+        firstdegree_set = {
+            _normalize_linkedin(r[0]) for r in firstdegree_cur.fetchall() if r[0]
+        }
+        firstdegree_set.discard("")
         # And a separate lookup for resolved LinkedIn URLs from the resolver.
         resolved_cur = conn.execute(
             "SELECT email, linkedin_url FROM linkedin_resolutions WHERE linkedin_url IS NOT NULL AND linkedin_url != ''"
@@ -3084,7 +3093,18 @@ def db_set_candidate_status(email, status):
 def db_count_unresolved_candidates():
     """Count candidates that have NO row in linkedin_resolutions (i.e. never
     been tried). Used by the bulk-resolve toolbar button. Excludes hidden
-    candidates by default since the user already triaged them out."""
+    candidates by default since the user already triaged them out.
+
+    The "qualifying candidate" definition here MUST stay equivalent to what
+    db_query_candidates produces. The two queries use slightly different
+    shapes (this one is a flat UNION of three table-specific SELECTs;
+    db_query_candidates does a LEFT JOIN on the self side to surface the
+    meeting count alongside email columns) but the resulting *email sets*
+    are equivalent: a row qualifies if it's in gmail_contacts with
+    bidirectional email engagement, OR in calendar_contacts with at least
+    one meeting, OR in teammate_contacts meeting either rule. Keep these
+    rules in lock-step or the bulk-resolve "N unresolved" counter will
+    drift from the actual list of rows on the page."""
     with _db_lock, _db_connect() as conn:
         cur = conn.execute("""
             SELECT COUNT(*) FROM (
@@ -3495,6 +3515,11 @@ def candidates_set_status():
     status = (body.get("status") or "").strip()
     if not email:
         return jsonify({"error": "email required"}), 400
+    # RFC 5321 caps email at 254 chars; we keep some headroom but reject
+    # obviously-wrong inputs so a curl-loop or scripted-misuse can't bloat
+    # the candidate_status table to a ridiculous size.
+    if len(email) > 320:
+        return jsonify({"error": "email too long"}), 400
     if status and status not in ("starred", "hidden", "supporter"):
         return jsonify({"error": f"unknown status: {status}"}), 400
     db_set_candidate_status(email, status)
