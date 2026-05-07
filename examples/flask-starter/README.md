@@ -109,6 +109,50 @@ mode:
 This is useful for read-only testing, demoing on a flight, or when you've
 hit Draftboard's rate limits and need the app to keep working.
 
+## Google Workspace setup (Candidates page)
+
+The **Candidates** page (`/supporters/candidates`) ranks the people you actually engage with — by Gmail thread frequency + Calendar meetings — so likely Supporters surface automatically.
+
+> **Heads up: this is a single-user, single-laptop feature.** Each teammate runs their own copy of this app on their own laptop and sees only their own contacts. Candidates are local — they're **not** shared across teammates today. A "send my candidates to my teammate" portable scanner is on the roadmap (a one-line installer your teammate runs on their laptop, OAuths, exports a JSON of their network you import here). Until then, each person on a team scores their own network independently.
+
+**Customer flow is one click:** open `/settings/google` → click **Connect Google** → consent → ~5-minute sync runs → candidates ready. No setup ceremony, no per-customer Google Cloud project. All Gmail + Calendar data stays on your laptop in `data.db` — Draftboard's infrastructure never touches it.
+
+### Configuring the OAuth client (one-time, you do this once)
+
+The Flask app uses a single Draftboard-owned Google OAuth client (Testing mode, capped at 100 test-user emails per Google's rules). To run this kit yourself you need a `client_id` + `client_secret` for that client, set in any of:
+
+- `GOOGLE_CLIENT_ID` + `GOOGLE_CLIENT_SECRET` env vars
+- `.env` in this directory (see `env.example`)
+- `~/.draftboard-secrets/google.env` — looks for `DRAFTBOARD_STARTER_GOOGLE_CLIENT_ID` / `_SECRET` first, falls back to plain `GOOGLE_CLIENT_ID` / `_SECRET`
+
+If you haven't already created the OAuth client, here's the one-time setup (~10 min):
+
+1. Open https://console.cloud.google.com/projectcreate → name it `Draftboard Supporters`
+2. Enable [Gmail API](https://console.cloud.google.com/apis/library/gmail.googleapis.com) + [Calendar API](https://console.cloud.google.com/apis/library/calendar-json.googleapis.com)
+3. [OAuth consent screen](https://console.cloud.google.com/apis/credentials/consent): External → Testing → app name `Draftboard` → support + dev contact emails → add yourself (and any future customers) under **Test users**
+4. [Credentials](https://console.cloud.google.com/apis/credentials) → **+ Create credentials** → **OAuth client ID** → **Web application** → add `http://localhost:5050/auth/google/callback` to **Authorized redirect URIs** → Create → copy the resulting `client_id` + `client_secret`
+5. Save them under one of the locations above and restart the app.
+
+Once that's in place, customers see a "Connect Google" button at `/settings/google` and `/supporters/candidates`. They never see any of step 1-4.
+
+### Adding customer test users
+
+While the OAuth client is in Testing mode (no Google verification), only emails on your test-users allowlist can complete the OAuth flow — others get "Access blocked." Add new customers by editing the test-users list at https://console.cloud.google.com/apis/credentials/consent (under your project). Hard cap of 100 total. Past that, you'd need to push the consent screen to "In production" and go through Google's verification: ~2-4 weeks of paperwork for `calendar.readonly` only, or a paid CASA security audit ($15-75k, 2-6 months) for the full `gmail.readonly` scope. Defer that until you have customer demand.
+
+### What happens during sync
+
+The OAuth scopes are `gmail.readonly` + `calendar.readonly` (plus `userinfo.email` for display). After consent the app:
+
+1. Fetches up to `GOOGLE_THREADS_CAP` (default 2000) of your most-recent Gmail threads, scoped to the last `GOOGLE_HISTORY_DAYS` (default 365). Pulls metadata only — From/To/Cc/Date headers, no message bodies.
+2. Fetches up to `GOOGLE_EVENTS_CAP` (default 2500) Calendar events from the same window. Pulls attendee lists only.
+3. Aggregates into `gmail_contacts` + `calendar_contacts` tables. **The OAuth tokens are held in memory only and discarded the moment the sync finishes** — there's no persistent refresh token, no encryption ceremony, no daily-sync daemon.
+
+To re-sync (e.g., after a few months), the customer clicks **Re-sync (re-consent)** which kicks off a fresh OAuth flow.
+
+### Scoring
+
+For each contact: `(emails_sent + replies × 2 + threads × 3 + meetings × 5) × recency_decay`, where `recency_decay = max(0.1, 1 - days_since_last_contact / 365)`. Email-only contacts must show **bidirectional engagement** (≥ 1 email you sent AND ≥ 1 reply from them) — cold-outreach prospects who never replied and inbound newsletters you ignored are filtered out. Calendar-only contacts (shared meeting, but no email signal) are kept since attending a meeting together is bidirectional by definition.
+
 ## What it's missing (deliberately)
 
 - **No auth.** The app is single-tenant — whoever can hit `localhost:5050` sees everything in the workspace your API key belongs to. If you fork this for a multi-user product, layer your own auth.

@@ -117,6 +117,43 @@ AUTO_SYNC_ENABLED = os.environ.get("AUTO_SYNC_ENABLED", "true").strip().lower() 
 
 app = Flask(__name__)
 
+
+def _load_or_create_local_secret(filename, length=32):
+    """Read or generate a per-install secret stored in ~/.draftboard-secrets/.
+
+    Used for the Flask session cookie (which carries the Google OAuth `state`
+    nonce across the consent redirect). All local — never leaves the machine.
+    Files are 600-permissioned on creation.
+    """
+    secrets_dir = os.path.expanduser("~/.draftboard-secrets")
+    path = os.path.join(secrets_dir, filename)
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as f:
+                data = f.read().strip()
+            if data:
+                return data
+        except OSError:
+            pass
+    try:
+        os.makedirs(secrets_dir, exist_ok=True)
+        data = os.urandom(length)
+        with open(path, "wb") as f:
+            f.write(data)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return data
+    except OSError:
+        # If we can't write to ~/.draftboard-secrets, fall back to in-memory.
+        # The Flask session will reset on every restart and Google OAuth tokens
+        # won't persist across restarts — but the app still works mid-session.
+        return os.urandom(length)
+
+
+app.secret_key = _load_or_create_local_secret("flask_session_secret")
+
 # In-memory caches for the lightweight endpoints (targets list, tags list, /me).
 _targets_cache = {"data": None, "error": None, "fetched_at": 0}
 _tags_cache = {"data": None, "error": None, "fetched_at": 0}
@@ -258,6 +295,49 @@ def init_db():
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_connector_paths_key ON connector_paths(connector_key)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_connector_paths_score ON connector_paths(score DESC)")
+
+        # --- Google Workspace integration tables ---
+        # One-time scoring use case — the user clicks Connect Google, we run a
+        # single sync, populate the candidate tables, throw the access token
+        # away. No refresh tokens stored (avoids the 7-day testing-mode token
+        # expiry and the encryption ceremony around it). Re-syncing is just
+        # a fresh OAuth consent flow.
+        #
+        # Sync timing + last-account info live in the existing `app_state` K/V
+        # table under keys `google_account_email` and `google_last_synced_at`.
+
+        # Aggregated per-contact stats from the last 12 months of Gmail.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS gmail_contacts (
+                email TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                emails_sent INTEGER NOT NULL DEFAULT 0,
+                replies_received INTEGER NOT NULL DEFAULT 0,
+                threads_count INTEGER NOT NULL DEFAULT 0,
+                last_contact_at INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_gmail_contacts_threads ON gmail_contacts(threads_count DESC)")
+
+        # Aggregated per-contact stats from the last 12 months of Calendar.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS calendar_contacts (
+                email TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                meetings_count INTEGER NOT NULL DEFAULT 0,
+                last_met_at INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_calendar_contacts_meetings ON calendar_contacts(meetings_count DESC)")
+
+        # Migration: drop the older `oauth_tokens` + `google_sync_state` tables
+        # from the BYO architecture. Their data was always per-install and
+        # ephemeral, so dropping is safe.
+        conn.execute("DROP TABLE IF EXISTS oauth_tokens")
+        conn.execute("DROP TABLE IF EXISTS google_sync_state")
+
         conn.commit()
 
 
@@ -2159,6 +2239,724 @@ def sync_start():
     force = request.args.get("force") == "1" or (request.get_json(silent=True) or {}).get("force") is True
     started = start_sync(force_all=force)
     return jsonify({"started": started, "force": force, "state": sync_progress_snapshot()})
+
+
+# =====================================================================
+# Google Workspace integration (centralized OAuth, one-time sync)
+# =====================================================================
+#
+# Customer clicks "Connect Google" → Google consent → we exchange the auth
+# code for an access token, run ONE sync (~5 min), persist aggregated
+# per-contact stats to SQLite, throw the token away. No refresh tokens, no
+# encryption, no daemons, no 7-day expiry to manage.
+#
+# Re-syncing is just clicking Connect again. Each click is a fresh OAuth
+# flow + a fresh sync.
+#
+# Credentials: a SINGLE Draftboard-owned OAuth client (registered in the
+# "Draftboard Supporters" Google Cloud project, in Testing mode). Customers
+# whose email is on the project's test-users allowlist (managed by you in
+# the GCP console) can connect; everyone else gets Google's standard
+# "access blocked" message.
+#
+# Privacy: all Gmail + Calendar data stays on the customer's laptop in
+# `data.db`. Nothing is sent to Draftboard's infrastructure. The only thing
+# Draftboard sees during the OAuth flow is Google's confirmation that a
+# user with email X granted access to client Y — standard OAuth telemetry.
+
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/calendar.readonly",
+    "openid",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile",
+]
+
+GOOGLE_REDIRECT_URI = os.environ.get(
+    "GOOGLE_OAUTH_REDIRECT", "http://localhost:5050/auth/google/callback"
+).strip()
+GOOGLE_HISTORY_DAYS = int(os.environ.get("GOOGLE_HISTORY_DAYS", "365"))
+GOOGLE_THREADS_CAP = int(os.environ.get("GOOGLE_THREADS_CAP", "2000"))
+GOOGLE_EVENTS_CAP = int(os.environ.get("GOOGLE_EVENTS_CAP", "2500"))
+
+# Lazy imports — google-auth-oauthlib and google-api-python-client are in
+# requirements.txt; if the venv hasn't installed them yet we surface a clean
+# error instead of crashing on boot.
+_google_libs_error = None
+try:
+    from google_auth_oauthlib.flow import Flow as _GoogleFlow  # noqa: F401
+    from googleapiclient.discovery import build as _google_build  # noqa: F401
+    from googleapiclient.errors import HttpError as _GoogleHttpError  # noqa: F401
+except ImportError as _e:
+    _google_libs_error = (
+        f"Google integration libraries not installed ({_e}). Run "
+        "`pip install -r requirements.txt` to enable Gmail + Calendar sync."
+    )
+
+# Google's library refuses to issue a token over plain HTTP unless this is
+# set. We only override it when the redirect URI is loopback — anyone forking
+# this kit and deploying behind a real domain MUST not silently accept HTTP
+# OAuth callbacks.
+def _is_loopback_redirect(uri):
+    return uri.startswith("http://localhost") or uri.startswith("http://127.0.0.1") or uri.startswith("http://[::1]")
+
+
+if _is_loopback_redirect(GOOGLE_REDIRECT_URI):
+    os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
+else:
+    # Make sure a previous loopback run can't leak this setting into a deploy.
+    os.environ.pop("OAUTHLIB_INSECURE_TRANSPORT", None)
+
+
+def _google_libs_ready():
+    return _google_libs_error is None
+
+
+def _load_google_oauth_client():
+    """Load the centralized Google OAuth client_id + client_secret.
+
+    Priority order:
+      1. GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET env vars
+      2. .env file in this app's directory
+      3. ~/.draftboard-secrets/google.env (DRAFTBOARD_STARTER_GOOGLE_CLIENT_ID +
+         _SECRET, or plain GOOGLE_CLIENT_ID/_SECRET as a fallback)
+
+    Returns (client_id, client_secret, source_label).
+    """
+    cid = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
+    cs = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
+    if cid and cs:
+        return cid, cs, "GOOGLE_CLIENT_ID/SECRET env vars"
+
+    def _parse_env_file(path, accept_export=False):
+        out = {}
+        try:
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if accept_export and line.startswith("export "):
+                        line = line[len("export "):].strip()
+                    if "=" in line:
+                        k, _, v = line.partition("=")
+                        out[k.strip()] = v.strip().strip('"').strip("'")
+        except OSError:
+            pass
+        return out
+
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    env_path = os.path.join(app_dir, ".env")
+    if os.path.exists(env_path):
+        vals = _parse_env_file(env_path)
+        cid = vals.get("GOOGLE_CLIENT_ID", "").strip()
+        cs = vals.get("GOOGLE_CLIENT_SECRET", "").strip()
+        if cid and cs:
+            return cid, cs, env_path
+
+    secrets_path = os.path.expanduser("~/.draftboard-secrets/google.env")
+    if os.path.exists(secrets_path):
+        vals = _parse_env_file(secrets_path, accept_export=True)
+        cid = (vals.get("DRAFTBOARD_STARTER_GOOGLE_CLIENT_ID")
+               or vals.get("GOOGLE_CLIENT_ID") or "").strip()
+        cs = (vals.get("DRAFTBOARD_STARTER_GOOGLE_CLIENT_SECRET")
+              or vals.get("GOOGLE_CLIENT_SECRET") or "").strip()
+        if cid and cs:
+            return cid, cs, secrets_path
+
+    return "", "", None
+
+
+GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, _google_creds_source = _load_google_oauth_client()
+if GOOGLE_CLIENT_ID:
+    print(f"[draftboard-starter] Loaded Google OAuth client from: {_google_creds_source}")
+else:
+    print("[draftboard-starter] No Google OAuth client configured. The Candidates feature will show a 'not connected' state until one is set.")
+
+
+def _google_flow():
+    if not _google_libs_ready():
+        raise RuntimeError(_google_libs_error)
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET):
+        raise RuntimeError("Google OAuth client not configured.")
+    client_config = {
+        "web": {
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [GOOGLE_REDIRECT_URI],
+        }
+    }
+    flow = _GoogleFlow.from_client_config(client_config, scopes=GOOGLE_SCOPES)
+    flow.redirect_uri = GOOGLE_REDIRECT_URI
+    return flow
+
+
+def google_status():
+    """Snapshot of integration state for the templates."""
+    return {
+        "libs_ready": _google_libs_ready(),
+        "libs_error": _google_libs_error,
+        "client_configured": bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET),
+        "client_source": _google_creds_source or "",
+        "account_email": db_app_state_get("google_account_email", "") or "",
+        "last_synced_at": int(db_app_state_get("google_last_synced_at", "0") or 0),
+        "last_error": db_app_state_get("google_last_error", "") or "",
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+    }
+
+
+# --- Header parsing helpers ----------------------------------------------
+
+# Use stdlib email.utils — it correctly handles quoted display names with
+# embedded commas (`"Last, First" <a@b.com>`), folded headers, and group
+# syntax. The regex+split approach we tried first fractured those.
+from email.utils import getaddresses as _getaddresses
+
+
+def _parse_addresses(header_value):
+    """Parse a From/To/Cc header into (name, email) tuples. Lowercases email."""
+    if not header_value:
+        return []
+    out = []
+    for name, email in _getaddresses([header_value]):
+        email = (email or "").strip().lower()
+        if not email or "@" not in email:
+            continue
+        out.append(((name or "").strip(), email))
+    return out
+
+
+_NOREPLY_PREFIXES = (
+    "noreply", "no-reply", "donotreply", "do-not-reply", "notifications",
+    "notification", "alert", "alerts", "support", "help", "info", "hello",
+    "team", "billing", "receipts", "invoice", "invoices", "hr", "press",
+    "marketing", "newsletter", "news", "updates", "system", "automated",
+    "calendar-notification", "auto-confirm",
+)
+
+
+def _is_noise_email(email):
+    if not email or "@" not in email:
+        return True
+    local, _, domain = email.partition("@")
+    local = local.lower()
+    domain = domain.lower()
+    if domain in ("googlegroups.com", "calendar.google.com", "resource.calendar.google.com"):
+        return True
+    if local.startswith(_NOREPLY_PREFIXES):
+        return True
+    if "+" in local and any(local.startswith(p) for p in ("bounce", "bounces")):
+        return True
+    return False
+
+
+# --- Gmail fetcher --------------------------------------------------------
+
+def fetch_gmail_threads(creds, my_email, days=GOOGLE_HISTORY_DAYS, cap=GOOGLE_THREADS_CAP, progress_cb=None):
+    """Pull up to `cap` threads from the last `days` days, return per-contact stats."""
+    service = _google_build("gmail", "v1", credentials=creds, cache_discovery=False)
+    me = (my_email or "").lower()
+
+    thread_ids = []
+    page_token = None
+    q = f"newer_than:{days}d"
+    while len(thread_ids) < cap:
+        page_size = min(500, cap - len(thread_ids))
+        resp = service.users().threads().list(
+            userId="me", q=q, maxResults=page_size, pageToken=page_token
+        ).execute()
+        for t in resp.get("threads", []) or []:
+            thread_ids.append(t["id"])
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+
+    contacts = {}
+    total = len(thread_ids)
+    if progress_cb:
+        progress_cb(0, total)
+
+    for i, tid in enumerate(thread_ids):
+        try:
+            thread = service.users().threads().get(
+                userId="me", id=tid, format="metadata",
+                metadataHeaders=["From", "To", "Cc", "Date"],
+            ).execute()
+        except _GoogleHttpError:
+            if (i + 1) % 50 == 0 and progress_cb:
+                progress_cb(i + 1, total)
+            continue
+
+        thread_contacts = {}
+        most_recent_ts = 0
+        for msg in thread.get("messages", []) or []:
+            headers = {h.get("name", "").lower(): h.get("value", "") for h in
+                       (msg.get("payload", {}).get("headers", []) or [])}
+            from_addrs = _parse_addresses(headers.get("from", ""))
+            to_addrs = _parse_addresses(headers.get("to", ""))
+            cc_addrs = _parse_addresses(headers.get("cc", ""))
+            try:
+                msg_ts = int(msg.get("internalDate", "0")) // 1000
+            except (TypeError, ValueError):
+                msg_ts = 0
+            if msg_ts > most_recent_ts:
+                most_recent_ts = msg_ts
+
+            sender_email = from_addrs[0][1] if from_addrs else ""
+            sent_by_me = sender_email == me
+
+            participants = []
+            for nm, em in from_addrs + to_addrs + cc_addrs:
+                if em == me or _is_noise_email(em):
+                    continue
+                participants.append((nm, em))
+
+            for nm, em in participants:
+                rec = thread_contacts.setdefault(em, {"name": "", "sent_by_me": 0, "replies": 0})
+                if nm and not rec["name"]:
+                    rec["name"] = nm
+                if sent_by_me:
+                    rec["sent_by_me"] += 1
+                elif em == sender_email:
+                    rec["replies"] += 1
+
+        for em, rec in thread_contacts.items():
+            agg = contacts.setdefault(em, {
+                "name": "", "emails_sent": 0, "replies_received": 0,
+                "threads_count": 0, "last_contact_at": 0,
+            })
+            if rec["name"] and not agg["name"]:
+                agg["name"] = rec["name"]
+            agg["emails_sent"] += rec["sent_by_me"]
+            agg["replies_received"] += rec["replies"]
+            agg["threads_count"] += 1
+            if most_recent_ts > agg["last_contact_at"]:
+                agg["last_contact_at"] = most_recent_ts
+
+        if progress_cb and (i + 1) % 25 == 0:
+            progress_cb(i + 1, total)
+
+    if progress_cb:
+        progress_cb(total, total)
+    return contacts
+
+
+# --- Calendar fetcher ----------------------------------------------------
+
+def fetch_calendar_events(creds, my_email, days=GOOGLE_HISTORY_DAYS, cap=GOOGLE_EVENTS_CAP, progress_cb=None):
+    """Pull up to `cap` events from the last `days` days, aggregate per-attendee."""
+    service = _google_build("calendar", "v3", credentials=creds, cache_discovery=False)
+    me = (my_email or "").lower()
+
+    from datetime import datetime, timedelta, timezone
+    time_min = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    time_max = datetime.now(timezone.utc).isoformat()
+
+    contacts = {}
+    page_token = None
+    processed = 0
+    while True:
+        page_size = min(2500, cap - processed)
+        if page_size <= 0:
+            break
+        resp = service.events().list(
+            calendarId="primary",
+            timeMin=time_min,
+            timeMax=time_max,
+            singleEvents=True,
+            orderBy="startTime",
+            maxResults=page_size,
+            pageToken=page_token,
+        ).execute()
+        events = resp.get("items", []) or []
+        for ev in events:
+            attendees = ev.get("attendees", []) or []
+            if not attendees:
+                processed += 1
+                continue
+            my_resp = next(
+                (a.get("responseStatus") for a in attendees if (a.get("email") or "").lower() == me),
+                None,
+            )
+            if my_resp == "declined":
+                processed += 1
+                continue
+            ts_str = (ev.get("start") or {}).get("dateTime") or (ev.get("start") or {}).get("date") or ""
+            ts = 0
+            if ts_str:
+                try:
+                    if "T" in ts_str:
+                        ts = int(datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp())
+                    else:
+                        ts = int(datetime.fromisoformat(ts_str).replace(tzinfo=timezone.utc).timestamp())
+                except (TypeError, ValueError):
+                    ts = 0
+            for a in attendees:
+                email = (a.get("email") or "").lower()
+                if not email or email == me or _is_noise_email(email):
+                    continue
+                if a.get("responseStatus") == "declined":
+                    continue
+                rec = contacts.setdefault(email, {"name": "", "meetings_count": 0, "last_met_at": 0})
+                nm = a.get("displayName") or ""
+                if nm and not rec["name"]:
+                    rec["name"] = nm
+                rec["meetings_count"] += 1
+                if ts > rec["last_met_at"]:
+                    rec["last_met_at"] = ts
+            processed += 1
+        if progress_cb and processed % 100 == 0:
+            progress_cb(processed, processed)
+        page_token = resp.get("nextPageToken")
+        if not page_token or processed >= cap:
+            break
+    if progress_cb:
+        progress_cb(processed, processed)
+    return contacts
+
+
+# --- Persistence ---------------------------------------------------------
+
+def db_replace_gmail_contacts(contacts):
+    now = int(time.time())
+    with _db_lock, _db_connect() as conn:
+        conn.execute("DELETE FROM gmail_contacts")
+        for email, c in contacts.items():
+            conn.execute(
+                "INSERT INTO gmail_contacts (email, name, emails_sent, replies_received, "
+                "threads_count, last_contact_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (email, c.get("name", ""), c.get("emails_sent", 0),
+                 c.get("replies_received", 0), c.get("threads_count", 0),
+                 c.get("last_contact_at", 0), now),
+            )
+        conn.commit()
+
+
+def db_replace_calendar_contacts(contacts):
+    now = int(time.time())
+    with _db_lock, _db_connect() as conn:
+        conn.execute("DELETE FROM calendar_contacts")
+        for email, c in contacts.items():
+            conn.execute(
+                "INSERT INTO calendar_contacts (email, name, meetings_count, last_met_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (email, c.get("name", ""), c.get("meetings_count", 0),
+                 c.get("last_met_at", 0), now),
+            )
+        conn.commit()
+
+
+def db_clear_google_data():
+    """Wipe synced Gmail + Calendar data + the recorded sync metadata + the
+    in-memory sync-state pill (so it doesn't keep showing 'stage=done' from
+    the prior sync)."""
+    with _db_lock, _db_connect() as conn:
+        conn.execute("DELETE FROM gmail_contacts")
+        conn.execute("DELETE FROM calendar_contacts")
+        conn.execute("DELETE FROM app_state WHERE key IN ('google_account_email', 'google_last_synced_at', 'google_last_error')")
+        conn.commit()
+    with _google_sync_lock:
+        _google_sync_state.update({
+            "running": False, "stage": "", "processed": 0, "total": 0,
+            "started_at": 0, "ended_at": 0, "last_error": "", "account_email": "",
+        })
+
+
+# --- Scoring + candidate query ------------------------------------------
+
+def score_contact(emails_sent, replies_received, threads_count, meetings_count, last_contact_days_ago):
+    """Per-contact relationship-strength score. See README."""
+    base = (emails_sent or 0) + 2 * (replies_received or 0) + 3 * (threads_count or 0) + 5 * (meetings_count or 0)
+    if last_contact_days_ago is None:
+        return 0
+    recency = max(0.1, 1.0 - (last_contact_days_ago / 365.0))
+    return int(base * recency)
+
+
+def db_query_candidates(limit=200, offset=0, query=""):
+    """Merge gmail + calendar contacts, score each, return top N.
+
+    BIDIRECTIONAL FILTER: an email-only contact must have at least one
+    outbound email from the user AND at least one reply from them. This
+    cuts cold-outreach prospects (you sent → no reply) and inbound
+    newsletters/notifications (they sent → you never replied) — neither
+    is a real relationship signal. Calendar-only contacts are kept
+    unconditionally since attending a shared meeting IS bidirectional.
+    """
+    now = int(time.time())
+    sql_left = """
+        SELECT
+          g.email AS email,
+          COALESCE(NULLIF(g.name, ''), NULLIF(c.name, ''), '') AS name,
+          g.emails_sent AS emails_sent,
+          g.replies_received AS replies_received,
+          g.threads_count AS threads_count,
+          COALESCE(c.meetings_count, 0) AS meetings_count,
+          g.last_contact_at AS last_emailed_at,
+          COALESCE(c.last_met_at, 0) AS last_met_at
+        FROM gmail_contacts g
+        LEFT JOIN calendar_contacts c ON g.email = c.email
+        WHERE
+          (g.emails_sent >= 1 AND g.replies_received >= 1)
+          OR COALESCE(c.meetings_count, 0) >= 1
+    """
+    sql_right_only = """
+        SELECT
+          c.email AS email,
+          COALESCE(NULLIF(c.name, ''), '') AS name,
+          0 AS emails_sent,
+          0 AS replies_received,
+          0 AS threads_count,
+          c.meetings_count AS meetings_count,
+          0 AS last_emailed_at,
+          c.last_met_at AS last_met_at
+        FROM calendar_contacts c
+        WHERE c.email NOT IN (SELECT email FROM gmail_contacts)
+          AND c.meetings_count >= 1
+    """
+    full_sql = f"SELECT * FROM ({sql_left} UNION ALL {sql_right_only})"
+    args = []
+    if query:
+        full_sql += " WHERE LOWER(email) LIKE ? OR LOWER(name) LIKE ?"
+        like = f"%{query.lower()}%"
+        args.extend([like, like])
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(full_sql, args)
+        rows = cur.fetchall()
+    candidates = []
+    for r in rows:
+        email = r[0]
+        name = r[1]
+        emails_sent = r[2]
+        replies_received = r[3]
+        threads_count = r[4]
+        meetings_count = r[5]
+        last_emailed_at = r[6]
+        last_met_at = r[7]
+        last_contact_at = max(last_emailed_at, last_met_at)
+        days_ago = ((now - last_contact_at) / 86400.0) if last_contact_at else None
+        score = score_contact(emails_sent, replies_received, threads_count, meetings_count, days_ago)
+        candidates.append({
+            "email": email,
+            "name": name or email,
+            "emails_sent": emails_sent,
+            "replies_received": replies_received,
+            "threads_count": threads_count,
+            "meetings_count": meetings_count,
+            "last_contact_at": last_contact_at,
+            "days_ago": int(days_ago) if days_ago is not None else None,
+            "score": score,
+        })
+    candidates.sort(key=lambda c: (-c["score"], -c["threads_count"], c["email"]))
+    total = len(candidates)
+    return candidates[offset:offset + limit], total
+
+
+# --- One-time sync worker ------------------------------------------------
+
+_google_sync_lock = threading.Lock()
+_google_sync_state = {
+    "running": False,
+    "stage": "",
+    "processed": 0,
+    "total": 0,
+    "started_at": 0,
+    "ended_at": 0,
+    "last_error": "",
+    "account_email": "",
+}
+_google_sync_thread = None
+
+
+def _set_google_sync_state(**kwargs):
+    with _google_sync_lock:
+        _google_sync_state.update(kwargs)
+
+
+def google_sync_progress_snapshot():
+    with _google_sync_lock:
+        snap = dict(_google_sync_state)
+    if snap["total"] > 0:
+        snap["percent"] = int(100 * snap["processed"] / snap["total"])
+    else:
+        snap["percent"] = 0
+    return snap
+
+
+def _google_sync_worker(creds):
+    """Run one sync end-to-end. Credentials are passed in memory and discarded
+    when this function returns — never persisted."""
+    started = int(time.time())
+    _set_google_sync_state(running=True, stage="starting", processed=0, total=0,
+                           started_at=started, ended_at=0, last_error="")
+    try:
+        try:
+            oauth2 = _google_build("oauth2", "v2", credentials=creds, cache_discovery=False)
+            profile = oauth2.userinfo().get().execute() or {}
+            my_email = (profile.get("email") or "").lower()
+        except Exception:
+            gmail = _google_build("gmail", "v1", credentials=creds, cache_discovery=False)
+            my_email = (gmail.users().getProfile(userId="me").execute() or {}).get("emailAddress", "").lower()
+
+        if my_email:
+            db_app_state_set("google_account_email", my_email)
+            _set_google_sync_state(account_email=my_email)
+
+        # Gmail
+        _set_google_sync_state(stage="gmail", processed=0, total=0)
+        def _gmail_progress(p, t):
+            _set_google_sync_state(stage="gmail", processed=p, total=t)
+        gmail_contacts = fetch_gmail_threads(creds, my_email, progress_cb=_gmail_progress)
+        db_replace_gmail_contacts(gmail_contacts)
+
+        # Calendar
+        _set_google_sync_state(stage="calendar", processed=0, total=0)
+        def _cal_progress(p, t):
+            _set_google_sync_state(stage="calendar", processed=p, total=t)
+        calendar_contacts = fetch_calendar_events(creds, my_email, progress_cb=_cal_progress)
+        db_replace_calendar_contacts(calendar_contacts)
+
+        ended = int(time.time())
+        db_app_state_set("google_last_synced_at", str(ended))
+        db_app_state_set("google_last_error", "")
+        _set_google_sync_state(running=False, stage="done", ended_at=ended, last_error="")
+    except Exception as e:
+        msg = f"{type(e).__name__}: {e}"
+        db_app_state_set("google_last_error", msg)
+        _set_google_sync_state(running=False, stage="error", ended_at=int(time.time()), last_error=msg)
+
+
+def start_google_sync(creds):
+    """Kick off the one-time sync. Returns True if started, False if one's
+    already in flight."""
+    global _google_sync_thread
+    with _google_sync_lock:
+        if _google_sync_state["running"]:
+            return False
+        _google_sync_state["running"] = True
+    _google_sync_thread = threading.Thread(
+        target=_google_sync_worker, args=(creds,), daemon=True, name="google-sync"
+    )
+    _google_sync_thread.start()
+    return True
+
+
+# --- Routes --------------------------------------------------------------
+
+@app.route("/settings/google", methods=["GET"])
+def settings_google_view():
+    """Status page: 'Connect Google' button OR last-synced banner + Re-sync."""
+    status = google_status()
+    sync_state = google_sync_progress_snapshot()
+    return render_template(
+        "settings_google.html",
+        status=status,
+        sync_state=sync_state,
+        active="settings_google",
+        api_key_set=bool(API_KEY),
+    )
+
+
+@app.route("/settings/google/clear-data", methods=["POST"])
+def settings_google_clear_data():
+    """Wipe the synced contact data + last-synced metadata."""
+    db_clear_google_data()
+    return redirect(url_for("settings_google_view") + "?cleared=1")
+
+
+@app.route("/auth/google/start", methods=["GET"])
+def auth_google_start():
+    if not _google_libs_ready():
+        return redirect(url_for("settings_google_view") + "?error=libs_missing")
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET):
+        return redirect(url_for("settings_google_view") + "?error=client_not_configured")
+    flow = _google_flow()
+    auth_url, state = flow.authorization_url(
+        access_type="online",  # one-time use, no refresh token needed
+        include_granted_scopes="true",
+    )
+    from flask import session
+    session["google_oauth_state"] = state
+    return redirect(auth_url)
+
+
+@app.route("/auth/google/callback", methods=["GET"])
+def auth_google_callback():
+    if not _google_libs_ready():
+        return redirect(url_for("settings_google_view") + "?error=libs_missing")
+    from flask import session
+    # Pop the state nonce up front so it can't be replayed by a second callback.
+    expected_state = session.pop("google_oauth_state", "")
+    got_state = request.args.get("state", "")
+
+    err = request.args.get("error")
+    if err:
+        # Map Google's standard error codes to friendly internal codes the
+        # /settings/google template can render with a recovery message.
+        if err == "access_denied":
+            # Two cases: customer cancelled, OR their email isn't on the
+            # test-users allowlist. Google's `error_description` distinguishes
+            # them; pass it through so the template can switch on it.
+            desc = (request.args.get("error_description") or "").lower()
+            if "test users" in desc or "verification" in desc or "blocked" in desc:
+                return redirect(url_for("settings_google_view") + "?error=access_blocked")
+            return redirect(url_for("settings_google_view") + "?error=access_cancelled")
+        return redirect(url_for("settings_google_view") + f"?error={err}")
+
+    # Reject if state is missing on either side OR doesn't match. The previous
+    # logic short-circuited the comparison when either side was empty, leaving
+    # the callback open to CSRF.
+    if not expected_state or not got_state or expected_state != got_state:
+        return redirect(url_for("settings_google_view") + "?error=state_mismatch")
+
+    try:
+        flow = _google_flow()
+        flow.fetch_token(authorization_response=request.url)
+        creds = flow.credentials
+        # Kick off sync — credentials live only inside the worker thread, never persisted.
+        start_google_sync(creds)
+    except Exception as e:
+        return redirect(url_for("settings_google_view") + f"?error=callback:{type(e).__name__}")
+    return redirect(url_for("settings_google_view") + "?connected=1")
+
+
+@app.route("/google/sync/status", methods=["GET"])
+def google_sync_status():
+    return jsonify(google_sync_progress_snapshot())
+
+
+@app.route("/supporters/candidates", methods=["GET"])
+def supporters_candidates_view():
+    """Ranked list of high-engagement contacts from Gmail + Calendar."""
+    try:
+        page = max(1, int(request.args.get("page") or "1"))
+    except ValueError:
+        page = 1
+    per_page = 50
+    query = (request.args.get("q") or "").strip()
+    candidates, total = db_query_candidates(
+        limit=per_page, offset=(page - 1) * per_page, query=query
+    )
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    status = google_status()
+    sync_state = google_sync_progress_snapshot()
+    return render_template(
+        "supporters_candidates.html",
+        candidates=candidates,
+        total=total,
+        page=page,
+        total_pages=total_pages,
+        per_page=per_page,
+        query=query,
+        status=status,
+        sync_state=sync_state,
+        active="candidates",
+        api_key_set=bool(API_KEY),
+    )
+
+
 
 
 # Kick off the scheduled-sync daemon on module import (fires every

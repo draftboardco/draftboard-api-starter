@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Draftboard — Connect Google</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+  <div class="max-w-2xl mx-auto px-6 py-10">
+    {% include "_nav.html" %}
+
+    <header class="mb-6">
+      <h1 class="text-2xl font-semibold tracking-tight">Connect Google</h1>
+      <p class="text-sm text-slate-500 mt-1">
+        We score the people you actually engage with — by Gmail thread frequency
+        plus shared meetings — so likely Supporters surface automatically on the
+        Candidates page.
+        <span class="block mt-1 text-xs text-slate-400">
+          One-time scan of your last 12 months. Takes ~5 minutes. All data stays
+          on this laptop in <code class="font-mono">data.db</code>.
+        </span>
+      </p>
+    </header>
+
+    {# --- Banners --- #}
+    {% if request.args.get('connected') %}
+      <div class="mb-4 rounded-md border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
+        ✅ Connected{% if status.account_email %} as <strong>{{ status.account_email }}</strong>{% endif %}.
+        Sync is running — watch the progress below.
+      </div>
+    {% endif %}
+    {% if request.args.get('cleared') %}
+      <div class="mb-4 rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+        Synced data cleared. Click "Connect Google" to re-run.
+      </div>
+    {% endif %}
+    {% set raw_err = request.args.get('error', '') %}
+    {% if raw_err %}
+      {% if raw_err == 'access_blocked' %}
+        <div class="mb-4 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">
+          <p class="font-medium">Google blocked the connection.</p>
+          <p class="mt-1 text-rose-800">
+            Your email isn't on the test-users allowlist for this Draftboard
+            OAuth app. Ask whoever set up your team's copy to add you in
+            <a href="https://console.cloud.google.com/apis/credentials/consent" target="_blank" rel="noopener" class="underline">Google Cloud → OAuth consent screen → Test users</a>,
+            then come back and click Connect again.
+          </p>
+        </div>
+      {% elif raw_err == 'access_cancelled' %}
+        <div class="mb-4 rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+          You cancelled the Google consent screen. Click Connect Google to try again.
+        </div>
+      {% elif raw_err == 'client_not_configured' %}
+        <div class="mb-4 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">
+          <p class="font-medium">OAuth client not configured.</p>
+          <p class="mt-1 text-rose-800 text-xs">
+            Set <code class="font-mono">GOOGLE_CLIENT_ID</code> + <code class="font-mono">GOOGLE_CLIENT_SECRET</code>
+            as env vars, or put them in <code class="font-mono">~/.draftboard-secrets/google.env</code>
+            (see README), then restart the server.
+          </p>
+        </div>
+      {% elif raw_err == 'libs_missing' %}
+        <div class="mb-4 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">
+          Python dependencies missing. Run <code class="font-mono text-xs">.venv/bin/pip install -r requirements.txt</code> and restart.
+        </div>
+      {% elif raw_err == 'state_mismatch' %}
+        <div class="mb-4 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">
+          Connection check failed (the OAuth handshake's anti-CSRF token didn't match).
+          This usually means the page session expired between clicks. Click Connect Google to start fresh.
+        </div>
+      {% elif raw_err.startswith('callback:') %}
+        <div class="mb-4 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">
+          Something went wrong finishing the Google sign-in. Try Connect Google again — if it keeps failing, check the server log.
+        </div>
+      {% else %}
+        <div class="mb-4 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">
+          Couldn't connect to Google. Try Connect Google again.
+        </div>
+      {% endif %}
+    {% endif %}
+
+    {% if not status.libs_ready %}
+      <div class="mb-6 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">
+        <strong>Python dependencies missing.</strong>
+        {{ status.libs_error }}
+        <pre class="mt-2 text-xs bg-white border border-rose-200 rounded p-2 font-mono">cd examples/flask-starter
+.venv/bin/pip install -r requirements.txt
+# then restart the server</pre>
+      </div>
+    {% elif not status.client_configured %}
+      <div class="mb-6 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">
+        <strong>Google OAuth client not configured.</strong> Either set
+        <code class="font-mono text-xs">GOOGLE_CLIENT_ID</code> + <code class="font-mono text-xs">GOOGLE_CLIENT_SECRET</code>
+        as env vars, or add them to
+        <code class="font-mono text-xs">~/.draftboard-secrets/google.env</code> (or this app's
+        <code class="font-mono text-xs">.env</code>) and restart.
+      </div>
+    {% endif %}
+
+    {# --- Connected (last sync exists) --- #}
+    {% if status.last_synced_at %}
+      <section class="rounded-lg bg-white border border-emerald-200 p-6 shadow-sm">
+        <div class="flex items-start justify-between gap-4 flex-wrap">
+          <div>
+            <h2 class="text-base font-semibold text-emerald-900">Last sync</h2>
+            <p class="mt-1 text-sm text-slate-600">
+              Account: <strong>{{ status.account_email or '(unknown)' }}</strong>
+            </p>
+            <p class="mt-1 text-xs text-slate-500">
+              Synced <span class="rel-ts" data-ts="{{ status.last_synced_at }}">{{ status.last_synced_at }}</span>.
+            </p>
+            {% if status.last_error %}
+              <p class="mt-1 text-xs text-rose-700">Last error: {{ status.last_error }}</p>
+            {% endif %}
+          </div>
+          <div class="flex flex-col items-end gap-2">
+            <a href="/supporters/candidates"
+               class="inline-flex items-center text-sm px-3 py-1.5 rounded-md bg-indigo-600 text-white hover:bg-indigo-700">
+              View candidates →
+            </a>
+            <a href="/auth/google/start"
+               class="inline-flex items-center text-xs px-3 py-1.5 rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">
+              Re-sync
+            </a>
+            <span class="text-[11px] text-slate-400">
+              Asks Google for permission again — tokens aren't stored between syncs.
+            </span>
+          </div>
+        </div>
+
+        <div id="google-sync-pill" class="mt-4 hidden text-xs"></div>
+
+        <form method="POST" action="/settings/google/clear-data"
+              onsubmit="return confirm('Wipe all synced Gmail + Calendar contact data from this laptop?');"
+              class="mt-6 border-t border-slate-100 pt-4">
+          <button type="submit"
+                  class="text-xs px-3 py-1.5 rounded-md border border-rose-200 bg-white text-rose-700 hover:bg-rose-50">
+            Clear synced data
+          </button>
+          <span class="ml-2 text-xs text-slate-500">
+            Removes the locally-stored Gmail + Calendar contacts. You can re-sync any time.
+          </span>
+        </form>
+      </section>
+
+    {# --- First connect / sync running with no prior data --- #}
+    {% else %}
+      <section class="rounded-lg bg-white border border-slate-200 p-6 shadow-sm">
+        {% if sync_state.running %}
+          <h2 class="text-base font-semibold text-slate-900">First sync running…</h2>
+          <p class="mt-1 text-sm text-slate-600">
+            Pulling 12 months of Gmail threads + Calendar events. Don't close
+            this tab — typically ~5 min.
+          </p>
+          <div id="google-sync-pill" class="mt-4 text-xs">
+            <!-- populated by JS -->
+          </div>
+        {% else %}
+          <h2 class="text-base font-semibold text-slate-900">Ready to connect</h2>
+          <p class="mt-1 text-sm text-slate-600">
+            Click below → Google's consent screen → grant access to your Gmail
+            (read-only) + Calendar (read-only). We'll start the one-time sync
+            immediately afterward.
+          </p>
+          <p class="mt-2 text-xs text-slate-500">
+            You'll see "Google hasn't verified this app" — that's expected.
+            It's Google's standard message for any small-team app that hasn't
+            paid for enterprise verification. The app reads metadata only (no
+            message contents) and runs locally on your machine.
+            Click <strong>Advanced → Go to Draftboard (unsafe)</strong> to proceed.
+          </p>
+
+          {% if status.libs_ready and status.client_configured %}
+            <a href="/auth/google/start"
+               class="mt-5 inline-flex items-center justify-center rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow hover:bg-indigo-700">
+              Connect Google →
+            </a>
+          {% else %}
+            <button type="button" disabled
+                    class="mt-5 inline-flex items-center justify-center rounded-md bg-slate-200 px-4 py-2 text-sm font-medium text-slate-400 cursor-not-allowed">
+              Connect Google →
+            </button>
+          {% endif %}
+        {% endif %}
+      </section>
+    {% endif %}
+
+    <footer class="text-xs text-slate-400 text-center mt-12">
+      Draftboard API starter · Google connect ·
+      <a href="/" class="hover:underline">← Back to Targets</a>
+    </footer>
+  </div>
+
+  <script>
+  (function () {
+    document.querySelectorAll('.rel-ts').forEach(function (el) {
+      var ts = parseInt(el.dataset.ts, 10) * 1000;
+      if (!ts) return;
+      var diff = (Date.now() - ts) / 1000;
+      var label;
+      if (diff < 60) label = Math.round(diff) + 's ago';
+      else if (diff < 3600) label = Math.round(diff/60) + 'm ago';
+      else if (diff < 86400) label = Math.round(diff/3600) + 'h ago';
+      else label = Math.round(diff/86400) + 'd ago';
+      el.textContent = label + ' (' + new Date(ts).toLocaleString() + ')';
+    });
+
+    var pill = document.getElementById('google-sync-pill');
+    if (!pill) return;
+    var pollTimer = null;
+    var lastEnded = 0;
+
+    function render(state) {
+      if (!state) return;
+      var stage = state.stage || '';
+      if (state.running) {
+        pill.classList.remove('hidden');
+        var label = stage === 'gmail' ? 'Pulling Gmail threads' :
+                    stage === 'calendar' ? 'Pulling Calendar events' :
+                    'Starting sync';
+        var counter = state.total > 0 ? ' (' + state.processed + ' / ' + state.total + ')' : '';
+        pill.innerHTML =
+          '<div class="flex items-center gap-2 px-3 py-1.5 rounded-md bg-indigo-50 border border-indigo-200 text-indigo-800">' +
+            '<span class="inline-block w-2 h-2 rounded-full bg-indigo-500 animate-pulse"></span>' +
+            '<span>' + label + counter + '</span>' +
+          '</div>';
+      } else if (stage === 'done' && state.ended_at && state.ended_at > lastEnded) {
+        lastEnded = state.ended_at;
+        pill.classList.remove('hidden');
+        pill.innerHTML =
+          '<div class="flex items-center gap-2 px-3 py-1.5 rounded-md bg-emerald-50 border border-emerald-200 text-emerald-800">' +
+            '<span>✓ Sync complete — </span>' +
+            '<a href="/supporters/candidates" class="underline">view candidates</a>' +
+          '</div>';
+        setTimeout(function () { window.location.reload(); }, 1500);
+      } else if (stage === 'error') {
+        pill.classList.remove('hidden');
+        pill.innerHTML =
+          '<div class="flex items-center gap-2 px-3 py-1.5 rounded-md bg-rose-50 border border-rose-200 text-rose-800">' +
+            '<span>✗ Sync failed: ' + (state.last_error || 'unknown') + '</span>' +
+          '</div>';
+      }
+    }
+
+    function poll() {
+      fetch('/google/sync/status')
+        .then(function (r) { return r.json(); })
+        .then(function (state) {
+          render(state);
+          if (!state.running && pollTimer && state.stage !== 'starting') {
+            clearInterval(pollTimer);
+            pollTimer = null;
+          }
+        })
+        .catch(function () {});
+    }
+
+    function startPolling() {
+      if (pollTimer) return;
+      pollTimer = setInterval(poll, 2500);
+    }
+
+    poll();
+    setTimeout(function () { poll(); startPolling(); }, 800);
+  })();
+  </script>
+</body>
+</html>

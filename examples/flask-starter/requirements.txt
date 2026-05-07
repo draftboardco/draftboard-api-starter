@@ -1,2 +1,9 @@
 flask>=3.0
 requests>=2.31
+
+# Google Workspace integration. Customer clicks "Connect Google" → consent →
+# one-time sync of last 12 months of Gmail + Calendar → done. See README
+# "Google Workspace setup" + /settings/google in the app.
+google-auth-oauthlib>=1.2
+google-api-python-client>=2.120
+cryptography>=42.0  # transitive dep of google-auth
