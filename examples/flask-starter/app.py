@@ -2401,6 +2401,121 @@ def _looks_like_email(value: str) -> bool:
     return bool(local) and "." in domain
 
 
+RESOLVE_BATCH_MAX = 500
+RESOLVE_BATCH_WORKERS = 5
+
+
+def _resolve_one_for_batch(name: str, email: str, keys: dict, force: bool) -> dict:
+    """Single-row resolver used by the batch worker pool. Mirrors the
+    cache-first logic of /candidates/resolve. Tagged with `email` so the
+    caller can correlate results back to their input row even if order
+    shifts."""
+    out_email = email.strip().lower()
+    if not name.strip() or not email.strip():
+        return {"email": out_email, "error": "name and email are required",
+                "linkedin_url": None, "confidence": "none", "source": "none",
+                "reasoning": "Missing name or email.", "cached": False}
+    if not _looks_like_email(email):
+        return {"email": out_email, "error": "email is malformed",
+                "linkedin_url": None, "confidence": "none", "source": "none",
+                "reasoning": "Email looks malformed.", "cached": False}
+
+    if not force:
+        cached = db_get_resolution(email)
+        if cached is not None:
+            return {**cached, "email": out_email}
+
+    result = resolve_linkedin(
+        name, email,
+        apollo_key=keys.get("apollo_api_key") or None,
+        cse_key=keys.get("google_cse_api_key") or None,
+        cse_id=keys.get("google_cse_id") or None,
+        openai_key=keys.get("openai_api_key") or None,
+    )
+    db_put_resolution(email, name, result)
+    result.pop("_transient", None)
+    return {**result, "email": out_email, "cached": False}
+
+
+@app.route("/candidates/resolve/batch", methods=["POST"])
+def candidates_resolve_batch():
+    """Resolve a list of (name, email) pairs concurrently.
+
+    Body:
+      {
+        "contacts": [{"name": "...", "email": "..."}, ...],   # required, max 500
+        "force":    false,                                      # optional
+      }
+
+    Returns:
+      {
+        "results": [
+          {"email":"...", "linkedin_url":"...", "confidence":"...",
+           "source":"...", "reasoning":"...", "cached": bool, "error": ...},
+          ...
+        ],
+        "count":  N,
+        "hits":   N_with_a_linkedin_url,
+        "cached": N_served_from_cache,
+      }
+
+    Order of `results` matches the input order. Each result includes the
+    lowercased `email` so callers can correlate. Per-row failures don't
+    abort the batch — they come back with `error` set on that row only.
+    """
+    if not request.is_json:
+        return jsonify({"error": "JSON body required (Content-Type: application/json)"}), 400
+    body = request.get_json(silent=True) or {}
+    contacts = body.get("contacts")
+    if not isinstance(contacts, list) or not contacts:
+        return jsonify({"error": "contacts must be a non-empty list"}), 400
+    if len(contacts) > RESOLVE_BATCH_MAX:
+        return jsonify({
+            "error": f"batch capped at {RESOLVE_BATCH_MAX} contacts; chunk and re-call",
+        }), 400
+    force = bool(body.get("force"))
+
+    # Load keys once for the whole batch instead of re-reading the secrets
+    # file per row.
+    keys = _load_resolver_keys()
+
+    # Each row keeps its input index so we can re-order at the end.
+    indexed = []
+    for i, c in enumerate(contacts):
+        if not isinstance(c, dict):
+            indexed.append((i, "", ""))
+            continue
+        indexed.append((i, str(c.get("name") or ""), str(c.get("email") or "")))
+
+    results: list[dict | None] = [None] * len(indexed)
+    with ThreadPoolExecutor(max_workers=RESOLVE_BATCH_WORKERS) as pool:
+        future_to_idx = {
+            pool.submit(_resolve_one_for_batch, name, email, keys, force): i
+            for (i, name, email) in indexed
+        }
+        for fut in as_completed(future_to_idx):
+            i = future_to_idx[fut]
+            try:
+                results[i] = fut.result()
+            except Exception as e:  # defense-in-depth — _resolve_one_for_batch shouldn't raise
+                results[i] = {
+                    "email": indexed[i][2].strip().lower(),
+                    "error": "resolver crashed",
+                    "linkedin_url": None, "confidence": "none", "source": "none",
+                    "reasoning": f"Unhandled error: {type(e).__name__}",
+                    "cached": False,
+                }
+
+    hits = sum(1 for r in results if r and r.get("linkedin_url"))
+    cached_n = sum(1 for r in results if r and r.get("cached"))
+    return jsonify({
+        "results": results,
+        "count": len(results),
+        "hits": hits,
+        "cached": cached_n,
+    })
+
+
 @app.route("/candidates/resolve", methods=["POST"])
 def candidates_resolve():
     """Resolve a single (name, email) pair to a LinkedIn URL.
