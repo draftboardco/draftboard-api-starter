@@ -2304,6 +2304,78 @@ def sync_start():
 #   - Compose-email-to-teammate flow (uses email to pre-fill Gmail's To: field)
 # Independent of Slack — useful immediately just for the email map.
 
+@app.route("/settings/slack", methods=["GET"])
+def settings_slack_view():
+    """Slack-setup wizard. Driven by ?step=N URL param, but also infers the
+    next step automatically from saved state so users can resume mid-flow.
+
+    Steps:
+      1. Intro / "want to set up?"
+      2. Pick a Slack channel display name
+      3. Install Incoming Webhook (next iteration)
+      4. Paste webhook URL (next iteration)
+      5. Map teammates → Slack IDs (links to /settings/team — next iteration)
+      6. Test message (next iteration)
+      7. Done (overview + reset)
+    """
+    webhook_url = db_get_slack_config("webhook_url")
+    channel_name = db_get_slack_config("channel_name")
+    completed_at = db_get_slack_config("setup_completed_at")
+
+    requested = request.args.get("step")
+    if completed_at and not requested:
+        current_step = "done"
+    elif requested:
+        try:
+            current_step = max(1, min(7, int(requested)))
+        except ValueError:
+            current_step = 1
+    else:
+        # Auto-resume based on what's been saved so far.
+        if not channel_name:
+            current_step = 1
+        elif not webhook_url:
+            current_step = 3  # channel picked, need webhook install
+        else:
+            current_step = 5  # webhook done, need teammate map
+
+    return render_template(
+        "settings_slack.html",
+        current_step=current_step,
+        channel_name=channel_name or "",
+        webhook_url=webhook_url or "",
+        completed_at=completed_at or "",
+        active="settings",
+    )
+
+
+@app.route("/settings/slack", methods=["POST"])
+def settings_slack_save():
+    """Wizard advance handler. Each step posts its form data + a hidden `step`
+    field; we persist what we got and redirect to the next step (or stay if
+    the user picked 'skip')."""
+    step = request.form.get("step", "")
+
+    if step == "1":
+        choice = request.form.get("choice", "")
+        if choice == "yes":
+            return redirect(url_for("settings_slack_view", step=2))
+        # skip-for-now → bounce back to Targets
+        return redirect("/")
+
+    if step == "2":
+        channel = (request.form.get("channel_name") or "").strip()
+        # Tolerate the user typing either "warm-intros" or "#warm-intros"
+        if channel and not channel.startswith("#"):
+            channel = "#" + channel
+        if channel:
+            db_set_slack_config("channel_name", channel)
+        return redirect(url_for("settings_slack_view", step=3))
+
+    # Steps 3-6 land in subsequent iterations.
+    return redirect(url_for("settings_slack_view"))
+
+
 @app.route("/settings/team", methods=["GET"])
 def settings_team_view():
     owners = db_unique_owners()  # [{id, first, last, name, linkedin, target_count}, ...]

@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Draftboard — Slack settings</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    {% include "_nav.html" %}
+
+    <header class="mb-6">
+      <h1 class="text-2xl font-semibold tracking-tight">Slack notifications</h1>
+      <p class="text-sm text-slate-500 mt-1">
+        When configured, the "Assign to teammate" dropdown grows a
+        <strong>💬 Slack #channel</strong> option per teammate. Click it →
+        Slack message lands in the channel tagging the teammate, with
+        prospect + connection details. <strong>Gmail is always the default;</strong>
+        Slack is an opt-in upgrade you can skip.
+      </p>
+    </header>
+
+    {# Step indicator (read-only progress dots) #}
+    {% set step_labels = [
+      (1, 'Intro'),
+      (2, 'Channel'),
+      (3, 'Webhook'),
+      (4, 'Paste URL'),
+      (5, 'Teammates'),
+      (6, 'Test'),
+      (7, 'Done'),
+    ] %}
+    {% set numeric_step = current_step if current_step is number else 7 %}
+    <ol class="mb-8 flex items-center gap-1 text-[11px] flex-wrap">
+      {% for n, label in step_labels %}
+        <li class="flex items-center gap-1">
+          <span class="inline-flex items-center justify-center w-6 h-6 rounded-full
+              {% if n < numeric_step %}bg-emerald-100 text-emerald-700 border border-emerald-300
+              {% elif n == numeric_step %}bg-indigo-600 text-white
+              {% else %}bg-slate-100 text-slate-400 border border-slate-200{% endif %} font-semibold">
+            {% if n < numeric_step %}✓{% else %}{{ n }}{% endif %}
+          </span>
+          <span class="{% if n == numeric_step %}text-slate-900 font-medium{% else %}text-slate-500{% endif %}">{{ label }}</span>
+          {% if not loop.last %}<span class="mx-1 text-slate-300">·</span>{% endif %}
+        </li>
+      {% endfor %}
+    </ol>
+
+    {# ---------- Step 1: Intro ---------- #}
+    {% if current_step == 1 %}
+      <form method="POST" action="/settings/slack" class="bg-white border border-slate-200 rounded-lg p-6 shadow-sm">
+        <input type="hidden" name="step" value="1" />
+        <h2 class="text-lg font-semibold mb-2">Want to set up Slack notifications?</h2>
+        <p class="text-sm text-slate-600 mb-4">
+          Setup takes about 5 minutes:
+        </p>
+        <ol class="text-sm text-slate-600 list-decimal list-inside space-y-1 mb-6">
+          <li>Pick a Slack channel where alerts should land</li>
+          <li>Create a <strong>Slack App</strong> and add an <strong>Incoming Webhook</strong> for that channel</li>
+          <li>Paste the webhook URL here</li>
+          <li>Map each teammate's Slack user ID (on the Team Settings page)</li>
+          <li>Send a test message to confirm</li>
+        </ol>
+        <p class="text-xs text-slate-500 mb-4">
+          You can stop after step 1 or 2 — the channel name + webhook are
+          saved as you go, so you can resume any time.
+        </p>
+        <div class="flex items-center gap-3">
+          <button type="submit" name="choice" value="yes"
+                  class="rounded-md bg-indigo-600 text-white px-4 py-2 text-sm font-medium hover:bg-indigo-700">
+            Yes, set it up
+          </button>
+          <button type="submit" name="choice" value="skip"
+                  class="rounded-md border border-slate-300 bg-white text-slate-700 px-4 py-2 text-sm hover:bg-slate-50">
+            Skip for now
+          </button>
+        </div>
+      </form>
+
+    {# ---------- Step 2: Pick a channel ---------- #}
+    {% elif current_step == 2 %}
+      <form method="POST" action="/settings/slack" class="bg-white border border-slate-200 rounded-lg p-6 shadow-sm">
+        <input type="hidden" name="step" value="2" />
+        <h2 class="text-lg font-semibold mb-2">Pick a Slack channel</h2>
+        <p class="text-sm text-slate-600 mb-4">
+          Which channel should warm-intro alerts land in? We default to
+          <code>#warm-intros</code>, but pick whatever fits your team — many
+          customers use an existing <code>#sales</code> channel, a dedicated
+          team channel, or a private channel. The name you save here is just
+          a label that shows up in this app's UI; it just has to match the
+          channel where you'll install the webhook in the next step.
+        </p>
+        <label class="block">
+          <span class="text-xs uppercase tracking-wider text-slate-500">Channel name</span>
+          <input type="text" name="channel_name" value="{{ channel_name or '#warm-intros' }}"
+                 placeholder="#warm-intros"
+                 class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+        </label>
+        <p class="text-[11px] text-slate-500 mt-1">
+          The <code>#</code> is added automatically if you skip it.
+        </p>
+
+        <div class="mt-4 text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded p-3 leading-relaxed">
+          <strong>Don't have a channel for this yet?</strong>
+          In Slack: click the <code>+</code> next to <strong>Channels</strong>
+          → <strong>Create channel</strong> → name it whatever you like
+          (most teams pick something descriptive like <code>#warm-intros</code>
+          or <code>#sales-intros</code>) → set it private if only the sales
+          team should see the alerts → <strong>Create</strong>. Then come back
+          here and type the same name above.
+          <br><br>
+          <strong>Already have a <code>#warm-intros</code> channel that does something else?</strong>
+          No problem — just type whatever name you want above. The app uses
+          this label only as a UI hint; what actually routes messages to
+          Slack is the webhook URL in the next step.
+        </div>
+
+        <div class="mt-6 flex items-center gap-3">
+          <button type="submit"
+                  class="rounded-md bg-indigo-600 text-white px-4 py-2 text-sm font-medium hover:bg-indigo-700">
+            Next →
+          </button>
+          <a href="/settings/slack?step=1"
+             class="text-sm text-slate-500 hover:text-slate-700">← Back</a>
+        </div>
+      </form>
+
+    {# ---------- Step 3+: placeholder until next iteration ---------- #}
+    {% elif current_step in [3, 4, 5, 6] %}
+      <div class="bg-amber-50 border border-amber-200 rounded-lg p-6 text-sm">
+        <h2 class="font-semibold text-amber-900 mb-1">
+          Step {{ current_step }} coming next
+        </h2>
+        <p class="text-amber-900">
+          Channel <strong>{{ channel_name or '(not set)' }}</strong> is saved.
+          The remaining wizard steps (install webhook, paste URL, map
+          teammates, test message) ship in the next iteration of this build.
+        </p>
+        <div class="mt-4 flex items-center gap-3">
+          <a href="/settings/slack?step=1"
+             class="text-sm text-slate-500 hover:text-slate-700">← Restart wizard</a>
+          <a href="/settings/team"
+             class="text-sm text-indigo-600 hover:underline">Map teammate emails / Slack IDs →</a>
+        </div>
+      </div>
+
+    {# ---------- Step 7: Done overview (also reachable when fully configured) ---------- #}
+    {% else %}
+      <div class="bg-emerald-50 border border-emerald-200 rounded-lg p-6 text-sm">
+        <h2 class="font-semibold text-emerald-900 mb-1">Slack connected ✓</h2>
+        <p class="text-emerald-900">
+          Channel: <strong>{{ channel_name or '(not set)' }}</strong>
+        </p>
+        <p class="mt-2 text-emerald-900">
+          Reset / re-install ships in a later step.
+        </p>
+      </div>
+    {% endif %}
+
+    <footer class="mt-10 text-xs text-slate-400 text-center">
+      Draftboard API starter · Slack settings · Wizard step {{ current_step }}
+    </footer>
+  </div>
+</body>
+</html>
