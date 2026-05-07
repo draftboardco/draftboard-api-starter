@@ -3297,18 +3297,25 @@ def supporters_candidates_view():
     # so already-resolved rows render with the URL inline. Fresh candidates
     # render the "Resolve" button; the JS handler hits /candidates/resolve and
     # mutates the row in place on success.
+    #
+    # `resolution_attempted` distinguishes "we tried and got nothing" (show
+    # Retry) from "we never tried" (show Resolve). The resolver leaves
+    # `error` NULL on plain "no match" results, so we have to look at the
+    # cache row's existence, not just at the error column.
     for c in candidates:
         cached = db_get_resolution(c["email"])
         if cached:
             c["linkedin_url"] = cached.get("linkedin_url") or ""
             c["resolution_source"] = cached.get("source") or ""
             c["resolution_confidence"] = cached.get("confidence") or ""
-            c["resolution_error"] = cached.get("error") or ""
+            c["resolution_error"] = cached.get("error") or cached.get("reasoning") or ""
+            c["resolution_attempted"] = True
         else:
             c["linkedin_url"] = ""
             c["resolution_source"] = ""
             c["resolution_confidence"] = ""
             c["resolution_error"] = ""
+            c["resolution_attempted"] = False
     total_pages = max(1, (total + per_page - 1) // per_page)
     status = google_status()
     sync_state = google_sync_progress_snapshot()
