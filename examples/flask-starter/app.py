@@ -319,6 +319,37 @@ def init_db():
             )
         """)
 
+        # Slack assignment config. Stores webhook URL, channel display name,
+        # setup completion timestamps, etc. Single-tenant — one Slack
+        # destination per Flask install. Schema is intentionally a small
+        # key/value store so we can add new keys (e.g., bot token for v2
+        # two-way reactions) without migrations.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS slack_config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+        """)
+
+        # Per-teammate map: owner_id (from Connection.owners[]) → Slack user ID
+        # and email. Shared by:
+        #   - Slack assign feature (uses slack_user_id for @-mentions)
+        #   - Existing Compose-email-to-teammate flow (uses email to pre-fill
+        #     the Gmail compose URL's `to=` field — the field has been empty
+        #     since that feature shipped because the Draftboard API doesn't
+        #     expose Member emails).
+        # Empty-string defaults so a teammate can have just one of the two
+        # values populated (e.g., email mapped but no Slack ID).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS team_members (
+                owner_id TEXT PRIMARY KEY,
+                slack_user_id TEXT NOT NULL DEFAULT '',
+                email TEXT NOT NULL DEFAULT '',
+                updated_at INTEGER NOT NULL
+            )
+        """)
+
         # Connector-first index: one row per (connector_key, target_id) pair.
         # The Draftboard API mints a fresh `connection_id` for every
         # (connector, target) combo — so to group "the same person across many
@@ -722,6 +753,121 @@ def db_app_state_set(key, value):
         conn.commit()
 
 
+# ---------- Slack config + team_members ----------
+# Both tables underpin the Slack-assignment feature AND the email-prefill
+# upgrade to the existing Compose-email-to-teammate flow.
+
+def db_get_slack_config(key, default=""):
+    """Read a Slack config value. Known keys: 'webhook_url', 'channel_name',
+    'setup_completed_at', 'last_test_at'. Empty string when unset."""
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute("SELECT value FROM slack_config WHERE key = ?", (key,))
+        row = cur.fetchone()
+        return row[0] if row else default
+
+
+def db_set_slack_config(key, value):
+    with _db_lock, _db_connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO slack_config (key, value, updated_at) VALUES (?, ?, ?)",
+            (key, str(value), int(time.time())),
+        )
+        conn.commit()
+
+
+def db_clear_slack_config(preserve_channel=True):
+    """Reset Slack config. By default keeps `channel_name` so the user
+    doesn't have to retype it after rotating a webhook — only the
+    webhook + completion timestamps are cleared. Call with
+    preserve_channel=False to wipe everything.
+
+    `team_members` is never touched here; email mappings are useful even
+    without Slack."""
+    with _db_lock, _db_connect() as conn:
+        if preserve_channel:
+            conn.execute(
+                "DELETE FROM slack_config WHERE key != 'channel_name'"
+            )
+        else:
+            conn.execute("DELETE FROM slack_config")
+        conn.commit()
+
+
+def slack_is_configured():
+    """True iff a real-looking Slack webhook URL is saved AND at least one
+    teammate is mapped to a Slack user ID. Drives whether the 💬 Slack row
+    appears in the Assign-to-teammate dropdown.
+
+    The webhook shape check matters: a partially-completed wizard or a stale
+    DB write could leave a non-empty-but-bogus value here, and we don't want
+    to surface a Slack action that we know will fail."""
+    webhook = db_get_slack_config("webhook_url") or ""
+    if not _SLACK_WEBHOOK_RE.match(webhook):
+        return False
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT 1 FROM team_members WHERE slack_user_id != '' LIMIT 1"
+        )
+        return cur.fetchone() is not None
+
+
+def db_get_team_member(owner_id):
+    """Returns dict {slack_user_id, email} or None if no row exists."""
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT slack_user_id, email FROM team_members WHERE owner_id = ?",
+            (owner_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {"slack_user_id": row[0] or "", "email": row[1] or ""}
+
+
+def db_set_team_member(owner_id, slack_user_id=None, email=None):
+    """Atomic upsert. Only updates fields explicitly passed (None = leave
+    unchanged). Empty string is a real value (clears the field).
+
+    The read-modify-write happens inside a single _db_lock block so two
+    concurrent saves of the same owner can't clobber each other's edits.
+    """
+    if slack_user_id is None and email is None:
+        return
+    if not owner_id:
+        return  # caller bug guard — refuse to write empty PK
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT slack_user_id, email FROM team_members WHERE owner_id = ?",
+            (owner_id,),
+        )
+        row = cur.fetchone()
+        existing_slack = (row[0] if row else "") or ""
+        existing_email = (row[1] if row else "") or ""
+        new_slack = existing_slack if slack_user_id is None else slack_user_id.strip()
+        new_email = existing_email if email is None else email.strip()
+        conn.execute(
+            "INSERT OR REPLACE INTO team_members "
+            "(owner_id, slack_user_id, email, updated_at) VALUES (?, ?, ?, ?)",
+            (owner_id, new_slack, new_email, int(time.time())),
+        )
+        conn.commit()
+
+
+def db_all_team_members():
+    """Returns dict keyed by owner_id of {slack_user_id, email}. Used by
+    settings page rendering and by the assignment-flow lookups."""
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT owner_id, slack_user_id, email FROM team_members"
+        )
+        return {
+            row[0]: {"slack_user_id": row[1] or "", "email": row[2] or ""}
+            for row in cur.fetchall()
+        }
+
+
+# ---------- LinkedIn resolver cache ----------
+
 def db_get_resolution(email: str, ttl_sec: int = RESOLUTION_CACHE_TTL):
     """Return a cached resolution dict for this email, or None if missing /
     expired. Email is normalized (lowercased) before lookup so 'Bogdan@X.com'
@@ -913,6 +1059,31 @@ def db_intro_requests_for_target(target_id):
 init_db()
 backfill_target_owners()
 backfill_connector_paths()
+
+
+def _migrate_slack_channel_name_strip_hash():
+    """One-shot migration: an earlier version stored channel_name with a
+    leading '#' (e.g. "#warm-intros"). The display layer now adds '#' at
+    render time, so any persisted '#'-prefixed value would render as
+    "##warm-intros". Strip it once at boot."""
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT value FROM slack_config WHERE key = 'channel_name'"
+        )
+        row = cur.fetchone()
+        if not row or not row[0]:
+            return
+        if row[0].startswith("#"):
+            cleaned = row[0].lstrip("#").strip()
+            conn.execute(
+                "UPDATE slack_config SET value = ?, updated_at = ? "
+                "WHERE key = 'channel_name'",
+                (cleaned, int(time.time())),
+            )
+            conn.commit()
+
+
+_migrate_slack_channel_name_strip_hash()
 
 
 def _auth_headers():
@@ -1563,19 +1734,27 @@ def _build_messages(target, connection):
     }
 
 
-def _gmail_compose_url(subject, body):
-    """Build a Gmail compose URL the user's browser can open in their logged-in account."""
+def _gmail_compose_url(subject, body, to=None):
+    """Build a Gmail compose URL the user's browser can open in their logged-in
+    account. `to` is optional; when provided, Gmail pre-fills the To: field."""
     from urllib.parse import quote
-    return (
-        "https://mail.google.com/mail/?view=cm&fs=1"
-        f"&su={quote(subject)}"
-        f"&body={quote(body)}"
-    )
+    parts = [
+        "https://mail.google.com/mail/?view=cm&fs=1",
+        f"&su={quote(subject)}",
+        f"&body={quote(body)}",
+    ]
+    if to:
+        parts.append(f"&to={quote(to)}")
+    return "".join(parts)
 
 
 def _build_assign_to_teammate_draft(target, connection, teammate):
     """Generate a Gmail draft asking a teammate to ping the connector for an
-    intro to the target. Used by the 'Assigned to' dropdown."""
+    intro to the target. Used by the 'Assigned to' dropdown.
+
+    Looks up the teammate's email in `team_members` (populated via the Team
+    Settings page) — when present, the Gmail compose URL pre-fills the To:
+    field. Otherwise the To: stays empty (existing behavior)."""
     target_first = (target.get("firstName") or "").strip() or "them"
     target_last = (target.get("lastName") or "").strip()
     target_full = f"{target_first} {target_last}".strip() if target_last else target_first
@@ -1589,6 +1768,7 @@ def _build_assign_to_teammate_draft(target, connection, teammate):
         connector_full = "your connection"
 
     teammate_first = (teammate.get("firstName") or "").strip() or "there"
+    teammate_id = teammate.get("id")
 
     company_clause = f" at {target_company}" if target_company else ""
     body_parts = [
@@ -1602,17 +1782,29 @@ def _build_assign_to_teammate_draft(target, connection, teammate):
     body = "\n\n".join(body_parts)
     subject = f"Quick ask: warm intro to {target_full}?"
 
+    # Look up the teammate's email + Slack ID so the Gmail compose URL can
+    # pre-fill To:, and the Slack row only appears when we know the handle.
+    teammate_email = ""
+    teammate_slack_user_id = ""
+    if teammate_id:
+        member = db_get_team_member(teammate_id)
+        if member:
+            teammate_email = member.get("email") or ""
+            teammate_slack_user_id = member.get("slack_user_id") or ""
+
     return {
-        "teammate_id": teammate.get("id"),
+        "teammate_id": teammate_id,
         "teammate_first": teammate_first,
         "teammate_last": (teammate.get("lastName") or "").strip(),
         "teammate_full": (
             f"{teammate_first} {(teammate.get('lastName') or '').strip()}"
         ).strip(),
         "teammate_initials": _initials(teammate.get("firstName"), teammate.get("lastName")),
+        "teammate_email": teammate_email,
+        "teammate_slack_user_id": teammate_slack_user_id,
         "subject": subject,
         "body": body,
-        "gmail_url": _gmail_compose_url(subject, body),
+        "gmail_url": _gmail_compose_url(subject, body, to=teammate_email or None),
     }
 
 
@@ -1671,6 +1863,13 @@ def _enrich_connection(target, connection, requested_set=None, my_user_id=None):
         _build_assign_to_teammate_draft(target, connection, o) for o in other_owners
     ]
 
+    # Slack rendering hint for the dropdown: the template only shows a
+    # "💬 Slack #channel" row for a teammate when BOTH are true:
+    #   1. the workspace has Slack configured (webhook URL + completed setup)
+    #   2. that specific teammate has a slack_user_id mapped in team_members
+    slack_on = slack_is_configured()
+    slack_channel = (db_get_slack_config("channel_name") or "").strip() if slack_on else ""
+
     return {
         "id": cid,
         "name": f"{first} {last}".strip() or "(no name)",
@@ -1685,6 +1884,8 @@ def _enrich_connection(target, connection, requested_set=None, my_user_id=None):
         "is_owned_by_me": is_owned_by_me,
         "other_owners": other_owners,
         "assign_drafts": assign_drafts,
+        "slack_configured": slack_on,
+        "slack_channel_name": slack_channel,
         "draft_message": messages["plain"],
         "draft_html": messages["html"],
         "draft_plain_fallback": messages["plain_fallback"],
@@ -2337,6 +2538,567 @@ def sync_start():
     started = start_sync(force_all=force)
     return jsonify({"started": started, "force": force, "state": sync_progress_snapshot()})
 
+
+# ---------- Team Settings page ----------
+# Flat editable map of every owner that has appeared in your workspace's
+# connection data. Pulls owner identity from `target_owners` (already
+# populated by the existing sync), lets the user paste a Slack user ID and
+# email per teammate. The saved values feed:
+#   - Slack assign feature (uses slack_user_id for @-mentions)
+#   - Compose-email-to-teammate flow (uses email to pre-fill Gmail's To: field)
+# Independent of Slack — useful immediately just for the email map.
+
+@app.route("/settings/slack", methods=["GET"])
+def settings_slack_view():
+    """Slack-setup wizard. Driven by ?step=N URL param, but also infers the
+    next step automatically from saved state so users can resume mid-flow.
+
+    Steps:
+      1. Intro / "want to set up?"
+      2. Pick a Slack channel display name
+      3. Install Incoming Webhook (next iteration)
+      4. Paste webhook URL (next iteration)
+      5. Map teammates → Slack IDs (links to /settings/team — next iteration)
+      6. Test message (next iteration)
+      7. Done (overview + reset)
+    """
+    webhook_url = db_get_slack_config("webhook_url")
+    channel_name = db_get_slack_config("channel_name")
+    completed_at = db_get_slack_config("setup_completed_at")
+
+    # Defensive: a config can be "completed" only when it actually has a
+    # valid webhook AND a channel saved. If something cleared one of them,
+    # don't show the "Slack connected ✓" page lying about state.
+    is_done = bool(
+        completed_at
+        and webhook_url
+        and channel_name
+        and _SLACK_WEBHOOK_RE.match(webhook_url)
+    )
+
+    requested = request.args.get("step")
+    if is_done and not requested:
+        current_step = "done"
+    elif requested:
+        try:
+            current_step = max(1, min(7, int(requested)))
+        except ValueError:
+            current_step = 1
+    else:
+        # Auto-resume based on what's been saved so far.
+        if not channel_name:
+            current_step = 1
+        elif not webhook_url:
+            current_step = 3  # channel picked, need webhook install
+        else:
+            current_step = 5  # webhook done, need teammate map
+
+    # Counts used by step 5 to surface "you have N teammates discovered, M
+    # mapped" inline. Cheap to compute and the data is on every wizard
+    # render — keeps templates simple.
+    teammates = db_unique_owners()
+    members = db_all_team_members()
+    mapped_slack = sum(1 for m in members.values() if m.get("slack_user_id"))
+    me, _ = fetch_me()
+
+    # Format the completion timestamp for display — raw Unix seconds is
+    # confusing in the "Set up" field on step 7.
+    completed_at_display = ""
+    if completed_at:
+        try:
+            completed_at_display = time.strftime(
+                "%Y-%m-%d %H:%M", time.localtime(int(completed_at))
+            )
+        except (TypeError, ValueError):
+            completed_at_display = ""
+
+    return render_template(
+        "settings_slack.html",
+        current_step=current_step,
+        channel_name=channel_name or "",
+        webhook_url=webhook_url or "",
+        completed_at=completed_at or "",
+        completed_at_display=completed_at_display,
+        error=request.args.get("error", ""),
+        total_teammates=len(teammates),
+        mapped_slack=mapped_slack,
+        me=me,
+        active="settings",
+    )
+
+
+_SLACK_WEBHOOK_PREFIX = "https://hooks.slack.com/services/"
+
+# Strict shape for a real Slack incoming-webhook URL, e.g.
+# https://hooks.slack.com/services/T01ABCDEF/B099XYZ/abc123def456...
+# Catches pasted gibberish AND prevents @-host SSRF tricks like
+# https://hooks.slack.com/services/x@evil.example/x/x.
+_SLACK_WEBHOOK_RE = re.compile(
+    r"^https://hooks\.slack\.com/services/T[A-Z0-9]{6,}/B[A-Z0-9]{6,}/[A-Za-z0-9]{16,}$"
+)
+
+# Slack user IDs are like U01ABCDEF or W0... (workspace IDs). Accept both.
+_SLACK_USER_ID_RE = re.compile(r"^[UW][A-Z0-9]{6,}$")
+
+# Reasonable channel name: alphanumerics, dashes, underscores, dots. Slack's
+# own rules are stricter (lowercase, max 80 chars) but we're permissive on
+# case for the display label.
+_SLACK_CHANNEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
+
+
+def _normalize_slack_channel(raw):
+    """Normalize a user-typed channel name. Strips leading '#', strips
+    whitespace, validates against the channel-name regex. Returns the clean
+    name (no '#') on success, or None if invalid."""
+    if not raw:
+        return None
+    s = raw.strip().lstrip("#").strip()
+    if not s or not _SLACK_CHANNEL_RE.match(s):
+        return None
+    return s
+
+
+def _normalize_slack_user_id(raw):
+    """Normalize a user-typed Slack user ID. Strips '<@...>', '@', whitespace.
+    Returns the clean ID on success, '' if input was empty/whitespace, or None
+    if input was non-empty but malformed."""
+    if raw is None:
+        return ""
+    s = raw.strip()
+    if not s:
+        return ""
+    # Strip <@U123> and <@U123|sarah> mention syntax
+    if s.startswith("<@") and s.endswith(">"):
+        s = s[2:-1]
+        if "|" in s:
+            s = s.split("|", 1)[0]
+    s = s.lstrip("@").strip()
+    if _SLACK_USER_ID_RE.match(s):
+        return s
+    return None
+
+
+def _slack_mrkdwn_escape(text):
+    """Escape a name/string for safe embedding in a Slack mrkdwn block.
+
+    Slack's mrkdwn parser treats `*` `_` `~` as formatting and `<...>` as
+    links/mentions. `&` `<` `>` MUST be HTML-entity escaped per Slack's docs.
+    Names like `Tom*Bold*` or `<John>` would otherwise break the message.
+    """
+    if not text:
+        return ""
+    s = str(text)
+    # Slack-required HTML entity escapes (must come first)
+    s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # Strip mrkdwn formatters from name fields. We strip rather than escape
+    # because there's no canonical escape for *_~ — Slack's recommendation
+    # is to remove them when they aren't intended as formatting.
+    for ch in ("*", "_", "~", "`"):
+        s = s.replace(ch, "")
+    return s
+
+
+@app.route("/settings/slack", methods=["POST"])
+def settings_slack_save():
+    """Wizard advance handler. Each step posts its form data + a hidden `step`
+    field; we persist what we got and redirect to the next step (or stay if
+    the user picked 'skip')."""
+    step = request.form.get("step", "")
+
+    if step == "1":
+        choice = request.form.get("choice", "")
+        if choice == "yes":
+            return redirect(url_for("settings_slack_view", step=2))
+        # skip-for-now → bounce back to Targets
+        return redirect("/")
+
+    if step == "2":
+        # Stored WITHOUT a leading '#' — display layer adds the '#' prefix.
+        # Avoids the "##warm-intros" double-prefix bug when concatenated.
+        normalized = _normalize_slack_channel(request.form.get("channel_name") or "")
+        if not normalized:
+            return redirect(url_for("settings_slack_view", step=2, error="bad_channel"))
+        db_set_slack_config("channel_name", normalized)
+        return redirect(url_for("settings_slack_view", step=3))
+
+    if step == "3":
+        # Informational step — nothing to save, just advance.
+        return redirect(url_for("settings_slack_view", step=4))
+
+    if step == "4":
+        webhook = (request.form.get("webhook_url") or "").strip()
+        # Strict shape check — catches typos AND blocks SSRF-flavored URLs
+        # like https://hooks.slack.com/services/x@127.0.0.1/x/x.
+        if len(webhook) > 256 or not _SLACK_WEBHOOK_RE.match(webhook):
+            return redirect(url_for("settings_slack_view", step=4, error="bad_url"))
+        db_set_slack_config("webhook_url", webhook)
+        return redirect(url_for("settings_slack_view", step=5))
+
+    if step == "5":
+        # Teammate-map step is informational — the actual mapping happens on
+        # /settings/team (a separate page that's been live since iteration 2).
+        # Just advance.
+        return redirect(url_for("settings_slack_view", step=6))
+
+    # Step 6 (test message) is handled by /settings/slack/test, not here.
+    return redirect(url_for("settings_slack_view"))
+
+
+@app.route("/settings/slack/test", methods=["POST"])
+def settings_slack_test():
+    """Send a real Slack test message via the configured webhook. On success,
+    record `last_test_at` + `setup_completed_at` and bounce the user to the
+    "Slack connected ✓" overview (step 7). On failure, bounce back to step 6
+    with a descriptive ?error= param so the user can see what went wrong."""
+    webhook = db_get_slack_config("webhook_url")
+    if not webhook:
+        return redirect(url_for("settings_slack_view", step=4, error="no_webhook"))
+
+    me, _ = fetch_me()
+    user_full = ""
+    if me:
+        user_full = (
+            f"{(me.get('user_first') or '').strip()} "
+            f"{(me.get('user_last') or '').strip()}"
+        ).strip()
+
+    channel_name = db_get_slack_config("channel_name")
+    channel_display = f"#{channel_name}" if channel_name else "this channel"
+    sender = f" from {_slack_mrkdwn_escape(user_full)}" if user_full else ""
+    text = (
+        f":dart: Draftboard is connected — this is a test message{sender}.\n"
+        f"{channel_display} will receive warm-intro alerts when you or a "
+        f"teammate clicks _Assign to teammate_ → :speech_balloon: *Slack* on "
+        f"a connector card."
+    )
+
+    try:
+        # allow_redirects=False so a fake/dead webhook (which Slack 302s away
+        # from) doesn't masquerade as success when the redirect target 200s.
+        r = requests.post(
+            webhook, json={"text": text}, timeout=10, allow_redirects=False
+        )
+    except requests.RequestException:
+        return redirect(url_for("settings_slack_view", step=6, error="network"))
+
+    # Canonical Slack-incoming-webhook success: HTTP 200 + body == "ok".
+    # Anything else (other status codes, empty body, body with an error code
+    # like "no_service") is a failure we report to the user.
+    body = (r.text or "").strip()
+    if r.status_code != 200 or body != "ok":
+        reason = body or f"http_{r.status_code}"
+        # Sanitize for URL: spaces/punct out, max 32 chars.
+        reason = re.sub(r"[^A-Za-z0-9_-]+", "_", reason)[:32] or f"http_{r.status_code}"
+        return redirect(url_for(
+            "settings_slack_view", step=6, error=f"slack_{reason}"
+        ))
+
+    now = int(time.time())
+    db_set_slack_config("last_test_at", str(now))
+    db_set_slack_config("setup_completed_at", str(now))
+    return redirect(url_for("settings_slack_view", step=7))
+
+
+def _slack_score_label(score):
+    """Plain-language strength label for an owner→connection score (0-100ish).
+    The Draftboard API doesn't expose per-owner scoreDetails ('the story') —
+    only a number — so this is the best we can do for the 'why this teammate'
+    line in the Slack message until that API gap closes."""
+    score = int(score or 0)
+    if score >= 90:
+        return "strong"
+    if score >= 70:
+        return "decent"
+    if score >= 50:
+        return "moderate"
+    return "weak"
+
+
+def _build_slack_assign_payload(target, connection, owner, slack_user_id):
+    """Build the Block Kit + fallback-text payload for a teammate-assignment
+    Slack post. Two-perspective 'why' as discussed: scoreDetails-derived
+    sentence for connector→target, score-based label for teammate→connector."""
+    target_first = (target.get("firstName") or "").strip()
+    target_last = (target.get("lastName") or "").strip()
+    target_full = f"{target_first} {target_last}".strip() or "this prospect"
+    target_pos = target.get("position") or {}
+    target_title = (target_pos.get("title") or "").strip()
+    target_company = (target_pos.get("companyName") or "").strip()
+    target_linkedin = (target.get("linkedinUrl") or "").strip()
+
+    connector_first = (connection.get("firstName") or "").strip()
+    connector_last = (connection.get("lastName") or "").strip()
+    connector_full = f"{connector_first} {connector_last}".strip() or "your connection"
+    connector_linkedin = (connection.get("linkedinUrl") or "").strip()
+
+    # Sanitize every name/string that ends up inside a mrkdwn section. Slack
+    # treats *_~<>& as formatting / link / entity characters; a connector
+    # named "Tom*Bold*" or "<John>" would otherwise corrupt the message
+    # rendering. plain_text fields (button labels) only need <>& escaping,
+    # which Slack accepts as HTML entities — _slack_mrkdwn_escape is more
+    # aggressive than needed for plain_text but doesn't break it.
+    target_first_s = _slack_mrkdwn_escape(target_first)
+    target_full_s = _slack_mrkdwn_escape(target_full)
+    target_title_s = _slack_mrkdwn_escape(target_title)
+    target_company_s = _slack_mrkdwn_escape(target_company)
+    connector_first_s = _slack_mrkdwn_escape(connector_first)
+    connector_full_s = _slack_mrkdwn_escape(connector_full)
+
+    # Why connector → target — reuse the existing third-person humanizer that
+    # already powers connector-card bullets ("Mindy worked with Bogdan at
+    # Microsoft for 26 months, most recently in 2009").
+    raw_details = connection.get("scoreDetails") or []
+    humanized_subject = connector_first or "they"
+    humanized_object = target_first or "them"
+    humanized = [
+        _humanize_for_card(d, humanized_subject, humanized_object)
+        for d in raw_details
+    ]
+    humanized = [h for h in humanized if h]
+    why_connector_target = _slack_mrkdwn_escape(humanized[0]) if humanized else ""
+
+    owner_score = owner.get("score")
+    score_strength = _slack_score_label(owner_score)
+
+    # ---- Build the message body (mrkdwn). One section, multi-line. ----
+    prospect_line = f"*Prospect:* {target_full_s}"
+    sub_bits = []
+    if target_title_s:
+        sub_bits.append(target_title_s)
+    if target_company_s:
+        sub_bits.append(f"at {target_company_s}")
+    if sub_bits:
+        prospect_line += "  _" + " ".join(sub_bits) + "_"
+
+    connection_line = f"*Connection:* {connector_full_s}"
+    # Drop the parenthetical when the score is unknown — "score 0 — weak" is
+    # more confusing than helpful when it just means "no signal yet."
+    if owner_score and owner_score > 0:
+        connection_line += (
+            f"  _(your score with {connector_first_s or 'them'}: "
+            f"{owner_score} — {score_strength})_"
+        )
+
+    why_line = ""
+    if why_connector_target:
+        # E.g., "*Why Adrian → Yoav:* Adrian worked with Yoav at Microsoft
+        # for 26 months, most recently in 2009"
+        why_line = (
+            f"*Why {connector_first_s or 'this connection'} → "
+            f"{target_first_s or 'them'}:* {why_connector_target}"
+        )
+
+    # `slack_user_id` is normalized at write-time in db_set_team_member,
+    # so it's safe to interpolate raw — but defense-in-depth: re-validate
+    # here in case the row was written before normalization shipped.
+    safe_uid = slack_user_id
+    if not _SLACK_USER_ID_RE.match(safe_uid or ""):
+        # Fallback to the connector's first name to avoid a broken @-mention.
+        # The route caller has already gated on a non-empty mapped ID, so
+        # this branch is paranoia.
+        safe_uid = ""
+    mention = f"<@{safe_uid}>" if safe_uid else "the assigned teammate"
+    headline = f":dart: Hey {mention}, you can make a warm intro"
+
+    body_lines = [headline, "", prospect_line, connection_line]
+    if why_line:
+        body_lines.append(why_line)
+    body_text = "\n".join(body_lines)
+
+    # Slack's section-text limit is 3000 chars. Realistic messages are well
+    # under, but a target with a paragraph-long company name + scoreDetails
+    # could trip it. Truncate with a clear marker rather than letting Slack
+    # reject the whole message.
+    if len(body_text) > 2900:
+        body_text = body_text[:2890].rstrip() + "\n_…(truncated)_"
+
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": body_text}},
+    ]
+
+    # Action buttons: LinkedIn for the target (always real) + LinkedIn for the
+    # connector when available. Slack rejects buttons with non-http(s) URLs,
+    # so guard against pasted-in javascript: or data: schemes (extremely
+    # unlikely for Draftboard data, but the kit is a reference for customers
+    # who will plug in their own data sources).
+    action_elements = []
+    if target_linkedin and target_linkedin.startswith(("http://", "https://")):
+        action_elements.append({
+            "type": "button",
+            "text": {"type": "plain_text", "text": f"View {target_first or 'prospect'} on LinkedIn"[:75]},
+            "url": target_linkedin,
+        })
+    if connector_linkedin and connector_linkedin.startswith(("http://", "https://")):
+        action_elements.append({
+            "type": "button",
+            "text": {"type": "plain_text", "text": f"View {connector_first or 'connector'} on LinkedIn"[:75]},
+            "url": connector_linkedin,
+        })
+    if action_elements:
+        blocks.append({"type": "actions", "elements": action_elements})
+
+    # Notification-tray preview text — plain text, no mrkdwn parsing.
+    fallback_text = f"Warm intro path: {connector_full} -> {target_full}"
+    return {"blocks": blocks, "text": fallback_text}
+
+
+@app.route("/slack/assign", methods=["POST"])
+def slack_assign():
+    """Post a teammate-assignment message to the configured Slack webhook.
+
+    Request JSON: {target_id, connection_id, owner_id}
+
+    Looks up:
+      - target metadata from cached /targets list
+      - the specific Connection (by connection_id) from cached
+        /targets/{id}/connections JSON
+      - the specific owner inside connection.owners[] (so we get their score)
+      - the owner's Slack user ID from team_members
+      - the webhook URL from slack_config
+
+    Posts a Block Kit message tagging the teammate. Returns JSON
+    {ok: bool, error?: str} so the click handler can show a toast.
+    """
+    data = request.get_json(silent=True) or {}
+    target_id = (data.get("target_id") or "").strip()
+    connection_id = (data.get("connection_id") or "").strip()
+    owner_id = (data.get("owner_id") or "").strip()
+
+    if not (target_id and connection_id and owner_id):
+        return jsonify({"ok": False, "error": "missing target_id, connection_id, or owner_id"}), 400
+
+    webhook = db_get_slack_config("webhook_url")
+    if not webhook:
+        return jsonify({"ok": False, "error": "Slack isn't configured yet — visit Settings → Slack"}), 400
+
+    member = db_get_team_member(owner_id) or {}
+    slack_user_id = (member.get("slack_user_id") or "").strip()
+    if not slack_user_id:
+        return jsonify({"ok": False, "error": "this teammate has no Slack ID mapped — visit Settings → Team to add one"}), 400
+
+    targets, _ = fetch_all_targets()
+    target = next((t for t in targets if t.get("id") == target_id), None)
+    if not target:
+        return jsonify({"ok": False, "error": "target not found in local cache"}), 404
+
+    target_connections, _err = fetch_target_connections(target_id)
+    connection = next((c for c in target_connections if c.get("id") == connection_id), None)
+    if not connection:
+        return jsonify({"ok": False, "error": "connection not found for this target"}), 404
+
+    owner = next((o for o in (connection.get("owners") or []) if o.get("id") == owner_id), None)
+    if not owner:
+        return jsonify({"ok": False, "error": "this owner isn't on the connection's owners list"}), 400
+
+    payload = _build_slack_assign_payload(target, connection, owner, slack_user_id)
+
+    try:
+        r = requests.post(webhook, json=payload, timeout=10, allow_redirects=False)
+    except requests.RequestException as e:
+        return jsonify({"ok": False, "error": f"network error posting to Slack: {e}"}), 502
+
+    body = (r.text or "").strip()
+    if r.status_code != 200 or body != "ok":
+        return jsonify({
+            "ok": False,
+            "error": f"Slack returned {r.status_code}: {body[:128]}",
+        }), 502
+
+    return jsonify({"ok": True, "channel": db_get_slack_config("channel_name") or ""})
+
+
+@app.route("/settings/slack/reset", methods=["POST"])
+def settings_slack_reset():
+    """Wipe Slack config (webhook URL, channel name, completion timestamps)
+    and bounce back to step 1 so the user can re-run the wizard. Leaves
+    team_members intact since email mappings are still useful even when
+    Slack is offline."""
+    db_clear_slack_config()
+    return redirect(url_for("settings_slack_view", step=1))
+
+
+@app.route("/settings/team", methods=["GET"])
+def settings_team_view():
+    owners = db_unique_owners()  # [{id, first, last, name, linkedin, target_count}, ...]
+    members = db_all_team_members()  # owner_id -> {slack_user_id, email}
+    rows = []
+    for o in owners:
+        m = members.get(o["id"]) or {"slack_user_id": "", "email": ""}
+        rows.append({
+            "owner_id": o["id"],
+            "name": o["name"],
+            "first": o["first"],
+            "linkedin": o["linkedin"],
+            "target_count": o["target_count"],
+            "slack_user_id": m["slack_user_id"],
+            "email": m["email"],
+        })
+    me, _ = fetch_me()
+    invalid_slack = (request.args.get("invalid_slack") or "").strip()
+    invalid_slack_list = [s for s in invalid_slack.split(",") if s] if invalid_slack else []
+    return render_template(
+        "settings_team.html",
+        rows=rows,
+        total_owners=len(rows),
+        mapped_emails=sum(1 for r in rows if r["email"]),
+        mapped_slack=sum(1 for r in rows if r["slack_user_id"]),
+        saved=request.args.get("saved") == "1",
+        invalid_slack_list=invalid_slack_list,
+        slack_configured=slack_is_configured(),
+        slack_webhook_saved=bool(db_get_slack_config("webhook_url")),
+        me=me,
+        active="settings",
+    )
+
+
+@app.route("/settings/team", methods=["POST"])
+def settings_team_save():
+    """Receive the entire team-mapping form and upsert each row.
+
+    Form field names: `slack_user_id__<owner_id>` and `email__<owner_id>`.
+    Empty-string values are treated as "clear the field" (legitimate).
+
+    Validation:
+      - owner_id must be non-empty AND exist in target_owners (rejects
+        crafted form-field names like `slack_user_id__` with empty PK
+        or arbitrary IDs not yet known to the app)
+      - slack_user_id is normalized via _normalize_slack_user_id which
+        strips '@', '<@U…>' mention syntax, and rejects malformed input
+    """
+    valid_owner_ids = {o["id"] for o in db_unique_owners()}
+    invalid_slack = []  # (owner_first_or_id, raw_value)
+    members_by_id = {o["id"]: o for o in db_unique_owners()}
+
+    for key, value in request.form.items():
+        if key.startswith("slack_user_id__"):
+            owner_id = key[len("slack_user_id__"):]
+            if not owner_id or owner_id not in valid_owner_ids:
+                continue  # silently skip — likely a stale form
+            normalized = _normalize_slack_user_id(value)
+            if normalized is None:
+                # Non-empty but malformed — collect for inline error
+                friendly = members_by_id.get(owner_id, {}).get("first") or owner_id
+                invalid_slack.append(friendly)
+                continue
+            db_set_team_member(owner_id, slack_user_id=normalized)
+        elif key.startswith("email__"):
+            owner_id = key[len("email__"):]
+            if not owner_id or owner_id not in valid_owner_ids:
+                continue
+            db_set_team_member(owner_id, email=value)
+
+    if invalid_slack:
+        # Pass back the names of teammates whose Slack IDs were rejected so
+        # the page can show an inline error instead of silently dropping.
+        return redirect(url_for(
+            "settings_team_view",
+            saved="1",
+            invalid_slack=",".join(invalid_slack[:5]),
+        ))
+    return redirect(url_for("settings_team_view", saved="1"))
+
+
+# ---------- LinkedIn resolver routes ----------
 
 def _resolver_status(keys: dict) -> dict:
     """Summarize which resolver methods are usable given the configured keys.

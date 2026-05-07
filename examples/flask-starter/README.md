@@ -76,9 +76,10 @@ The first page load takes ~1 minute on a workspace with thousands of targets (th
 ## Files
 
 - `app.py` — Flask app, all routes, SQLite-backed connection cache, parallel sync worker + scheduler, ownership logic, message templating
-- `templates/` — Jinja templates. `_nav.html` is the top bar with the sync-progress pill. `_drawer_skeleton.html` is the slide-in drawer container plus its JS (drawer routing, clipboard copy, toast, account-drawer target switching). `_connector_card.html` is the path detail card shared between every drawer. `_owner_filter.html` is the team-member filter dropdown shared by Targets, Accounts, and New paths.
-- `requirements.txt` — Flask + requests
-- `env.example` — copy to `.env` and fill in your real key
+- `linkedin_resolver.py` — Apollo + Google CSE + gpt-4o-mini resolver module powering the `/candidates/resolve` route and the `/settings/linkedin-resolver` wizard
+- `templates/` — Jinja templates. `_nav.html` is the top bar with the sync-progress pill. `_drawer_skeleton.html` is the slide-in drawer container plus its JS (drawer routing, clipboard copy, toast, account-drawer target switching, Slack-assign click handler). `_connector_card.html` is the path detail card shared between every drawer (with the Assign-to-teammate dropdown that grows Slack rows when configured). `_owner_filter.html` is the team-member filter dropdown shared by Targets, Accounts, and New paths. `settings_team.html` maps each teammate to a Slack user ID + email. `settings_slack.html` is the 7-step Slack-setup wizard. `settings_linkedin_resolver.html` is the BYO-keys wizard for Apollo + Google CSE + OpenAI.
+- `requirements.txt` — Flask + requests + openai (the resolver uses gpt-4o-mini; the rest of the app has no LLM calls)
+- `env.example` — copy to `.env` and fill in your real key. Slack is configured in-app (no env vars). Resolver keys can also be set in-app via the wizard.
 - `data.db` — SQLite cache, created on first run. Gitignored. Delete it to force a full re-sync.
 
 ## SQLite tables
@@ -127,12 +128,51 @@ mode:
 This is useful for read-only testing, demoing on a flight, or when you've
 hit Draftboard's rate limits and need the app to keep working.
 
+## Slack assignments (optional)
+
+Out of the box, the "Assign to teammate" dropdown on each connector card
+opens a Gmail compose window with a pre-drafted ask. That works for everyone
+with zero setup. Want one-click "ping the teammate in Slack" instead? Visit
+**Settings → Slack** in the running app — a 7-step wizard walks you through:
+
+1. Pick a Slack channel (defaults to `#warm-intros`)
+2. Create a Slack app + Incoming Webhook for that channel (~3 minutes,
+   click-by-click instructions in the wizard)
+3. Paste the webhook URL
+4. Map your teammates' Slack user IDs in **Settings → Team** (one-time;
+   the same page where you map their email addresses for Gmail pre-fill)
+5. Send a test message to confirm it works
+
+Once configured, every connector card's "Assign to teammate" dropdown grows a
+new row per mapped teammate:
+
+- `📧 Email Sarah` (Gmail compose, always)
+- `💬 Slack Sarah in #warm-intros` (only when both Slack is configured AND
+  Sarah's Slack ID is mapped)
+
+The Slack message uses Block Kit and includes a two-perspective "why":
+
+- **Why your teammate → the connector**: their relationship score from
+  `Connection.owners[].score`, rendered as `"score 95 — strong"`
+- **Why the connector → the prospect**: derived from the `scoreDetails` the
+  Draftboard API returns ("Mindy worked with Bogdan at Microsoft for 26
+  months, most recently in 2009")
+
+Plus LinkedIn buttons for both the prospect and the connector. No bot, no
+OAuth — just the Incoming Webhook URL, which is one-way and safe to revoke
+from the Slack app dashboard at any time.
+
+Storage: webhook URL + setup state live in the `slack_config` SQLite table;
+per-teammate Slack user IDs and emails live in `team_members`. Both are
+single-row-per-key tables so they're easy to inspect or wipe.
+
 ## What it's missing (deliberately)
 
 - **No auth.** The app is single-tenant — whoever can hit `localhost:5050` sees everything in the workspace your API key belongs to. If you fork this for a multi-user product, layer your own auth.
-- **No teammate email lookup.** The API doesn't expose Member emails, so the "Assign to teammate" Gmail draft has an empty `To:` field — you fill it in. A future Draftboard endpoint (`GET /organization/members` or similar) would let us pre-fill it.
+- **No automatic teammate email lookup.** The Draftboard API doesn't expose Member emails, so you fill them in once at **Settings → Team**. After that the "Assign to teammate" Gmail draft pre-fills the `To:` field automatically. A future endpoint (`GET /organization/members` or similar) would skip that step.
 - **No "Mark as requested" UI.** The SQLite table and toggle endpoint exist but the button is hidden — re-enable it in `templates/_connector_card.html` if you want.
 - **No LLM-generated messages.** Drafts are template-based — no API key for OpenAI/Anthropic needed. To plug an LLM in, replace `_build_messages()` in `app.py`.
+- **No two-way Slack reactions.** A teammate can't 👍 the Slack message to mark the path "I'll do it" — that requires a Slack bot + public HTTPS endpoint, which would change the kit's "runs on your laptop" shape. If demand emerges, it ships as a separate `examples/flask-hosted/` example.
 
 ## License / use
 
