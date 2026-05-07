@@ -31,7 +31,7 @@ The flow is asymmetric: **you** (the kit author) build the script once with your
        │
        ▼
     Their contacts pooled into the
-    candidates page, tagged "from <teammate>"
+    Supporters page, tagged "from <teammate>"
 ```
 
 The HTML review step is intentional — your teammate sees every contact the
@@ -122,4 +122,4 @@ Once the JSON lands in your inbox, head to your kit's `/supporters/import-teamma
 - Validates the schema
 - Stores rows in `teammate_contacts(contributor_email, email, …)` keyed by both
 - Re-imports from the same teammate UPDATE in place (idempotent)
-- Pools into `/supporters/candidates` alongside your own contacts, with a "From <teammate>" badge
+- Pools into the Supporters page alongside your own contacts, with a "From <teammate>" badge

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Draftboard — Supporter candidates</title>
+  <title>Draftboard — Supporters</title>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-50 text-slate-900 min-h-screen">
@@ -12,10 +12,15 @@
 
     <header class="mb-6 flex items-end justify-between flex-wrap gap-3">
       <div>
-        <h1 class="text-2xl font-semibold tracking-tight">Supporter candidates</h1>
+        <h1 class="text-2xl font-semibold tracking-tight">Supporters</h1>
         <p class="text-sm text-slate-500 mt-1">
-          Ranked by how often you actually engage — emails back-and-forth,
-          threads, and meetings, weighted toward recency.
+          Find potential Supporters in your Gmail and Calendar (and your
+          teammates' networks), then mark the ones you actually want to
+          add as Supporters in Draftboard.
+          <span class="block mt-1 text-xs text-slate-400">
+            Ranked by how often you actually engage — emails back-and-forth,
+            threads, and shared meetings, weighted toward recency.
+          </span>
         </p>
       </div>
       <div class="flex items-center gap-2">
@@ -43,7 +48,7 @@
         <div class="flex-1">
           <strong>LinkedIn resolver isn't configured.</strong>
           The "Resolve LinkedIn URL" buttons below need either an Apollo key or a Google Custom Search + OpenAI key combo.
-          Without them, you can still browse candidates and import them by pasting LinkedIn URLs manually.
+          Without them, you can still browse the list and import people manually by pasting LinkedIn URLs.
         </div>
         <a href="/settings/linkedin-resolver"
            class="text-xs px-3 py-1.5 rounded-md bg-slate-900 text-white hover:bg-slate-800">
@@ -57,7 +62,7 @@
       <div class="mb-4 rounded-md border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
         ✅ Imported {{ request.args.get('imported_count') or '' }} contact{{ '' if request.args.get('imported_count') == '1' else 's' }}
         {% if contributor %}from <strong>{{ contributor }}</strong>{% endif %}.
-        They're now mixed into your candidates below.
+        They're now mixed into your Supporters list below.
       </div>
     {% endif %}
 
@@ -112,7 +117,7 @@
     {# --- Bulk-resolve toolbar (above the filter bar so it persists across filter changes) --- #}
     {% if has_any_data and unresolved_count > 0 and resolver_status and resolver_status.any_ready %}
       <div id="bulk-resolve-bar" class="mb-3 flex items-center gap-3 flex-wrap rounded-md border border-indigo-200 bg-indigo-50 px-4 py-2 text-sm text-indigo-900">
-        <strong>{{ unresolved_count }}</strong> candidate{{ '' if unresolved_count == 1 else 's' }} {{ "hasn't" if unresolved_count == 1 else "haven't" }} been looked up on LinkedIn yet.
+        <strong>{{ unresolved_count }}</strong> {{ "person hasn't" if unresolved_count == 1 else "people haven't" }} been looked up on LinkedIn yet.
         <button id="bulk-resolve-btn" type="button"
                 class="ml-auto inline-flex items-center text-xs px-3 py-1.5 rounded-md bg-indigo-600 text-white font-medium hover:bg-indigo-700">
           Resolve all LinkedIn URLs →
@@ -171,7 +176,7 @@
           Apply
         </button>
         <div class="ml-auto text-xs text-slate-500">
-          {{ total }} candidate{{ '' if total == 1 else 's' }}
+          {{ total }} {{ "person" if total == 1 else "people" }}
           {% if status.last_synced_at %}
             · your last sync <span data-ts="{{ status.last_synced_at }}" class="rel-ts">{{ status.last_synced_at }}</span>
           {% endif %}
@@ -179,11 +184,11 @@
       </form>
     {% endif %}
 
-    {# --- Candidates table --- #}
+    {# --- Supporters table --- #}
     {% if total == 0 %}
       {% if has_any_data %}
         <div class="rounded-lg border border-dashed border-slate-300 bg-white py-16 px-6 text-center">
-          <p class="text-base font-medium text-slate-700">No candidates match these filters.</p>
+          <p class="text-base font-medium text-slate-700">Nobody matches these filters.</p>
           <p class="mt-2 text-sm text-slate-500 max-w-md mx-auto">
             {% if query or contributor %}
               Try clearing the search or contributor filter.
@@ -329,7 +334,7 @@
     {% endif %}
 
     <footer class="mt-10 text-xs text-slate-400 text-center">
-      Draftboard API starter · Supporter candidates · Re-sync any time from
+      Draftboard API starter · Supporters · Re-sync any time from
       <a href="/settings/google" class="underline hover:text-slate-500">Google settings</a>
     </footer>
   </div>
@@ -454,7 +459,7 @@
     var bulkProgress = document.getElementById('bulk-resolve-progress');
     if (bulkBtn) {
       bulkBtn.addEventListener('click', function () {
-        if (!confirm('Resolve LinkedIn URLs for all unresolved candidates? Each lookup uses a small bit of your Apollo / Google CSE quota.')) return;
+        if (!confirm('Resolve LinkedIn URLs for everyone who hasn\'t been looked up yet? Each lookup uses a small bit of your Apollo / Google CSE quota.')) return;
         bulkBtn.disabled = true;
         bulkBtn.textContent = 'Resolving…';
         bulkProgress.classList.remove('hidden');

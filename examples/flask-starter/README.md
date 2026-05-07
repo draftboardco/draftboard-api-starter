@@ -96,14 +96,14 @@ The first page load takes ~1 minute on a workspace with thousands of targets (th
 
 ## LinkedIn resolver setup
 
-When the Google Workspace integration is connected, the Candidates page lists high-engagement contacts pulled from your Gmail and Calendar. To import any of them as a Draftboard Target you need their LinkedIn URL — the resolver finds it for you so you don't have to copy-paste.
+When the Google Workspace integration is connected, the Supporters page lists high-engagement contacts pulled from your Gmail and Calendar. To import any of them as a Draftboard Target you need their LinkedIn URL — the resolver finds it for you so you don't have to copy-paste.
 
 Two methods, tried in order:
 
 1. **Apollo `/people/match`** — fastest. POST `(email, first_name, last_name)`, get the LinkedIn URL back when Apollo knows the person. Hits ~50–70% of business contacts.
-2. **Google Custom Search + gpt-4o-mini** — fallback. Searches `"{first_name} {company} linkedin"`, recovers profile URLs (also from `linkedin.com/posts/...` URLs that Google ranks above the actual profile), dedupes results with snippet merging to bypass LinkedIn's cookie-consent boilerplate, and asks gpt-4o-mini to pick the right candidate.
+2. **Google Custom Search + gpt-4o-mini** — fallback. Searches `"{first_name} {company} linkedin"`, recovers profile URLs (also from `linkedin.com/posts/...` URLs that Google ranks above the actual profile), dedupes results with snippet merging to bypass LinkedIn's cookie-consent boilerplate, and asks gpt-4o-mini to pick the right profile.
 
-If both methods miss, the candidate row stays usable — you paste the LinkedIn URL manually before clicking Import.
+If both methods miss, the row stays usable — you paste the LinkedIn URL manually before clicking Import.
 
 **All three keys are optional.** Configure none, some, or all via the in-app wizard at [`/settings/linkedin-resolver`](http://localhost:5050/settings/linkedin-resolver) — it has step-by-step setup links for Apollo, Google CSE, and OpenAI. Or set `APOLLO_API_KEY`, `GOOGLE_CSE_API_KEY`, `GOOGLE_CSE_ID`, and `OPENAI_API_KEY` in `.env` (see `env.example`). Wizard saves to `~/.draftboard-secrets/draftboard-api-starter-resolver.json` (mode 0600, owner-only).
 
@@ -127,13 +127,13 @@ mode:
 This is useful for read-only testing, demoing on a flight, or when you've
 hit Draftboard's rate limits and need the app to keep working.
 
-## Google Workspace setup (Candidates page)
+## Google Workspace setup (Supporters page)
 
-The **Candidates** page (`/supporters/candidates`) ranks the people you actually engage with — by Gmail thread frequency + Calendar meetings — so likely Supporters surface automatically.
+The **Supporters** page (`/supporters/candidates`) ranks the people you actually engage with — by Gmail thread frequency + Calendar meetings — so likely Supporters surface automatically. You then triage the list (star, hide, mark already-added) and push the keepers into Draftboard.
 
-> **Single-user main app, multi-user via portable scanner.** This Flask kit runs on one laptop. By default the Candidates page shows contacts from **your** Gmail + Calendar only. To pool a teammate's network, send them the portable scanner at `scanner/supporter_scan.py` — they OAuth on their laptop, export a JSON, send it back, you import via `/supporters/import-teammate`. Each contact gets badged with whose network it came from. See **"Pooling teammate networks"** below for the full flow.
+> **Single-user main app, multi-user via portable scanner.** This Flask kit runs on one laptop. By default the Supporters page shows contacts from **your** Gmail + Calendar only. To pool a teammate's network, send them the portable scanner at `scanner/supporter_scan.py` — they OAuth on their laptop, export a JSON, send it back, you import via `/supporters/import-teammate`. Each contact gets badged with whose network it came from. See **"Pooling teammate networks"** below for the full flow.
 
-**Customer flow is one click:** open `/settings/google` → click **Connect Google** → consent → 5-10 minute sync runs → candidates ready. No setup ceremony, no per-customer Google Cloud project. All Gmail + Calendar data stays on your laptop in `data.db` — Draftboard's infrastructure never touches it.
+**Customer flow is one click:** open `/settings/google` → click **Connect Google** → consent → 5-10 minute sync runs → Supporters list ready. No setup ceremony, no per-customer Google Cloud project. All Gmail + Calendar data stays on your laptop in `data.db` — Draftboard's infrastructure never touches it.
 
 ### Configuring the OAuth client (one-time, you do this once)
 
@@ -192,9 +192,9 @@ A Draftboard team is multiple people. Each person's Gmail + Calendar history is 
 3. **They run** `python3 supporter_scan.py` on their laptop. The script auto-installs missing packages, opens a browser for Google sign-in, scans 12 months of metadata, then writes a `supporter_scan_<email>_<date>.html` file next to itself.
 4. **They open that HTML in their browser**, see every contact the scan found in a sortable table with checkboxes, untick anyone they don't want shared, click **Save Filtered JSON** — a `_filtered.json` downloads.
 5. **They send the filtered JSON back** to you (Slack DM, email). Nothing leaves their laptop until they explicitly send the file.
-6. **You import** at `/supporters/import-teammate` — drag-drop the file, click Import. Their contacts merge into your Candidates page, badged with their name in the **From** column.
+6. **You import** at `/supporters/import-teammate` — drag-drop the file, click Import. Their contacts merge into your Supporters page, badged with their name in the **From** column.
 
-Re-imports from the same teammate replace their prior data (idempotent). The "Imported scans" section on the import page lists all your contributors with a Remove button per teammate. The contributor filter on the Candidates page lets you slice the list to just one person's network.
+Re-imports from the same teammate replace their prior data (idempotent). The "Imported scans" section on the import page lists all your contributors with a Remove button per teammate. The contributor filter on the Supporters page lets you slice the list to just one person's network.
 
 The scanner reads metadata only — From/To/Cc/Date headers, attendee lists. Never message bodies. The HTML and the resulting JSON both contain contact emails, names, and aggregate counts; nothing else. Privacy stays equivalent to what the kit already does: Draftboard's infrastructure never touches any of it. The HTML stays on the teammate's laptop unless they choose to send it; the filtered JSON only travels between them and you via whatever channel you DM through.
 
