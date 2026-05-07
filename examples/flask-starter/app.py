@@ -227,6 +227,37 @@ def init_db():
             )
         """)
 
+        # Slack assignment config. Stores webhook URL, channel display name,
+        # setup completion timestamps, etc. Single-tenant — one Slack
+        # destination per Flask install. Schema is intentionally a small
+        # key/value store so we can add new keys (e.g., bot token for v2
+        # two-way reactions) without migrations.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS slack_config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+        """)
+
+        # Per-teammate map: owner_id (from Connection.owners[]) → Slack user ID
+        # and email. Shared by:
+        #   - Slack assign feature (uses slack_user_id for @-mentions)
+        #   - Existing Compose-email-to-teammate flow (uses email to pre-fill
+        #     the Gmail compose URL's `to=` field — the field has been empty
+        #     since that feature shipped because the Draftboard API doesn't
+        #     expose Member emails).
+        # Empty-string defaults so a teammate can have just one of the two
+        # values populated (e.g., email mapped but no Slack ID).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS team_members (
+                owner_id TEXT PRIMARY KEY,
+                slack_user_id TEXT NOT NULL DEFAULT '',
+                email TEXT NOT NULL DEFAULT '',
+                updated_at INTEGER NOT NULL
+            )
+        """)
+
         # Connector-first index: one row per (connector_key, target_id) pair.
         # The Draftboard API mints a fresh `connection_id` for every
         # (connector, target) combo — so to group "the same person across many
@@ -609,6 +640,92 @@ def db_app_state_set(key, value):
             (key, str(value), int(time.time()))
         )
         conn.commit()
+
+
+# ---------- Slack config + team_members ----------
+# Both tables underpin the Slack-assignment feature AND the email-prefill
+# upgrade to the existing Compose-email-to-teammate flow.
+
+def db_get_slack_config(key, default=""):
+    """Read a Slack config value. Known keys: 'webhook_url', 'channel_name',
+    'setup_completed_at', 'last_test_at'. Empty string when unset."""
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute("SELECT value FROM slack_config WHERE key = ?", (key,))
+        row = cur.fetchone()
+        return row[0] if row else default
+
+
+def db_set_slack_config(key, value):
+    with _db_lock, _db_connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO slack_config (key, value, updated_at) VALUES (?, ?, ?)",
+            (key, str(value), int(time.time())),
+        )
+        conn.commit()
+
+
+def db_clear_slack_config():
+    """Wipe Slack config (used by Reset on the settings page). Leaves
+    team_members intact since email mappings are useful even without Slack."""
+    with _db_lock, _db_connect() as conn:
+        conn.execute("DELETE FROM slack_config")
+        conn.commit()
+
+
+def slack_is_configured():
+    """True iff a Slack webhook URL has been saved AND at least one teammate
+    is mapped to a Slack user ID. Drives whether the Slack row appears in the
+    Assign-to-teammate dropdown."""
+    if not db_get_slack_config("webhook_url"):
+        return False
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT 1 FROM team_members WHERE slack_user_id != '' LIMIT 1"
+        )
+        return cur.fetchone() is not None
+
+
+def db_get_team_member(owner_id):
+    """Returns dict {slack_user_id, email} or None if no row exists."""
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT slack_user_id, email FROM team_members WHERE owner_id = ?",
+            (owner_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {"slack_user_id": row[0] or "", "email": row[1] or ""}
+
+
+def db_set_team_member(owner_id, slack_user_id=None, email=None):
+    """Upsert a row. Only updates the fields explicitly passed (None = leave
+    unchanged). Empty string is a real value (clears the field)."""
+    if slack_user_id is None and email is None:
+        return
+    existing = db_get_team_member(owner_id) or {"slack_user_id": "", "email": ""}
+    new_slack = existing["slack_user_id"] if slack_user_id is None else slack_user_id.strip()
+    new_email = existing["email"] if email is None else email.strip()
+    with _db_lock, _db_connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO team_members "
+            "(owner_id, slack_user_id, email, updated_at) VALUES (?, ?, ?, ?)",
+            (owner_id, new_slack, new_email, int(time.time())),
+        )
+        conn.commit()
+
+
+def db_all_team_members():
+    """Returns dict keyed by owner_id of {slack_user_id, email}. Used by
+    settings page rendering and by the assignment-flow lookups."""
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT owner_id, slack_user_id, email FROM team_members"
+        )
+        return {
+            row[0]: {"slack_user_id": row[1] or "", "email": row[2] or ""}
+            for row in cur.fetchall()
+        }
 
 
 def db_unique_owners():
@@ -2159,6 +2276,64 @@ def sync_start():
     force = request.args.get("force") == "1" or (request.get_json(silent=True) or {}).get("force") is True
     started = start_sync(force_all=force)
     return jsonify({"started": started, "force": force, "state": sync_progress_snapshot()})
+
+
+# ---------- Team Settings page ----------
+# Flat editable map of every owner that has appeared in your workspace's
+# connection data. Pulls owner identity from `target_owners` (already
+# populated by the existing sync), lets the user paste a Slack user ID and
+# email per teammate. The saved values feed:
+#   - Slack assign feature (uses slack_user_id for @-mentions)
+#   - Compose-email-to-teammate flow (uses email to pre-fill Gmail's To: field)
+# Independent of Slack — useful immediately just for the email map.
+
+@app.route("/settings/team", methods=["GET"])
+def settings_team_view():
+    owners = db_unique_owners()  # [{id, first, last, name, linkedin, target_count}, ...]
+    members = db_all_team_members()  # owner_id -> {slack_user_id, email}
+    rows = []
+    for o in owners:
+        m = members.get(o["id"]) or {"slack_user_id": "", "email": ""}
+        rows.append({
+            "owner_id": o["id"],
+            "name": o["name"],
+            "first": o["first"],
+            "linkedin": o["linkedin"],
+            "target_count": o["target_count"],
+            "slack_user_id": m["slack_user_id"],
+            "email": m["email"],
+        })
+    me, _ = fetch_me()
+    return render_template(
+        "settings_team.html",
+        rows=rows,
+        total_owners=len(rows),
+        mapped_emails=sum(1 for r in rows if r["email"]),
+        mapped_slack=sum(1 for r in rows if r["slack_user_id"]),
+        saved=request.args.get("saved") == "1",
+        me=me,
+        active="settings",
+    )
+
+
+@app.route("/settings/team", methods=["POST"])
+def settings_team_save():
+    """Receive the entire team-mapping form and upsert each row.
+
+    Form field names: `slack_user_id__<owner_id>` and `email__<owner_id>`.
+    Empty-string values are treated as "clear the field" (legitimate).
+    """
+    saved_count = 0
+    for key, value in request.form.items():
+        if key.startswith("slack_user_id__"):
+            owner_id = key[len("slack_user_id__"):]
+            db_set_team_member(owner_id, slack_user_id=value)
+            saved_count += 1
+        elif key.startswith("email__"):
+            owner_id = key[len("email__"):]
+            db_set_team_member(owner_id, email=value)
+            saved_count += 1
+    return redirect(url_for("settings_team_view", saved="1"))
 
 
 # Kick off the scheduled-sync daemon on module import (fires every
