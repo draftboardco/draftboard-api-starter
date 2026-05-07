@@ -113,7 +113,7 @@ hit Draftboard's rate limits and need the app to keep working.
 
 The **Candidates** page (`/supporters/candidates`) ranks the people you actually engage with — by Gmail thread frequency + Calendar meetings — so likely Supporters surface automatically.
 
-> **Heads up: this is a single-user, single-laptop feature.** Each teammate runs their own copy of this app on their own laptop and sees only their own contacts. Candidates are local — they're **not** shared across teammates today. A "send my candidates to my teammate" portable scanner is on the roadmap (a one-line installer your teammate runs on their laptop, OAuths, exports a JSON of their network you import here). Until then, each person on a team scores their own network independently.
+> **Single-user main app, multi-user via portable scanner.** This Flask kit runs on one laptop. By default the Candidates page shows contacts from **your** Gmail + Calendar only. To pool a teammate's network, send them the portable scanner at `scanner/supporter_scan.py` — they OAuth on their laptop, export a JSON, send it back, you import via `/supporters/import-teammate`. Each contact gets badged with whose network it came from. See **"Pooling teammate networks"** below for the full flow.
 
 **Customer flow is one click:** open `/settings/google` → click **Connect Google** → consent → ~5-minute sync runs → candidates ready. No setup ceremony, no per-customer Google Cloud project. All Gmail + Calendar data stays on your laptop in `data.db` — Draftboard's infrastructure never touches it.
 
@@ -152,6 +152,34 @@ To re-sync (e.g., after a few months), the customer clicks **Re-sync (re-consent
 ### Scoring
 
 For each contact: `(emails_sent + replies × 2 + threads × 3 + meetings × 5) × recency_decay`, where `recency_decay = max(0.1, 1 - days_since_last_contact / 365)`. Email-only contacts must show **bidirectional engagement** (≥ 1 email you sent AND ≥ 1 reply from them) — cold-outreach prospects who never replied and inbound newsletters you ignored are filtered out. Calendar-only contacts (shared meeting, but no email signal) are kept since attending a meeting together is bidirectional by definition.
+
+## Pooling teammate networks (portable scanner)
+
+A Draftboard team is multiple people. Each person's Gmail + Calendar history is a different slice of the team's collective network. To pool them, the kit ships a **standalone Python scanner** in `scanner/` that a teammate runs on their own laptop — OAuth + 5 minutes — and exports a JSON file you import into your kit.
+
+**Setup (you do this once):**
+
+1. Create a second OAuth client in the same Google Cloud project — type **Desktop app** (not Web). The Desktop client uses PKCE so its `client_secret` isn't truly confidential and can be embedded in the script we ship to teammates.
+2. Save the credentials in `~/.draftboard-secrets/google.env`:
+   ```bash
+   export DRAFTBOARD_SCANNER_GOOGLE_CLIENT_ID="..."
+   export DRAFTBOARD_SCANNER_GOOGLE_CLIENT_SECRET="GOCSPX-..."
+   ```
+3. Add each teammate's Google email to the project's **test users** allowlist in the [OAuth consent screen](https://console.cloud.google.com/apis/credentials/consent). Hard cap of 100 emails for testing-mode apps.
+
+**Per-teammate flow:**
+
+1. **Build the distributable**: `python3 scanner/build_dist.py` (reads the secrets file, writes `scanner/dist/supporter_scan.py` with the credentials baked in). The `dist/` directory is gitignored — never commit it.
+2. **DM the file to your teammate** — Slack attachment, email, private gist. Don't post publicly: anyone with the file can use your OAuth client to consent on their own Google.
+3. **They run** `python3 supporter_scan.py` on their laptop. The script auto-installs missing packages, opens a browser for Google sign-in, scans 12 months of metadata, drops a `supporter_scan_<email>_<date>.json` next to itself, prints a top-10 preview.
+4. **They send the JSON back** to you (Slack DM, email).
+5. **You import** at `/supporters/import-teammate` — drag-drop the file, click Import. Their contacts merge into your Candidates page, badged with their name in the **From** column.
+
+Re-imports from the same teammate replace their prior data (idempotent). The "Imported scans" section on the import page lists all your contributors with a Remove button per teammate. The contributor filter on the Candidates page lets you slice the list to just one person's network.
+
+The scanner reads metadata only — From/To/Cc/Date headers, attendee lists. Never message bodies. The JSON contains contact emails, names, and aggregate counts. Privacy stays equivalent to what the kit already does: Draftboard's infrastructure never touches any of it; the JSON only travels between you and your teammate via whatever channel you DM through.
+
+Full teammate-facing instructions are in [`scanner/README.md`](scanner/README.md).
 
 ## What it's missing (deliberately)
 

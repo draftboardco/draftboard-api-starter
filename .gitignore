@@ -14,3 +14,6 @@ data.db-wal
 server.log
 *.sqlite
 *.sqlite3
+# Built supporter_scan.py distributables — these have OAuth client_secret
+# baked in for shipping to teammates. See scanner/README.md for the build step.
+examples/flask-starter/scanner/dist/

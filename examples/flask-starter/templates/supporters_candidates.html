@@ -19,6 +19,10 @@
         </p>
       </div>
       <div class="flex items-center gap-2">
+        <a href="/supporters/import-teammate"
+           class="inline-flex items-center text-xs px-3 py-1.5 rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">
+          + Import teammate scan
+        </a>
         <a href="/settings/google"
            class="inline-flex items-center text-xs px-3 py-1.5 rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">
           Google settings
@@ -33,7 +37,17 @@
       </div>
     </header>
 
+    {# --- Imported banner --- #}
+    {% if request.args.get('imported') %}
+      <div class="mb-4 rounded-md border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
+        ✅ Imported {{ request.args.get('imported_count') or '' }} contact{{ '' if request.args.get('imported_count') == '1' else 's' }}
+        {% if contributor %}from <strong>{{ contributor }}</strong>{% endif %}.
+        They're now mixed into your candidates below.
+      </div>
+    {% endif %}
+
     {# --- Connection status banners --- #}
+    {% set has_any_data = status.last_synced_at or contributors|selectattr('email', 'ne', '__self__')|list %}
     {% if not status.libs_ready %}
       <div class="mb-6 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">
         <strong>Python dependencies missing.</strong> Run
@@ -48,16 +62,26 @@
           or in <code class="font-mono text-xs">~/.draftboard-secrets/google.env</code>, and restart.
         </p>
       </div>
-    {% elif not status.last_synced_at and not sync_state.running %}
+    {% elif not has_any_data and not sync_state.running %}
       <div class="mb-6 rounded-md border border-amber-300 bg-amber-50 px-5 py-4 text-sm text-amber-900">
-        <p class="font-medium">Haven't synced yet.</p>
+        <p class="font-medium">No data yet.</p>
         <p class="mt-1 text-amber-800">
-          Connect Google to score your top contacts. One click, then ~5 minutes.
+          Two ways to populate this page:
         </p>
-        <a href="/auth/google/start"
-           class="mt-3 inline-flex items-center text-xs px-3 py-1.5 rounded-md bg-indigo-600 text-white hover:bg-indigo-700">
-          Connect Google →
-        </a>
+        <ul class="mt-2 list-disc list-inside text-amber-800 text-xs space-y-1">
+          <li>Connect <strong>your own</strong> Google to score your contacts.</li>
+          <li>Or import a JSON from a teammate who ran the portable scanner.</li>
+        </ul>
+        <div class="mt-3 flex gap-2">
+          <a href="/auth/google/start"
+             class="inline-flex items-center text-xs px-3 py-1.5 rounded-md bg-indigo-600 text-white hover:bg-indigo-700">
+            Connect Google →
+          </a>
+          <a href="/supporters/import-teammate"
+             class="inline-flex items-center text-xs px-3 py-1.5 rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">
+            Import teammate scan
+          </a>
+        </div>
       </div>
     {% elif sync_state.running %}
       <div class="mb-6 rounded-md border border-indigo-200 bg-indigo-50 px-5 py-4 text-sm text-indigo-900">
@@ -68,15 +92,29 @@
     {% endif %}
 
     {# --- Filter / search bar --- #}
-    {% if status.last_synced_at %}
+    {% if has_any_data %}
       <form method="GET" action="/supporters/candidates"
             class="mb-6 flex items-end gap-3 flex-wrap bg-white border border-slate-200 rounded-lg p-4 shadow-sm">
-        <div class="flex-1 min-w-[200px]">
+        <div class="flex-1 min-w-[180px]">
           <label for="q" class="block text-[10px] uppercase tracking-wider text-slate-500 mb-1">Search</label>
           <input type="text" name="q" id="q" value="{{ query }}"
                  placeholder="Name or email"
                  class="w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500" />
         </div>
+        {% if contributors|length > 1 %}
+          <div>
+            <label for="contributor" class="block text-[10px] uppercase tracking-wider text-slate-500 mb-1">Contributor</label>
+            <select name="contributor" id="contributor" onchange="this.form.submit()"
+                    class="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500">
+              <option value="">Everyone ({{ contributors|length }})</option>
+              {% for ct in contributors %}
+                <option value="{{ ct.email }}" {% if contributor == ct.email %}selected{% endif %}>
+                  {% if ct.email == '__self__' %}You{% else %}{{ ct.name }}{% endif %} ({{ ct.row_count }})
+                </option>
+              {% endfor %}
+            </select>
+          </div>
+        {% endif %}
         <button type="submit"
                 class="text-xs px-3 py-1.5 rounded-md bg-slate-900 text-white hover:bg-slate-800">
           Apply
@@ -84,7 +122,7 @@
         <div class="ml-auto text-xs text-slate-500">
           {{ total }} candidate{{ '' if total == 1 else 's' }}
           {% if status.last_synced_at %}
-            · last sync <span data-ts="{{ status.last_synced_at }}" class="rel-ts">{{ status.last_synced_at }}</span>
+            · your last sync <span data-ts="{{ status.last_synced_at }}" class="rel-ts">{{ status.last_synced_at }}</span>
           {% endif %}
         </div>
       </form>
@@ -92,13 +130,17 @@
 
     {# --- Candidates table --- #}
     {% if total == 0 %}
-      {% if status.last_synced_at %}
+      {% if has_any_data %}
         <div class="rounded-lg border border-dashed border-slate-300 bg-white py-16 px-6 text-center">
-          <p class="text-base font-medium text-slate-700">No candidates yet.</p>
+          <p class="text-base font-medium text-slate-700">No candidates match these filters.</p>
           <p class="mt-2 text-sm text-slate-500 max-w-md mx-auto">
-            We didn't find any contacts with bidirectional email engagement
-            or shared meetings in your last 12 months. If your inbox is light
-            on threaded conversations, you may not have enough signal yet.
+            {% if query or contributor %}
+              Try clearing the search or contributor filter.
+            {% else %}
+              We didn't find any contacts with bidirectional email engagement
+              or shared meetings. If your inbox is light on threaded
+              conversations, you may not have enough signal yet.
+            {% endif %}
           </p>
         </div>
       {% endif %}
@@ -109,6 +151,10 @@
             <tr class="text-left">
               <th class="px-4 py-2 font-medium text-[11px] uppercase tracking-wider w-8">#</th>
               <th class="px-4 py-2 font-medium text-[11px] uppercase tracking-wider">Contact</th>
+              <th class="px-4 py-2 font-medium text-[11px] uppercase tracking-wider"
+                  title="Whose network this contact came from. 'You' means your own Gmail/Calendar; teammate names come from imported scans.">
+                From
+              </th>
               <th class="px-4 py-2 font-medium text-[11px] uppercase tracking-wider text-right">Threads</th>
               <th class="px-4 py-2 font-medium text-[11px] uppercase tracking-wider text-right">Replies</th>
               <th class="px-4 py-2 font-medium text-[11px] uppercase tracking-wider text-right">Meetings</th>
@@ -127,6 +173,15 @@
                 <td class="px-4 py-3 align-top">
                   <div class="font-medium text-slate-900">{{ c.name }}</div>
                   <div class="text-xs text-slate-500 truncate">{{ c.email }}</div>
+                </td>
+                <td class="px-4 py-3 align-top">
+                  {% if c.contributor_email == '__self__' %}
+                    <span class="inline-flex items-center rounded-full bg-slate-100 text-slate-600 px-2 py-0.5 text-xs font-medium">you</span>
+                  {% else %}
+                    <span class="inline-flex items-center rounded-full bg-amber-50 text-amber-700 px-2 py-0.5 text-xs font-medium" title="{{ c.contributor_email }}">
+                      {{ c.contributor_label }}
+                    </span>
+                  {% endif %}
                 </td>
                 <td class="px-4 py-3 text-right tabular-nums align-top">{{ c.threads_count }}</td>
                 <td class="px-4 py-3 text-right tabular-nums align-top">{{ c.replies_received }}</td>
@@ -167,7 +222,7 @@
             Showing {{ (page - 1) * per_page + 1 }}–{{ [page * per_page, total] | min }} of {{ total }}
           </div>
           <div class="flex gap-1">
-            {% set qs = '&q=' ~ query if query else '' %}
+            {% set qs = ('&q=' ~ query if query else '') ~ ('&contributor=' ~ contributor if contributor else '') %}
             {% if page > 1 %}
               <a href="?page={{ page - 1 }}{{ qs }}" class="px-2 py-1 rounded-md border border-slate-300 bg-white hover:bg-slate-50">← Prev</a>
             {% endif %}

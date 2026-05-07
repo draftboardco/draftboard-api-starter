@@ -332,6 +332,30 @@ def init_db():
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_calendar_contacts_meetings ON calendar_contacts(meetings_count DESC)")
 
+        # Imported teammate scans — populated by /supporters/import-teammate.
+        # Each row carries the contributor (whose Gmail/Calendar this came from)
+        # so the candidates page can badge "From <teammate>". Composite primary
+        # key on (contributor_email, email) means re-importing from the same
+        # teammate UPDATEs in place; importing from a different teammate adds
+        # a parallel row even for the same contact (you might both know Alice).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS teammate_contacts (
+                contributor_email TEXT NOT NULL,
+                contributor_name TEXT NOT NULL DEFAULT '',
+                email TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                emails_sent INTEGER NOT NULL DEFAULT 0,
+                replies_received INTEGER NOT NULL DEFAULT 0,
+                threads_count INTEGER NOT NULL DEFAULT 0,
+                meetings_count INTEGER NOT NULL DEFAULT 0,
+                last_contact_at INTEGER NOT NULL DEFAULT 0,
+                imported_at INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (contributor_email, email)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_teammate_contacts_contributor ON teammate_contacts(contributor_email)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_teammate_contacts_email ON teammate_contacts(email)")
+
         # Migration: drop the older `oauth_tokens` + `google_sync_state` tables
         # from the BYO architecture. Their data was always per-install and
         # ephemeral, so dropping is safe.
@@ -2675,19 +2699,33 @@ def score_contact(emails_sent, replies_received, threads_count, meetings_count, 
     return int(base * recency)
 
 
-def db_query_candidates(limit=200, offset=0, query=""):
-    """Merge gmail + calendar contacts, score each, return top N.
+def db_query_candidates(limit=200, offset=0, query="", contributor=""):
+    """Merge gmail + calendar contacts (the local user's own scan) AND any
+    imported teammate scans, score each, return top N.
+
+    Each candidate row carries `contributor_email` + `contributor_name`. The
+    local user's own contacts use the special contributor_email value
+    `__self__` (the candidates page renders that as "you").
 
     BIDIRECTIONAL FILTER: an email-only contact must have at least one
-    outbound email from the user AND at least one reply from them. This
-    cuts cold-outreach prospects (you sent → no reply) and inbound
-    newsletters/notifications (they sent → you never replied) — neither
-    is a real relationship signal. Calendar-only contacts are kept
+    outbound email from the contributor AND at least one reply from them.
+    This cuts cold-outreach prospects (sent → no reply) and inbound
+    newsletters (received → never replied). Calendar-only contacts are kept
     unconditionally since attending a shared meeting IS bidirectional.
+
+    `contributor` filter, when non-empty, restricts to a single contributor's
+    contacts. Pass "__self__" to see only the local user's own; pass a
+    teammate's email to see only theirs.
     """
     now = int(time.time())
-    sql_left = """
+    me_email = (db_app_state_get("google_account_email", "") or "").strip().lower()
+    me_name = ""  # We only persist email; the candidates page can show "you" instead.
+
+    # Local user's own gmail+calendar (with bidirectional filter).
+    sql_self_left = """
         SELECT
+          '__self__' AS contributor_email,
+          '' AS contributor_name,
           g.email AS email,
           COALESCE(NULLIF(g.name, ''), NULLIF(c.name, ''), '') AS name,
           g.emails_sent AS emails_sent,
@@ -2702,8 +2740,10 @@ def db_query_candidates(limit=200, offset=0, query=""):
           (g.emails_sent >= 1 AND g.replies_received >= 1)
           OR COALESCE(c.meetings_count, 0) >= 1
     """
-    sql_right_only = """
+    sql_self_right = """
         SELECT
+          '__self__' AS contributor_email,
+          '' AS contributor_name,
           c.email AS email,
           COALESCE(NULLIF(c.name, ''), '') AS name,
           0 AS emails_sent,
@@ -2716,28 +2756,61 @@ def db_query_candidates(limit=200, offset=0, query=""):
         WHERE c.email NOT IN (SELECT email FROM gmail_contacts)
           AND c.meetings_count >= 1
     """
-    full_sql = f"SELECT * FROM ({sql_left} UNION ALL {sql_right_only})"
+    # Imported teammate scans (same bidirectional filter applied per-contributor).
+    sql_teammate = """
+        SELECT
+          tc.contributor_email AS contributor_email,
+          tc.contributor_name AS contributor_name,
+          tc.email AS email,
+          tc.name AS name,
+          tc.emails_sent AS emails_sent,
+          tc.replies_received AS replies_received,
+          tc.threads_count AS threads_count,
+          tc.meetings_count AS meetings_count,
+          tc.last_contact_at AS last_emailed_at,
+          tc.last_contact_at AS last_met_at
+        FROM teammate_contacts tc
+        WHERE
+          (tc.emails_sent >= 1 AND tc.replies_received >= 1)
+          OR tc.meetings_count >= 1
+    """
+    full_sql = f"SELECT * FROM ({sql_self_left} UNION ALL {sql_self_right} UNION ALL {sql_teammate})"
     args = []
+    where_clauses = []
     if query:
-        full_sql += " WHERE LOWER(email) LIKE ? OR LOWER(name) LIKE ?"
+        where_clauses.append("(LOWER(email) LIKE ? OR LOWER(name) LIKE ?)")
         like = f"%{query.lower()}%"
         args.extend([like, like])
+    if contributor:
+        where_clauses.append("contributor_email = ?")
+        args.append(contributor)
+    if where_clauses:
+        full_sql += " WHERE " + " AND ".join(where_clauses)
     with _db_lock, _db_connect() as conn:
         cur = conn.execute(full_sql, args)
         rows = cur.fetchall()
     candidates = []
     for r in rows:
-        email = r[0]
-        name = r[1]
-        emails_sent = r[2]
-        replies_received = r[3]
-        threads_count = r[4]
-        meetings_count = r[5]
-        last_emailed_at = r[6]
-        last_met_at = r[7]
+        contributor_email = r[0]
+        contributor_name = r[1]
+        email = r[2]
+        name = r[3]
+        emails_sent = r[4]
+        replies_received = r[5]
+        threads_count = r[6]
+        meetings_count = r[7]
+        last_emailed_at = r[8]
+        last_met_at = r[9]
         last_contact_at = max(last_emailed_at, last_met_at)
         days_ago = ((now - last_contact_at) / 86400.0) if last_contact_at else None
         score = score_contact(emails_sent, replies_received, threads_count, meetings_count, days_ago)
+        # Render-time labels for the contributor.
+        if contributor_email == "__self__":
+            contributor_label = "you"
+        elif contributor_name:
+            contributor_label = contributor_name
+        else:
+            contributor_label = contributor_email
         candidates.append({
             "email": email,
             "name": name or email,
@@ -2748,10 +2821,113 @@ def db_query_candidates(limit=200, offset=0, query=""):
             "last_contact_at": last_contact_at,
             "days_ago": int(days_ago) if days_ago is not None else None,
             "score": score,
+            "contributor_email": contributor_email,
+            "contributor_label": contributor_label,
         })
     candidates.sort(key=lambda c: (-c["score"], -c["threads_count"], c["email"]))
     total = len(candidates)
     return candidates[offset:offset + limit], total
+
+
+def db_list_contributors():
+    """Return all contributors who have rows in candidates: '__self__' (if the
+    local user has synced) plus every imported teammate."""
+    out = []
+    with _db_lock, _db_connect() as conn:
+        # Self
+        cur = conn.execute("SELECT COUNT(*) FROM gmail_contacts")
+        gc = cur.fetchone()[0]
+        cur = conn.execute("SELECT COUNT(*) FROM calendar_contacts")
+        cc = cur.fetchone()[0]
+        if gc > 0 or cc > 0:
+            out.append({"email": "__self__", "name": "you", "row_count": gc + cc, "imported_at": 0})
+        # Teammates
+        cur = conn.execute(
+            "SELECT contributor_email, MAX(contributor_name), COUNT(*), MAX(imported_at) "
+            "FROM teammate_contacts GROUP BY contributor_email"
+        )
+        for row in cur.fetchall():
+            out.append({"email": row[0], "name": row[1] or row[0], "row_count": row[2], "imported_at": row[3] or 0})
+    return out
+
+
+def db_import_teammate_scan(payload):
+    """Validate + persist a parsed scanner JSON. Returns (count_imported,
+    contributor_email, error_or_None). Re-imports from the same teammate
+    UPDATE in place via INSERT OR REPLACE."""
+    if not isinstance(payload, dict):
+        return 0, "", "JSON root must be an object."
+    if payload.get("scan_type") != "draftboard_supporter_scan":
+        return 0, "", "Not a Draftboard supporter scan file (scan_type mismatch)."
+    if int(payload.get("schema_version", 0)) != 1:
+        return 0, "", f"Unsupported schema_version: {payload.get('schema_version')}"
+    scanned_by = payload.get("scanned_by") or {}
+    contributor_email = (scanned_by.get("email") or "").strip().lower()
+    contributor_name = (scanned_by.get("name") or "").strip()
+    if not contributor_email or "@" not in contributor_email:
+        return 0, "", "scanned_by.email is missing or invalid."
+
+    gmail_rows = payload.get("gmail_contacts") or []
+    cal_rows = payload.get("calendar_contacts") or []
+    # Merge by email — a contact in both gets a single row with combined counts.
+    merged = {}
+    for c in gmail_rows:
+        em = (c.get("email") or "").strip().lower()
+        if not em or "@" not in em:
+            continue
+        merged[em] = {
+            "name": c.get("name") or "",
+            "emails_sent": int(c.get("emails_sent") or 0),
+            "replies_received": int(c.get("replies_received") or 0),
+            "threads_count": int(c.get("threads_count") or 0),
+            "meetings_count": 0,
+            "last_contact_at": int(c.get("last_contact_at") or 0),
+        }
+    for c in cal_rows:
+        em = (c.get("email") or "").strip().lower()
+        if not em or "@" not in em:
+            continue
+        d = merged.setdefault(em, {
+            "name": c.get("name") or "",
+            "emails_sent": 0, "replies_received": 0, "threads_count": 0,
+            "meetings_count": 0, "last_contact_at": 0,
+        })
+        d["meetings_count"] = int(c.get("meetings_count") or 0)
+        last_met = int(c.get("last_met_at") or 0)
+        if last_met > d["last_contact_at"]:
+            d["last_contact_at"] = last_met
+        if not d["name"] and c.get("name"):
+            d["name"] = c["name"]
+
+    now = int(time.time())
+    count = 0
+    with _db_lock, _db_connect() as conn:
+        # Wipe any existing rows for this contributor first so removed contacts
+        # don't linger from a previous import.
+        conn.execute("DELETE FROM teammate_contacts WHERE contributor_email = ?", (contributor_email,))
+        for em, d in merged.items():
+            conn.execute(
+                "INSERT INTO teammate_contacts (contributor_email, contributor_name, email, name, "
+                "emails_sent, replies_received, threads_count, meetings_count, last_contact_at, imported_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (contributor_email, contributor_name, em, d["name"],
+                 d["emails_sent"], d["replies_received"], d["threads_count"],
+                 d["meetings_count"], d["last_contact_at"], now),
+            )
+            count += 1
+        conn.commit()
+    return count, contributor_email, None
+
+
+def db_remove_teammate_contributor(contributor_email):
+    """Wipe all rows for one contributor (the 'remove a teammate' button)."""
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM teammate_contacts WHERE contributor_email = ?",
+            (contributor_email.strip().lower(),),
+        )
+        conn.commit()
+        return cur.rowcount
 
 
 # --- One-time sync worker ------------------------------------------------
@@ -2929,19 +3105,22 @@ def google_sync_status():
 
 @app.route("/supporters/candidates", methods=["GET"])
 def supporters_candidates_view():
-    """Ranked list of high-engagement contacts from Gmail + Calendar."""
+    """Ranked list of high-engagement contacts from the local user's Gmail
+    + Calendar, plus any imported teammate scans."""
     try:
         page = max(1, int(request.args.get("page") or "1"))
     except ValueError:
         page = 1
     per_page = 50
     query = (request.args.get("q") or "").strip()
+    contributor = (request.args.get("contributor") or "").strip()
     candidates, total = db_query_candidates(
-        limit=per_page, offset=(page - 1) * per_page, query=query
+        limit=per_page, offset=(page - 1) * per_page, query=query, contributor=contributor
     )
     total_pages = max(1, (total + per_page - 1) // per_page)
     status = google_status()
     sync_state = google_sync_progress_snapshot()
+    contributors = db_list_contributors()
     return render_template(
         "supporters_candidates.html",
         candidates=candidates,
@@ -2950,11 +3129,59 @@ def supporters_candidates_view():
         total_pages=total_pages,
         per_page=per_page,
         query=query,
+        contributor=contributor,
+        contributors=contributors,
         status=status,
         sync_state=sync_state,
         active="candidates",
         api_key_set=bool(API_KEY),
     )
+
+
+@app.route("/supporters/import-teammate", methods=["GET", "POST"])
+def supporters_import_teammate_view():
+    """Upload a teammate's supporter_scan_*.json. Validates schema, replaces
+    any prior import from the same teammate, redirects with a summary."""
+    error = None
+    summary = None
+    if request.method == "POST":
+        upload = request.files.get("scan_file")
+        if not upload or not upload.filename:
+            error = "No file selected. Pick the supporter_scan_*.json a teammate sent you."
+        else:
+            try:
+                payload = json.loads(upload.read().decode("utf-8"))
+            except (ValueError, UnicodeDecodeError) as e:
+                error = f"Couldn't parse JSON: {e}"
+                payload = None
+            if payload is not None:
+                count, contributor, err = db_import_teammate_scan(payload)
+                if err:
+                    error = err
+                else:
+                    return redirect(
+                        url_for("supporters_candidates_view")
+                        + f"?contributor={contributor}&imported=1&imported_count={count}"
+                    )
+
+    contributors = db_list_contributors()
+    return render_template(
+        "import_teammate.html",
+        error=error,
+        summary=summary,
+        contributors=[c for c in contributors if c["email"] != "__self__"],
+        active="candidates",
+        api_key_set=bool(API_KEY),
+    )
+
+
+@app.route("/supporters/remove-teammate", methods=["POST"])
+def supporters_remove_teammate():
+    contributor_email = (request.form.get("contributor_email") or "").strip().lower()
+    if not contributor_email:
+        return redirect(url_for("supporters_import_teammate_view"))
+    removed = db_remove_teammate_contributor(contributor_email)
+    return redirect(url_for("supporters_import_teammate_view") + f"?removed={removed}")
 
 
 
