@@ -126,16 +126,98 @@
         </div>
       </form>
 
-    {# ---------- Step 3+: placeholder until next iteration ---------- #}
-    {% elif current_step in [3, 4, 5, 6] %}
+    {# ---------- Step 3: Install webhook ---------- #}
+    {% elif current_step == 3 %}
+      <form method="POST" action="/settings/slack" class="bg-white border border-slate-200 rounded-lg p-6 shadow-sm">
+        <input type="hidden" name="step" value="3" />
+        <h2 class="text-lg font-semibold mb-2">Install a Slack Incoming Webhook</h2>
+        <p class="text-sm text-slate-600 mb-4">
+          A webhook is a one-way URL that Slack gives you so this app can post
+          messages into the channel — no bot, no OAuth, no extra permissions.
+          Takes ~2 minutes.
+        </p>
+
+        <ol class="text-sm text-slate-700 list-decimal list-outside ml-5 space-y-2 bg-slate-50 border border-slate-200 rounded p-4 mb-4">
+          <li>Open <a href="https://api.slack.com/apps" target="_blank" rel="noopener" class="text-indigo-600 hover:underline">api.slack.com/apps</a> and sign in to your workspace.</li>
+          <li>Click <strong>Create New App</strong> → <strong>From scratch</strong>.</li>
+          <li>Name it <code>Draftboard Alerts</code> (or anything you like) and pick your workspace → <strong>Create App</strong>.</li>
+          <li>In the left sidebar, click <strong>Incoming Webhooks</strong>.</li>
+          <li>Toggle <strong>Activate Incoming Webhooks</strong> to <strong>On</strong>.</li>
+          <li>Scroll down, click <strong>Add New Webhook to Workspace</strong>.</li>
+          <li>Pick the <strong>{{ channel_name or '#warm-intros' }}</strong> channel from the dropdown → <strong>Allow</strong>.</li>
+          <li>You'll land back on the Incoming Webhooks page. <strong>Copy</strong> the new webhook URL. It looks like <code class="text-[11px]">https://hooks.slack.com/services/T0&hellip;/B0&hellip;/&hellip;</code>.</li>
+        </ol>
+
+        <p class="text-xs text-slate-500 mb-4">
+          Slack restricts who can install apps. If you're not the workspace
+          owner / admin, you may need to ask one to approve "Draftboard Alerts"
+          before step 6 above will work for you.
+        </p>
+
+        <div class="flex items-center gap-3">
+          <button type="submit"
+                  class="rounded-md bg-indigo-600 text-white px-4 py-2 text-sm font-medium hover:bg-indigo-700">
+            I've installed it — show me the URL paste box →
+          </button>
+          <a href="/settings/slack?step=2"
+             class="text-sm text-slate-500 hover:text-slate-700">← Back</a>
+        </div>
+      </form>
+
+    {# ---------- Step 4: Paste webhook URL ---------- #}
+    {% elif current_step == 4 %}
+      <form method="POST" action="/settings/slack" class="bg-white border border-slate-200 rounded-lg p-6 shadow-sm">
+        <input type="hidden" name="step" value="4" />
+        <h2 class="text-lg font-semibold mb-2">Paste the webhook URL</h2>
+        <p class="text-sm text-slate-600 mb-4">
+          The URL Slack generated when you clicked "Add New Webhook to
+          Workspace" in the previous step. It always starts with
+          <code class="text-[11px]">https://hooks.slack.com/services/</code>.
+        </p>
+
+        {% if error == "bad_url" %}
+          <div class="mb-4 rounded border border-rose-300 bg-rose-50 p-3 text-xs text-rose-800">
+            That doesn't look like a Slack webhook URL — they all start with
+            <code>https://hooks.slack.com/services/</code>. Double-check what
+            you copied, then try again.
+          </div>
+        {% endif %}
+
+        <label class="block">
+          <span class="text-xs uppercase tracking-wider text-slate-500">Webhook URL</span>
+          <input type="url"
+                 name="webhook_url"
+                 value="{{ webhook_url }}"
+                 placeholder="https://hooks.slack.com/services/T01.../B02.../abc..."
+                 required
+                 class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+        </label>
+        <p class="text-[11px] text-slate-500 mt-1">
+          Stored in your local <code>data.db</code> file. Treat it like a
+          password — anyone with this URL can post to your Slack channel.
+        </p>
+
+        <div class="mt-6 flex items-center gap-3">
+          <button type="submit"
+                  class="rounded-md bg-indigo-600 text-white px-4 py-2 text-sm font-medium hover:bg-indigo-700">
+            Save and continue →
+          </button>
+          <a href="/settings/slack?step=3"
+             class="text-sm text-slate-500 hover:text-slate-700">← Back</a>
+        </div>
+      </form>
+
+    {# ---------- Steps 5-6: placeholder until next iteration ---------- #}
+    {% elif current_step in [5, 6] %}
       <div class="bg-amber-50 border border-amber-200 rounded-lg p-6 text-sm">
         <h2 class="font-semibold text-amber-900 mb-1">
           Step {{ current_step }} coming next
         </h2>
         <p class="text-amber-900">
-          Channel <strong>{{ channel_name or '(not set)' }}</strong> is saved.
-          The remaining wizard steps (install webhook, paste URL, map
-          teammates, test message) ship in the next iteration of this build.
+          Channel <strong>{{ channel_name or '(not set)' }}</strong> is saved
+          {% if webhook_url %}and webhook URL is stored{% endif %}.
+          Remaining wizard steps (map teammates, send test message) ship in
+          the next iteration of this build.
         </p>
         <div class="mt-4 flex items-center gap-3">
           <a href="/settings/slack?step=1"

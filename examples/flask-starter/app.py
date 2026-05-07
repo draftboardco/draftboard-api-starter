@@ -2345,8 +2345,12 @@ def settings_slack_view():
         channel_name=channel_name or "",
         webhook_url=webhook_url or "",
         completed_at=completed_at or "",
+        error=request.args.get("error", ""),
         active="settings",
     )
+
+
+_SLACK_WEBHOOK_PREFIX = "https://hooks.slack.com/services/"
 
 
 @app.route("/settings/slack", methods=["POST"])
@@ -2372,7 +2376,21 @@ def settings_slack_save():
             db_set_slack_config("channel_name", channel)
         return redirect(url_for("settings_slack_view", step=3))
 
-    # Steps 3-6 land in subsequent iterations.
+    if step == "3":
+        # Informational step — nothing to save, just advance.
+        return redirect(url_for("settings_slack_view", step=4))
+
+    if step == "4":
+        webhook = (request.form.get("webhook_url") or "").strip()
+        # Lightweight validation. Slack itself will reject misshapen URLs at
+        # post-time, but catching the obvious typo here saves the user a
+        # round-trip to the Test step and back.
+        if not webhook.startswith(_SLACK_WEBHOOK_PREFIX):
+            return redirect(url_for("settings_slack_view", step=4, error="bad_url"))
+        db_set_slack_config("webhook_url", webhook)
+        return redirect(url_for("settings_slack_view", step=5))
+
+    # Steps 5-6 land in subsequent iterations.
     return redirect(url_for("settings_slack_view"))
 
 
