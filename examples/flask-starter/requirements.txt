@@ -3,4 +3,4 @@ requests>=2.31
 
 # LinkedIn resolver — gpt-4o-mini ranking of Google CSE results.
 # (See /settings/linkedin-resolver in the app for the BYO-keys wizard.)
-openai>=1.0
+openai>=1.40,<2.0

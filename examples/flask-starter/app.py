@@ -30,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, render_template, request, jsonify, redirect, url_for
 import requests
 
-from linkedin_resolver import resolve_linkedin
+from linkedin_resolver import resolve_linkedin, is_cacheable as _resolver_is_cacheable
 
 API_BASE = "https://intros.draftboard.com/api/v1/integration"
 
@@ -157,13 +157,18 @@ def _save_resolver_keys(updates: dict) -> None:
         # else: empty string — leave existing untouched
 
     secrets_dir = os.path.dirname(RESOLVER_SECRETS_PATH)
-    os.makedirs(secrets_dir, exist_ok=True)
+    # mode= only takes effect when the dir is *created* (not when it already
+    # exists), but on first run this prevents the secrets dir from being made
+    # group/world-readable.
+    os.makedirs(secrets_dir, mode=0o700, exist_ok=True)
     # Write to a temp file then rename (atomic on POSIX) so a crash mid-write
-    # can't truncate the file. 0o600 perms — only the owner can read.
+    # can't truncate the file. Open with mode=0o600 directly via os.open so the
+    # file is owner-only from the moment it exists — a separate chmod after
+    # write leaves a microsecond window where the file is world-readable.
     tmp = RESOLVER_SECRETS_PATH + ".tmp"
-    with open(tmp, "w") as f:
+    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         json.dump(existing, f, indent=2)
-    os.chmod(tmp, 0o600)
     os.replace(tmp, RESOLVER_SECRETS_PATH)
 
 
@@ -737,9 +742,13 @@ def db_get_resolution(email: str, ttl_sec: int = RESOLUTION_CACHE_TTL):
 
 
 def db_put_resolution(email: str, name: str, result: dict):
-    """Persist a resolver result. Always overwrites the existing row so a
-    later attempt with better keys can supersede an earlier negative cache."""
+    """Persist a resolver result. Skips non-definitive results (transient API
+    errors, "no keys configured") so the cache can't be poisoned with a stale
+    no-match that survives the customer adding keys later. See
+    `linkedin_resolver.is_cacheable` for the exact rule."""
     if not email:
+        return
+    if not _resolver_is_cacheable(result):
         return
     key = email.strip().lower()
     now = int(time.time())
@@ -2340,30 +2349,56 @@ def linkedin_resolver_settings():
         "settings_linkedin_resolver.html",
         status=_resolver_status(keys),
         secrets_path=RESOLVER_SECRETS_PATH,
-        saved=request.args.get("saved") == "1",
-        cleared=request.args.get("cleared") == "1",
     )
 
 
 @app.route("/settings/linkedin-resolver", methods=["POST"])
 def save_linkedin_resolver_settings():
     """Persist any non-empty resolver keys to the secrets JSON file. Empty
-    fields leave existing values untouched. A `clear_<name>` checkbox wipes
-    the corresponding key."""
+    fields leave existing values untouched. A `clear_<name>: true` field wipes
+    the corresponding key.
+
+    JSON-only by design: form-encoded POSTs are CORS "simple requests" that
+    bypass preflight, so accepting them would let any malicious site the
+    customer visits silently overwrite their API keys via a hidden form. JSON
+    bodies trigger CORS preflight, which Flask doesn't answer to by default,
+    so cross-origin POSTs are blocked. Same-origin fetch from the wizard JS
+    works fine."""
+    if not request.is_json:
+        return jsonify({
+            "error": "JSON body required (Content-Type: application/json)",
+        }), 400
+    body = request.get_json(silent=True) or {}
     updates = {}
     cleared_any = False
     for name in RESOLVER_KEY_NAMES:
-        if request.form.get(f"clear_{name}") == "1":
+        if body.get(f"clear_{name}") is True:
             updates[name] = "__clear__"
             cleared_any = True
-        else:
-            val = (request.form.get(name) or "").strip()
-            if val:
-                updates[name] = val
+            continue
+        raw = body.get(name)
+        if isinstance(raw, str) and raw.strip():
+            updates[name] = raw.strip()
     if updates:
         _save_resolver_keys(updates)
-    target = url_for("linkedin_resolver_settings") + ("?cleared=1" if cleared_any else "?saved=1")
-    return redirect(target)
+    return jsonify({
+        "ok": True,
+        "saved": [n for n, v in updates.items() if v != "__clear__"],
+        "cleared": [n for n, v in updates.items() if v == "__clear__"],
+        "status": _resolver_status(_load_resolver_keys()),
+    })
+
+
+def _looks_like_email(value: str) -> bool:
+    """Cheap shape check — not RFC 5322. Just enough to reject obvious garbage
+    so we don't waste an Apollo credit on it."""
+    if not isinstance(value, str):
+        return False
+    v = value.strip()
+    if "@" not in v or v.startswith("@") or v.endswith("@"):
+        return False
+    local, _, domain = v.rpartition("@")
+    return bool(local) and "." in domain
 
 
 @app.route("/candidates/resolve", methods=["POST"])
@@ -2377,6 +2412,8 @@ def candidates_resolve():
     RESOLUTION_CACHE_TTL) is returned immediately without calling Apollo or
     Google. Pass `force: true` to skip the cache.
     """
+    if not request.is_json:
+        return jsonify({"error": "JSON body required (Content-Type: application/json)"}), 400
     body = request.get_json(silent=True) or {}
     name = (body.get("name") or "").strip()
     email = (body.get("email") or "").strip()
@@ -2384,6 +2421,8 @@ def candidates_resolve():
 
     if not name or not email:
         return jsonify({"error": "name and email are required"}), 400
+    if not _looks_like_email(email):
+        return jsonify({"error": "email is malformed"}), 400
 
     if not force:
         cached = db_get_resolution(email)
@@ -2398,7 +2437,11 @@ def candidates_resolve():
         cse_id=keys.get("google_cse_id") or None,
         openai_key=keys.get("openai_api_key") or None,
     )
+    # db_put_resolution reads result["_transient"] internally to decide
+    # whether to cache. Strip it before responding so the implementation
+    # detail doesn't leak into the public JSON.
     db_put_resolution(email, name, result)
+    result.pop("_transient", None)
     return jsonify({**result, "cached": False})
 
 

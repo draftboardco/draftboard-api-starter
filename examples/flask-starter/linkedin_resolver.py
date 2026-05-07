@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from typing import Any
 
 import requests
@@ -39,17 +40,35 @@ OPENAI_MODEL = "gpt-4o-mini"
 FREE_MAIL_DOMAINS = {
     "gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "icloud.com",
     "me.com", "proton.me", "protonmail.com", "aol.com", "msn.com", "live.com",
+    "gmx.com", "mail.com", "yandex.com", "qq.com", "pm.me", "fastmail.com",
+    "fastmail.fm", "zoho.com", "tutanota.com",
 }
 
-# Recovers a profile slug from a LinkedIn post URL.
-# /posts/{slug}_{post-content}-activity-{id}-{hash}
-_POST_SLUG_RE = re.compile(r"linkedin\.com/posts/([a-zA-Z0-9-]+?)_")
+# Anchored to require an actual LinkedIn host. Without anchoring, an attacker
+# page indexed by Google with a URL like `evil.com/?ref=linkedin.com/posts/x_y`
+# would be turned into a fake `/in/x` profile URL.
+_POST_URL_RE = re.compile(
+    r"^https?://(?:[a-z0-9-]+\.)?linkedin\.com/posts/([a-zA-Z0-9-]+?)_",
+    re.IGNORECASE,
+)
+_PROFILE_URL_RE = re.compile(
+    r"^https?://(?:[a-z0-9-]+\.)?linkedin\.com/in/[a-zA-Z0-9._%-]+",
+    re.IGNORECASE,
+)
 
 # LinkedIn cookie-consent boilerplate Google sometimes returns instead of real
 # post snippet content. When we see this on a duplicate result, replace it with
-# the real content from another result if available.
+# the real content from another result if available. 12-char floor — real
+# terse snippets ("CEO at Acme.") shouldn't be flagged.
 _BOILERPLATE_MARKERS = ("Agree & Join", "Agree &amp; Join", "User Agreement", "By clicking Continue")
-_BOILERPLATE_MIN_LEN = 20
+_BOILERPLATE_MIN_LEN = 12
+
+
+def _log(msg: str) -> None:
+    """Tagged stderr log. Used for error types that we don't want echoed back
+    to the API client (proxies sometimes embed credentials in their error
+    repr)."""
+    print(f"[linkedin-resolver] {msg}", file=sys.stderr, flush=True)
 
 
 def _split_name(name: str) -> tuple[str, str]:
@@ -87,12 +106,15 @@ def _extract_profile_url(url: str) -> str | None:
     Direct profile URL -> pass through.
     Post URL -> rebuild from the author slug captured before the underscore.
     Anything else (company pages, articles, schools, jobs) -> None.
+
+    Both forms require the URL to actually be on a linkedin.com host — an
+    unanchored substring match could be tricked by `evil.com/?x=linkedin.com/in/...`.
     """
     if not url:
         return None
-    if "linkedin.com/in/" in url:
+    if _PROFILE_URL_RE.match(url):
         return url
-    m = _POST_SLUG_RE.search(url)
+    m = _POST_URL_RE.match(url)
     if m:
         return f"https://www.linkedin.com/in/{m.group(1)}"
     return None
@@ -147,9 +169,16 @@ def _extract_profile_candidates(items: list[dict]) -> list[dict]:
     return list(by_url.values())[:5]
 
 
-def _try_apollo(name: str, email: str, apollo_key: str) -> dict | None:
-    """POST to Apollo /people/match. Returns a result dict on hit, None on miss
-    or error (caller falls through to CSE)."""
+def _try_apollo(name: str, email: str, apollo_key: str) -> tuple[dict | None, str | None]:
+    """POST to Apollo /people/match. Returns (result, transient_error) where:
+      - (result_dict, None)  on hit  → caller returns this
+      - (None, None)         on definitive miss → caller falls through and
+                                                  caches "tried, none found"
+      - (None, "...reason")  on transient error (network, 5xx, 429, auth) →
+                             caller falls through but DOES NOT cache the
+                             negative result, since adding/fixing a key later
+                             should retry.
+    """
     first, last = _split_name(name)
     body = {"email": email, "first_name": first, "last_name": last}
     try:
@@ -159,19 +188,35 @@ def _try_apollo(name: str, email: str, apollo_key: str) -> dict | None:
             json=body,
             timeout=15,
         )
-    except requests.RequestException:
-        return None
+    except requests.RequestException as e:
+        _log(f"apollo network error: {type(e).__name__}")
+        return None, "apollo network error"
+    if r.status_code in (401, 403):
+        _log(f"apollo auth failed: HTTP {r.status_code}")
+        return None, "apollo auth failed"
+    if r.status_code == 429:
+        return None, "apollo rate-limited"
+    if r.status_code >= 500:
+        return None, f"apollo {r.status_code}"
     if r.status_code != 200:
-        return None
+        # Other 4xx — likely a definitive "didn't find them"
+        return None, None
     try:
         data = r.json() or {}
     except ValueError:
-        return None
+        _log("apollo returned non-JSON")
+        return None, "apollo returned non-JSON"
     person = data.get("person") or {}
-    li = (person.get("linkedin_url") or "").strip()
-    if not li:
-        return None
-    full = (person.get("name") or name).strip()
+    li_raw = person.get("linkedin_url")
+    if not isinstance(li_raw, str):
+        return None, None
+    li = li_raw.strip()
+    if not _PROFILE_URL_RE.match(li):
+        # Apollo returned something but it's not a /in/ profile URL — treat
+        # as a miss (definitive).
+        return None, None
+    full_raw = person.get("name") or name
+    full = full_raw.strip() if isinstance(full_raw, str) else name
     return {
         "linkedin_url": li,
         "full_name": full,
@@ -180,7 +225,7 @@ def _try_apollo(name: str, email: str, apollo_key: str) -> dict | None:
         "reasoning": "Apollo /people/match returned the LinkedIn URL directly.",
         "query": email,
         "error": None,
-    }
+    }, None
 
 
 def _build_cse_prompt(name: str, email: str, company: str, candidates: list[dict]) -> str:
@@ -232,7 +277,12 @@ def _try_cse(
     openai_key: str,
 ) -> dict:
     """Run the Google-CSE-then-LLM-rank path. Always returns a result dict
-    (never None) — `linkedin_url` may be None when nothing matched."""
+    (never None) — `linkedin_url` may be None when nothing matched.
+
+    Result includes a private `_transient` flag (popped before being returned
+    from `resolve_linkedin`) telling the caller whether the failure was a
+    transient API error (don't cache the miss) vs a definitive "tried, didn't
+    find them" (safe to cache)."""
     first, _last = _split_name(name)
     company = _company_from_email(email)
     query_parts = [first, company, "linkedin"]
@@ -246,6 +296,7 @@ def _try_cse(
         "reasoning": "",
         "query": query,
         "error": None,
+        "_transient": False,
     }
 
     try:
@@ -255,16 +306,22 @@ def _try_cse(
             timeout=15,
         )
     except requests.RequestException as e:
-        return {**base, "error": f"CSE request failed: {e}", "reasoning": "CSE request failed."}
+        _log(f"cse network error: {type(e).__name__}")
+        return {**base, "error": "CSE request failed", "reasoning": "CSE request failed.", "_transient": True}
     if r.status_code != 200:
-        return {**base, "error": f"CSE returned {r.status_code}", "reasoning": "CSE call failed."}
+        # 4xx auth/quota/rate-limit and 5xx are all transient from the
+        # customer's perspective — they could fix the key or wait and retry.
+        _log(f"cse returned HTTP {r.status_code}")
+        return {**base, "error": f"CSE returned {r.status_code}", "reasoning": "CSE call failed.", "_transient": True}
     try:
         data = r.json() or {}
     except ValueError:
-        return {**base, "error": "CSE returned non-JSON", "reasoning": "CSE returned non-JSON."}
+        _log("cse returned non-JSON")
+        return {**base, "error": "CSE returned non-JSON", "reasoning": "CSE returned non-JSON.", "_transient": True}
 
     candidates = _extract_profile_candidates(data.get("items") or [])
     if not candidates:
+        # Definitive: CSE worked, just had no LinkedIn-shaped results for this query.
         return {**base, "reasoning": "No LinkedIn profiles in CSE results."}
 
     # Lazy-import OpenAI so the module is importable without the package
@@ -272,7 +329,7 @@ def _try_cse(
     try:
         from openai import OpenAI
     except ImportError:
-        return {**base, "error": "openai package not installed", "reasoning": "openai package missing."}
+        return {**base, "error": "openai package not installed", "reasoning": "openai package missing.", "_transient": True}
 
     prompt = _build_cse_prompt(name, email, company, candidates)
     try:
@@ -289,16 +346,34 @@ def _try_cse(
         content = completion.choices[0].message.content or "{}"
         analysis = json.loads(content)
     except Exception as e:  # network, auth, JSON, etc.
-        return {**base, "error": f"OpenAI call failed: {e}", "reasoning": "OpenAI ranking failed."}
+        # Don't include str(e) — proxy errors can include URLs with query
+        # params that may contain the API key.
+        _log(f"openai error: {type(e).__name__}")
+        return {**base, "error": "OpenAI call failed", "reasoning": "OpenAI ranking failed.", "_transient": True}
 
     idx = analysis.get("bestMatchIndex")
-    li = analysis.get("linkedinUrl") or ""
-    full = analysis.get("fullName") or ""
     confidence = analysis.get("confidence") or "none"
-    reasoning = analysis.get("reasoning") or ""
+    reasoning_raw = analysis.get("reasoning") or ""
+    reasoning = reasoning_raw if isinstance(reasoning_raw, str) else ""
 
-    if idx is None or not li or not isinstance(idx, int) or idx < 0 or idx >= len(candidates):
+    if not isinstance(idx, int) or idx < 0 or idx >= len(candidates):
+        # Definitive: LLM saw the candidates and rejected all of them.
         return {**base, "confidence": "none", "reasoning": reasoning or "LLM did not pick a match."}
+
+    # CRITICAL: never trust the LLM's `linkedinUrl` — index back into the
+    # candidate set. The CSE titles/snippets are attacker-controllable (anyone
+    # can put text on a webpage Google indexes) and a prompt-injected snippet
+    # could otherwise make us return `linkedin.com/in/attacker` with high
+    # confidence.
+    chosen = candidates[idx]
+    li = chosen["link"]
+    if not _PROFILE_URL_RE.match(li):
+        # Shouldn't happen — _extract_profile_candidates only emits /in/ URLs —
+        # but defense in depth.
+        return {**base, "confidence": "none", "reasoning": "Chosen candidate URL was not a profile URL."}
+
+    full_raw = analysis.get("fullName")
+    full = full_raw.strip() if isinstance(full_raw, str) else name
 
     return {
         "linkedin_url": li,
@@ -308,7 +383,32 @@ def _try_cse(
         "reasoning": reasoning,
         "query": query,
         "error": None,
+        "_transient": False,
     }
+
+
+def is_cacheable(result: dict) -> bool:
+    """Should this resolver result be persisted to the SQLite cache?
+
+    Cache only definitive outcomes:
+      - apollo hit
+      - cse hit (LLM picked a candidate)
+      - definitive miss (Apollo + CSE were tried and reported no match)
+
+    Don't cache:
+      - "no keys configured" (customer hasn't pasted keys yet — caching this
+        would lock every contact to a 30-day no-match even after they fix the
+        config)
+      - transient API failures (rate limit, network, auth — fixable by the
+        customer; should retry on next call, not be cached)
+    """
+    if result.get("_transient"):
+        return False
+    if result.get("error") == "no keys configured":
+        return False
+    if result.get("error") == "missing input":
+        return False
+    return True
 
 
 def resolve_linkedin(
@@ -338,6 +438,10 @@ def resolve_linkedin(
       - "cse"    — Google CSE + LLM ranking found it (confidence from LLM).
       - "none"   — couldn't resolve. Caller should ask the user to paste a
                    LinkedIn URL manually.
+
+    Callers that want to cache should check `is_cacheable(result)` first —
+    a result with a transient API error (rate limit, network) returns False
+    so the cache doesn't get poisoned with a stale "no match".
     """
     if not (name or "").strip() or not (email or "").strip():
         return {
@@ -346,24 +450,48 @@ def resolve_linkedin(
             "query": "", "error": "missing input",
         }
 
+    apollo_transient: str | None = None
+    cse_transient = False
+
     # 1. Apollo first (when configured).
     if apollo_key:
-        hit = _try_apollo(name, email, apollo_key)
+        hit, apollo_transient = _try_apollo(name, email, apollo_key)
         if hit:
             return hit
 
     # 2. CSE + OpenAI fallback (when both fully configured).
     if cse_key and cse_id and openai_key:
-        return _try_cse(name, email, cse_key, cse_id, openai_key)
+        cse_result = _try_cse(name, email, cse_key, cse_id, openai_key)
+        cse_transient = bool(cse_result.pop("_transient", False))
+        # If Apollo had a transient error too, surface that detail in the
+        # result so the customer knows both sides hiccupped.
+        if cse_transient and apollo_transient:
+            cse_result["reasoning"] = f"{cse_result['reasoning']} (apollo also failed: {apollo_transient})"
+        # Re-flag the result so the caller sees the transient bit.
+        if cse_transient:
+            cse_result["_transient"] = True
+        return cse_result
 
-    # 3. Nothing worked.
+    # 3. Nothing worked. Build a "tried but missed" or "no keys" response.
     keys_configured = bool(apollo_key or (cse_key and cse_id and openai_key))
+    if not keys_configured:
+        return {
+            "linkedin_url": None, "full_name": None, "confidence": "none",
+            "source": "none", "reasoning": "No keys configured.",
+            "query": "", "error": "no keys configured",
+        }
+    # Apollo was the only configured method, and it didn't find them.
     return {
         "linkedin_url": None,
         "full_name": None,
         "confidence": "none",
         "source": "none",
-        "reasoning": "No match found." if keys_configured else "No keys configured.",
-        "query": "",
-        "error": None if keys_configured else "no keys configured",
+        "reasoning": (
+            f"Apollo tried and could not find this person ({apollo_transient})"
+            if apollo_transient
+            else "Apollo tried and could not find this person."
+        ),
+        "query": email,
+        "error": None,
+        "_transient": bool(apollo_transient),
     }

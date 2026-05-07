@@ -17,16 +17,7 @@
       </p>
     </header>
 
-    {% if saved %}
-      <div class="mb-6 rounded-md border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
-        Keys saved.
-      </div>
-    {% endif %}
-    {% if cleared %}
-      <div class="mb-6 rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
-        Cleared selected keys.
-      </div>
-    {% endif %}
+    <div id="save_banner"></div>
 
     <!-- What this does -->
     <section class="mb-6 rounded-lg border border-slate-200 bg-white p-6 shadow-sm">
@@ -77,7 +68,7 @@
       {% endif %}
     </section>
 
-    <form method="POST" action="/settings/linkedin-resolver" class="space-y-6">
+    <form id="resolver_form" onsubmit="return false;" class="space-y-6">
 
       <!-- Apollo -->
       <section class="rounded-lg border border-slate-200 bg-white p-6 shadow-sm">
@@ -197,7 +188,8 @@
           Saved to <code class="text-xs bg-slate-100 rounded px-1">{{ secrets_path }}</code> (read-only by you).
         </p>
         <button
-          type="submit"
+          type="button"
+          id="save_btn"
           class="rounded-md bg-indigo-600 hover:bg-indigo-500 px-4 py-2 text-sm font-medium text-white shadow-sm">
           Save
         </button>
@@ -240,12 +232,57 @@
       var nameEl = document.getElementById('test_name');
       var emailEl = document.getElementById('test_email');
       var out = document.getElementById('test_result');
+      var saveBtn = document.getElementById('save_btn');
+      var saveBanner = document.getElementById('save_banner');
 
       function escapeHtml(s) {
         return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
           return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
         });
       }
+
+      // Save handler — POSTs JSON. Form-encoded POSTs would be CORS simple
+      // requests and bypass preflight, letting a malicious site overwrite the
+      // user's API keys. JSON triggers preflight which Flask blocks by default,
+      // so cross-origin saves are denied while this same-origin fetch works.
+      saveBtn.addEventListener('click', function () {
+        var keys = ['apollo_api_key', 'google_cse_api_key', 'google_cse_id', 'openai_api_key'];
+        var body = {};
+        var anything = false;
+        keys.forEach(function (k) {
+          var v = (document.getElementById(k).value || '').trim();
+          if (v) { body[k] = v; anything = true; }
+          var clearEl = document.querySelector('input[name="clear_' + k + '"]');
+          if (clearEl && clearEl.checked) { body['clear_' + k] = true; anything = true; }
+        });
+        if (!anything) {
+          saveBanner.innerHTML = '<div class="mb-6 rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">Nothing to save — paste a key or check a clear-box first.</div>';
+          return;
+        }
+        saveBtn.disabled = true;
+        saveBtn.textContent = 'Saving...';
+        fetch('/settings/linkedin-resolver', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        })
+          .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+          .then(function (resp) {
+            if (!resp.ok) {
+              saveBanner.innerHTML = '<div class="mb-6 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">' + escapeHtml(resp.body.error || 'Save failed') + '</div>';
+              return;
+            }
+            // Reload to refresh the masked-input placeholders + status pills.
+            window.location.href = '/settings/linkedin-resolver';
+          })
+          .catch(function (err) {
+            saveBanner.innerHTML = '<div class="mb-6 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">' + escapeHtml(err.message || 'Network error') + '</div>';
+          })
+          .finally(function () {
+            saveBtn.disabled = false;
+            saveBtn.textContent = 'Save';
+          });
+      });
 
       function badgeColor(conf) {
         if (conf === 'high') return 'bg-emerald-100 text-emerald-800';
