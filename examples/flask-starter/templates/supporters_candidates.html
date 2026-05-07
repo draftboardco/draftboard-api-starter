@@ -37,6 +37,21 @@
       </div>
     </header>
 
+    {# --- Resolver-not-configured banner — only when there's at least one row to act on --- #}
+    {% if has_any_data and resolver_status and not resolver_status.any_ready %}
+      <div class="mb-4 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900 flex items-start gap-3 flex-wrap">
+        <div class="flex-1">
+          <strong>LinkedIn resolver isn't configured.</strong>
+          The "Resolve LinkedIn URL" buttons below need either an Apollo key or a Google Custom Search + OpenAI key combo.
+          Without them, you can still browse candidates and import them by pasting LinkedIn URLs manually.
+        </div>
+        <a href="/settings/linkedin-resolver"
+           class="text-xs px-3 py-1.5 rounded-md bg-slate-900 text-white hover:bg-slate-800">
+          Set up resolver →
+        </a>
+      </div>
+    {% endif %}
+
     {# --- Imported banner --- #}
     {% if request.args.get('imported') %}
       <div class="mb-4 rounded-md border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
@@ -202,12 +217,28 @@
                   </span>
                 </td>
                 <td class="px-4 py-3 text-right align-top">
-                  <button type="button"
-                          data-name="{{ c.name }}"
-                          data-email="{{ c.email }}"
-                          class="resolve-btn text-xs px-2.5 py-1 rounded-md border border-slate-300 bg-white text-slate-600 hover:bg-slate-50">
-                    Resolve LinkedIn URL
-                  </button>
+                  <div class="resolve-cell" data-email="{{ c.email }}">
+                    {% if c.linkedin_url %}
+                      <a href="{{ c.linkedin_url }}" target="_blank" rel="noopener"
+                         class="inline-flex items-center text-xs px-2.5 py-1 rounded-md border border-emerald-200 bg-emerald-50 text-emerald-800 hover:bg-emerald-100 font-medium"
+                         title="Resolved via {{ c.resolution_source }} ({{ c.resolution_confidence }} confidence)">
+                        Open LinkedIn ↗
+                      </a>
+                    {% elif c.resolution_error %}
+                      <button type="button"
+                              data-name="{{ c.name }}" data-email="{{ c.email }}"
+                              class="resolve-btn text-xs px-2.5 py-1 rounded-md border border-slate-300 bg-white text-slate-500 hover:bg-slate-50"
+                              title="Last attempt: {{ c.resolution_error }}">
+                        Retry
+                      </button>
+                    {% else %}
+                      <button type="button"
+                              data-name="{{ c.name }}" data-email="{{ c.email }}"
+                              class="resolve-btn text-xs px-2.5 py-1 rounded-md border border-slate-300 bg-white text-slate-600 hover:bg-slate-50">
+                        Resolve LinkedIn URL
+                      </button>
+                    {% endif %}
+                  </div>
                 </td>
               </tr>
             {% endfor %}
@@ -257,13 +288,76 @@
       window._toastTimer = setTimeout(function () { t.classList.add('hidden'); }, 4000);
     }
 
-    // Placeholder Resolve button — the LinkedIn Resolver session will replace
-    // this handler with a real fetch call once that PR lands.
-    document.querySelectorAll('.resolve-btn').forEach(function (btn) {
-      btn.addEventListener('click', function () {
-        showToast('LinkedIn URL resolver coming soon — for now, search LinkedIn for ' + (btn.dataset.name || btn.dataset.email) + '.');
+    // Resolve LinkedIn URL — POST to /candidates/resolve, mutate row in place.
+    function escapeHtml(s) {
+      return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
       });
-    });
+    }
+
+    function renderResolved(cell, data) {
+      var url = data.linkedin_url;
+      var src = data.source || '';
+      var conf = data.confidence || '';
+      if (url) {
+        cell.innerHTML =
+          '<a href="' + escapeHtml(url) + '" target="_blank" rel="noopener" ' +
+          'class="inline-flex items-center text-xs px-2.5 py-1 rounded-md border border-emerald-200 bg-emerald-50 text-emerald-800 hover:bg-emerald-100 font-medium" ' +
+          'title="Resolved via ' + escapeHtml(src) + ' (' + escapeHtml(conf) + ' confidence)">' +
+          'Open LinkedIn ↗</a>';
+      } else {
+        var msg = data.error || 'No LinkedIn profile found.';
+        cell.innerHTML =
+          '<button type="button" data-name="' + escapeHtml(data.name || '') + '" data-email="' + escapeHtml(data.email || '') + '" ' +
+          'title="' + escapeHtml(msg) + '" ' +
+          'class="resolve-btn text-xs px-2.5 py-1 rounded-md border border-slate-300 bg-white text-slate-500 hover:bg-slate-50">' +
+          'Retry</button>';
+        wireResolveButton(cell.querySelector('.resolve-btn'));
+      }
+    }
+
+    function wireResolveButton(btn) {
+      if (!btn) return;
+      btn.addEventListener('click', function () {
+        var cell = btn.closest('.resolve-cell');
+        var name = btn.dataset.name || '';
+        var email = btn.dataset.email || '';
+        if (!email) return;
+        btn.disabled = true;
+        var orig = btn.textContent;
+        btn.textContent = 'Resolving…';
+        fetch('/candidates/resolve', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: name, email: email })
+        })
+          .then(function (r) {
+            return r.json().then(function (data) { return { ok: r.ok, status: r.status, data: data }; });
+          })
+          .then(function (resp) {
+            if (!resp.ok) {
+              btn.disabled = false;
+              btn.textContent = orig;
+              var err = (resp.data && resp.data.error) || ('Server error ' + resp.status);
+              showToast(err);
+              return;
+            }
+            renderResolved(cell, resp.data);
+            if (resp.data.linkedin_url) {
+              showToast('Found LinkedIn URL for ' + (name || email));
+            } else {
+              showToast('No LinkedIn profile found for ' + (name || email));
+            }
+          })
+          .catch(function (e) {
+            btn.disabled = false;
+            btn.textContent = orig;
+            showToast('Network error — try again.');
+          });
+      });
+    }
+
+    document.querySelectorAll('.resolve-btn').forEach(wireResolveButton);
 
     // Relative timestamps
     document.querySelectorAll('.rel-ts').forEach(function (el) {

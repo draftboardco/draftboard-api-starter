@@ -3293,10 +3293,28 @@ def supporters_candidates_view():
     candidates, total = db_query_candidates(
         limit=per_page, offset=(page - 1) * per_page, query=query, contributor=contributor
     )
+    # Hydrate each candidate with its cached LinkedIn-resolution result (if any)
+    # so already-resolved rows render with the URL inline. Fresh candidates
+    # render the "Resolve" button; the JS handler hits /candidates/resolve and
+    # mutates the row in place on success.
+    for c in candidates:
+        cached = db_get_resolution(c["email"])
+        if cached:
+            c["linkedin_url"] = cached.get("linkedin_url") or ""
+            c["resolution_source"] = cached.get("source") or ""
+            c["resolution_confidence"] = cached.get("confidence") or ""
+            c["resolution_error"] = cached.get("error") or ""
+        else:
+            c["linkedin_url"] = ""
+            c["resolution_source"] = ""
+            c["resolution_confidence"] = ""
+            c["resolution_error"] = ""
     total_pages = max(1, (total + per_page - 1) // per_page)
     status = google_status()
     sync_state = google_sync_progress_snapshot()
     contributors = db_list_contributors()
+    resolver_keys = _load_resolver_keys()
+    resolver_status = _resolver_status(resolver_keys)
     return render_template(
         "supporters_candidates.html",
         candidates=candidates,
@@ -3309,6 +3327,7 @@ def supporters_candidates_view():
         contributors=contributors,
         status=status,
         sync_state=sync_state,
+        resolver_status=resolver_status,
         active="candidates",
         api_key_set=bool(API_KEY),
     )
