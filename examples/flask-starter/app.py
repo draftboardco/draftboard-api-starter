@@ -2339,6 +2339,13 @@ def settings_slack_view():
         else:
             current_step = 5  # webhook done, need teammate map
 
+    # Counts used by step 5 to surface "you have N teammates discovered, M
+    # mapped" inline. Cheap to compute and the data is on every wizard
+    # render — keeps templates simple.
+    teammates = db_unique_owners()
+    members = db_all_team_members()
+    mapped_slack = sum(1 for m in members.values() if m.get("slack_user_id"))
+
     return render_template(
         "settings_slack.html",
         current_step=current_step,
@@ -2346,6 +2353,8 @@ def settings_slack_view():
         webhook_url=webhook_url or "",
         completed_at=completed_at or "",
         error=request.args.get("error", ""),
+        total_teammates=len(teammates),
+        mapped_slack=mapped_slack,
         active="settings",
     )
 
@@ -2390,7 +2399,13 @@ def settings_slack_save():
         db_set_slack_config("webhook_url", webhook)
         return redirect(url_for("settings_slack_view", step=5))
 
-    # Steps 5-6 land in subsequent iterations.
+    if step == "5":
+        # Teammate-map step is informational — the actual mapping happens on
+        # /settings/team (a separate page that's been live since iteration 2).
+        # Just advance.
+        return redirect(url_for("settings_slack_view", step=6))
+
+    # Step 6 lands in the next iteration.
     return redirect(url_for("settings_slack_view"))
 
 
