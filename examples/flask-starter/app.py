@@ -1503,19 +1503,27 @@ def _build_messages(target, connection):
     }
 
 
-def _gmail_compose_url(subject, body):
-    """Build a Gmail compose URL the user's browser can open in their logged-in account."""
+def _gmail_compose_url(subject, body, to=None):
+    """Build a Gmail compose URL the user's browser can open in their logged-in
+    account. `to` is optional; when provided, Gmail pre-fills the To: field."""
     from urllib.parse import quote
-    return (
-        "https://mail.google.com/mail/?view=cm&fs=1"
-        f"&su={quote(subject)}"
-        f"&body={quote(body)}"
-    )
+    parts = [
+        "https://mail.google.com/mail/?view=cm&fs=1",
+        f"&su={quote(subject)}",
+        f"&body={quote(body)}",
+    ]
+    if to:
+        parts.append(f"&to={quote(to)}")
+    return "".join(parts)
 
 
 def _build_assign_to_teammate_draft(target, connection, teammate):
     """Generate a Gmail draft asking a teammate to ping the connector for an
-    intro to the target. Used by the 'Assigned to' dropdown."""
+    intro to the target. Used by the 'Assigned to' dropdown.
+
+    Looks up the teammate's email in `team_members` (populated via the Team
+    Settings page) — when present, the Gmail compose URL pre-fills the To:
+    field. Otherwise the To: stays empty (existing behavior)."""
     target_first = (target.get("firstName") or "").strip() or "them"
     target_last = (target.get("lastName") or "").strip()
     target_full = f"{target_first} {target_last}".strip() if target_last else target_first
@@ -1529,6 +1537,7 @@ def _build_assign_to_teammate_draft(target, connection, teammate):
         connector_full = "your connection"
 
     teammate_first = (teammate.get("firstName") or "").strip() or "there"
+    teammate_id = teammate.get("id")
 
     company_clause = f" at {target_company}" if target_company else ""
     body_parts = [
@@ -1542,17 +1551,25 @@ def _build_assign_to_teammate_draft(target, connection, teammate):
     body = "\n\n".join(body_parts)
     subject = f"Quick ask: warm intro to {target_full}?"
 
+    # Look up the teammate's email so the Gmail compose URL can pre-fill To:
+    teammate_email = ""
+    if teammate_id:
+        member = db_get_team_member(teammate_id)
+        if member:
+            teammate_email = member.get("email") or ""
+
     return {
-        "teammate_id": teammate.get("id"),
+        "teammate_id": teammate_id,
         "teammate_first": teammate_first,
         "teammate_last": (teammate.get("lastName") or "").strip(),
         "teammate_full": (
             f"{teammate_first} {(teammate.get('lastName') or '').strip()}"
         ).strip(),
         "teammate_initials": _initials(teammate.get("firstName"), teammate.get("lastName")),
+        "teammate_email": teammate_email,
         "subject": subject,
         "body": body,
-        "gmail_url": _gmail_compose_url(subject, body),
+        "gmail_url": _gmail_compose_url(subject, body, to=teammate_email or None),
     }
 
 
