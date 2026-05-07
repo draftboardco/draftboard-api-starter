@@ -253,7 +253,10 @@ _me_cache = {"data": None, "error": None, "fetched_at": 0}
 ME_CACHE_TTL = 600
 
 # SQLite-backed persistent caches: per-target connections + intro_requests state.
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.db")
+# DB_PATH override exists so tests can point at a throwaway file (e.g.
+# /tmp/test.db) without ever touching the production data.db. Default is
+# data.db next to this file. NEVER hardcode a test path here.
+DB_PATH = os.environ.get("DRAFTBOARD_DB_PATH") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.db")
 _db_lock = threading.Lock()
 
 # Background sync worker state.
