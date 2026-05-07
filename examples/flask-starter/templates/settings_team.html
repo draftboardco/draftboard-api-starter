@@ -20,9 +20,49 @@
       </p>
     </header>
 
-    {% if saved %}
+    {% if saved and not invalid_slack_list %}
       <div class="mb-4 rounded-md border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
         ✓ Saved.
+      </div>
+    {% endif %}
+
+    {% if invalid_slack_list %}
+      <div class="mb-4 rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+        ⚠️ Saved most fields, but rejected the Slack ID for:
+        <strong>{{ invalid_slack_list|join(', ') }}</strong>.
+        Slack user IDs look like <code>U0123ABCD</code> (or <code>W…</code> for workspace IDs).
+        In Slack: open the teammate's profile → <code>⋮</code> menu →
+        <strong>Copy member ID</strong>.
+      </div>
+    {% endif %}
+
+    {% if not slack_configured %}
+      <div class="mb-4 rounded-lg border border-indigo-200 bg-indigo-50 px-4 py-3 flex items-start gap-3">
+        <span class="text-xl">💬</span>
+        <div class="flex-1 min-w-0">
+          <p class="text-sm font-medium text-indigo-900">
+            {% if slack_webhook_saved %}
+              Finish Slack setup
+            {% else %}
+              Want one-click Slack notifications?
+            {% endif %}
+          </p>
+          <p class="text-xs text-indigo-800 mt-0.5">
+            {% if slack_webhook_saved %}
+              You've installed a webhook. Map at least one teammate's
+              Slack user ID below to enable the 💬 Slack action on
+              connector cards.
+            {% else %}
+              Skip the Gmail step entirely — clicking Assign-to-teammate
+              can post a tagged message in your team's Slack channel.
+              Setup takes ~3 minutes.
+            {% endif %}
+          </p>
+        </div>
+        <a href="/settings/slack"
+           class="flex-shrink-0 rounded-md bg-indigo-600 text-white text-xs px-3 py-1.5 font-medium hover:bg-indigo-700">
+          {% if slack_webhook_saved %}Resume setup →{% else %}Set up Slack →{% endif %}
+        </a>
       </div>
     {% endif %}
 

@@ -29,7 +29,9 @@
   {% if panel.connections %}
     <div class="space-y-3">
       {% for c in panel.connections %}
-        {% include "_connector_card.html" with context %}
+        {% with target_id = panel.target_id %}
+          {% include "_connector_card.html" with context %}
+        {% endwith %}
       {% endfor %}
     </div>
   {% elif not panel.error %}

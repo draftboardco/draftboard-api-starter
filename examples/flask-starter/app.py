@@ -664,19 +664,34 @@ def db_set_slack_config(key, value):
         conn.commit()
 
 
-def db_clear_slack_config():
-    """Wipe Slack config (used by Reset on the settings page). Leaves
-    team_members intact since email mappings are useful even without Slack."""
+def db_clear_slack_config(preserve_channel=True):
+    """Reset Slack config. By default keeps `channel_name` so the user
+    doesn't have to retype it after rotating a webhook — only the
+    webhook + completion timestamps are cleared. Call with
+    preserve_channel=False to wipe everything.
+
+    `team_members` is never touched here; email mappings are useful even
+    without Slack."""
     with _db_lock, _db_connect() as conn:
-        conn.execute("DELETE FROM slack_config")
+        if preserve_channel:
+            conn.execute(
+                "DELETE FROM slack_config WHERE key != 'channel_name'"
+            )
+        else:
+            conn.execute("DELETE FROM slack_config")
         conn.commit()
 
 
 def slack_is_configured():
-    """True iff a Slack webhook URL has been saved AND at least one teammate
-    is mapped to a Slack user ID. Drives whether the Slack row appears in the
-    Assign-to-teammate dropdown."""
-    if not db_get_slack_config("webhook_url"):
+    """True iff a real-looking Slack webhook URL is saved AND at least one
+    teammate is mapped to a Slack user ID. Drives whether the 💬 Slack row
+    appears in the Assign-to-teammate dropdown.
+
+    The webhook shape check matters: a partially-completed wizard or a stale
+    DB write could leave a non-empty-but-bogus value here, and we don't want
+    to surface a Slack action that we know will fail."""
+    webhook = db_get_slack_config("webhook_url") or ""
+    if not _SLACK_WEBHOOK_RE.match(webhook):
         return False
     with _db_lock, _db_connect() as conn:
         cur = conn.execute(
@@ -699,14 +714,26 @@ def db_get_team_member(owner_id):
 
 
 def db_set_team_member(owner_id, slack_user_id=None, email=None):
-    """Upsert a row. Only updates the fields explicitly passed (None = leave
-    unchanged). Empty string is a real value (clears the field)."""
+    """Atomic upsert. Only updates fields explicitly passed (None = leave
+    unchanged). Empty string is a real value (clears the field).
+
+    The read-modify-write happens inside a single _db_lock block so two
+    concurrent saves of the same owner can't clobber each other's edits.
+    """
     if slack_user_id is None and email is None:
         return
-    existing = db_get_team_member(owner_id) or {"slack_user_id": "", "email": ""}
-    new_slack = existing["slack_user_id"] if slack_user_id is None else slack_user_id.strip()
-    new_email = existing["email"] if email is None else email.strip()
+    if not owner_id:
+        return  # caller bug guard — refuse to write empty PK
     with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT slack_user_id, email FROM team_members WHERE owner_id = ?",
+            (owner_id,),
+        )
+        row = cur.fetchone()
+        existing_slack = (row[0] if row else "") or ""
+        existing_email = (row[1] if row else "") or ""
+        new_slack = existing_slack if slack_user_id is None else slack_user_id.strip()
+        new_email = existing_email if email is None else email.strip()
         conn.execute(
             "INSERT OR REPLACE INTO team_members "
             "(owner_id, slack_user_id, email, updated_at) VALUES (?, ?, ?, ?)",
@@ -853,6 +880,31 @@ def db_intro_requests_for_target(target_id):
 init_db()
 backfill_target_owners()
 backfill_connector_paths()
+
+
+def _migrate_slack_channel_name_strip_hash():
+    """One-shot migration: an earlier version stored channel_name with a
+    leading '#' (e.g. "#warm-intros"). The display layer now adds '#' at
+    render time, so any persisted '#'-prefixed value would render as
+    "##warm-intros". Strip it once at boot."""
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT value FROM slack_config WHERE key = 'channel_name'"
+        )
+        row = cur.fetchone()
+        if not row or not row[0]:
+            return
+        if row[0].startswith("#"):
+            cleaned = row[0].lstrip("#").strip()
+            conn.execute(
+                "UPDATE slack_config SET value = ?, updated_at = ? "
+                "WHERE key = 'channel_name'",
+                (cleaned, int(time.time())),
+            )
+            conn.commit()
+
+
+_migrate_slack_channel_name_strip_hash()
 
 
 def _auth_headers():
@@ -2335,8 +2387,18 @@ def settings_slack_view():
     channel_name = db_get_slack_config("channel_name")
     completed_at = db_get_slack_config("setup_completed_at")
 
+    # Defensive: a config can be "completed" only when it actually has a
+    # valid webhook AND a channel saved. If something cleared one of them,
+    # don't show the "Slack connected ✓" page lying about state.
+    is_done = bool(
+        completed_at
+        and webhook_url
+        and channel_name
+        and _SLACK_WEBHOOK_RE.match(webhook_url)
+    )
+
     requested = request.args.get("step")
-    if completed_at and not requested:
+    if is_done and not requested:
         current_step = "done"
     elif requested:
         try:
@@ -2360,12 +2422,24 @@ def settings_slack_view():
     mapped_slack = sum(1 for m in members.values() if m.get("slack_user_id"))
     me, _ = fetch_me()
 
+    # Format the completion timestamp for display — raw Unix seconds is
+    # confusing in the "Set up" field on step 7.
+    completed_at_display = ""
+    if completed_at:
+        try:
+            completed_at_display = time.strftime(
+                "%Y-%m-%d %H:%M", time.localtime(int(completed_at))
+            )
+        except (TypeError, ValueError):
+            completed_at_display = ""
+
     return render_template(
         "settings_slack.html",
         current_step=current_step,
         channel_name=channel_name or "",
         webhook_url=webhook_url or "",
         completed_at=completed_at or "",
+        completed_at_display=completed_at_display,
         error=request.args.get("error", ""),
         total_teammates=len(teammates),
         mapped_slack=mapped_slack,
@@ -2375,6 +2449,74 @@ def settings_slack_view():
 
 
 _SLACK_WEBHOOK_PREFIX = "https://hooks.slack.com/services/"
+
+# Strict shape for a real Slack incoming-webhook URL, e.g.
+# https://hooks.slack.com/services/T01ABCDEF/B099XYZ/abc123def456...
+# Catches pasted gibberish AND prevents @-host SSRF tricks like
+# https://hooks.slack.com/services/x@evil.example/x/x.
+_SLACK_WEBHOOK_RE = re.compile(
+    r"^https://hooks\.slack\.com/services/T[A-Z0-9]{6,}/B[A-Z0-9]{6,}/[A-Za-z0-9]{16,}$"
+)
+
+# Slack user IDs are like U01ABCDEF or W0... (workspace IDs). Accept both.
+_SLACK_USER_ID_RE = re.compile(r"^[UW][A-Z0-9]{6,}$")
+
+# Reasonable channel name: alphanumerics, dashes, underscores, dots. Slack's
+# own rules are stricter (lowercase, max 80 chars) but we're permissive on
+# case for the display label.
+_SLACK_CHANNEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
+
+
+def _normalize_slack_channel(raw):
+    """Normalize a user-typed channel name. Strips leading '#', strips
+    whitespace, validates against the channel-name regex. Returns the clean
+    name (no '#') on success, or None if invalid."""
+    if not raw:
+        return None
+    s = raw.strip().lstrip("#").strip()
+    if not s or not _SLACK_CHANNEL_RE.match(s):
+        return None
+    return s
+
+
+def _normalize_slack_user_id(raw):
+    """Normalize a user-typed Slack user ID. Strips '<@...>', '@', whitespace.
+    Returns the clean ID on success, '' if input was empty/whitespace, or None
+    if input was non-empty but malformed."""
+    if raw is None:
+        return ""
+    s = raw.strip()
+    if not s:
+        return ""
+    # Strip <@U123> and <@U123|sarah> mention syntax
+    if s.startswith("<@") and s.endswith(">"):
+        s = s[2:-1]
+        if "|" in s:
+            s = s.split("|", 1)[0]
+    s = s.lstrip("@").strip()
+    if _SLACK_USER_ID_RE.match(s):
+        return s
+    return None
+
+
+def _slack_mrkdwn_escape(text):
+    """Escape a name/string for safe embedding in a Slack mrkdwn block.
+
+    Slack's mrkdwn parser treats `*` `_` `~` as formatting and `<...>` as
+    links/mentions. `&` `<` `>` MUST be HTML-entity escaped per Slack's docs.
+    Names like `Tom*Bold*` or `<John>` would otherwise break the message.
+    """
+    if not text:
+        return ""
+    s = str(text)
+    # Slack-required HTML entity escapes (must come first)
+    s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # Strip mrkdwn formatters from name fields. We strip rather than escape
+    # because there's no canonical escape for *_~ — Slack's recommendation
+    # is to remove them when they aren't intended as formatting.
+    for ch in ("*", "_", "~", "`"):
+        s = s.replace(ch, "")
+    return s
 
 
 @app.route("/settings/slack", methods=["POST"])
@@ -2392,12 +2534,12 @@ def settings_slack_save():
         return redirect("/")
 
     if step == "2":
-        channel = (request.form.get("channel_name") or "").strip()
-        # Tolerate the user typing either "warm-intros" or "#warm-intros"
-        if channel and not channel.startswith("#"):
-            channel = "#" + channel
-        if channel:
-            db_set_slack_config("channel_name", channel)
+        # Stored WITHOUT a leading '#' — display layer adds the '#' prefix.
+        # Avoids the "##warm-intros" double-prefix bug when concatenated.
+        normalized = _normalize_slack_channel(request.form.get("channel_name") or "")
+        if not normalized:
+            return redirect(url_for("settings_slack_view", step=2, error="bad_channel"))
+        db_set_slack_config("channel_name", normalized)
         return redirect(url_for("settings_slack_view", step=3))
 
     if step == "3":
@@ -2406,10 +2548,9 @@ def settings_slack_save():
 
     if step == "4":
         webhook = (request.form.get("webhook_url") or "").strip()
-        # Lightweight validation. Slack itself will reject misshapen URLs at
-        # post-time, but catching the obvious typo here saves the user a
-        # round-trip to the Test step and back.
-        if not webhook.startswith(_SLACK_WEBHOOK_PREFIX):
+        # Strict shape check — catches typos AND blocks SSRF-flavored URLs
+        # like https://hooks.slack.com/services/x@127.0.0.1/x/x.
+        if len(webhook) > 256 or not _SLACK_WEBHOOK_RE.match(webhook):
             return redirect(url_for("settings_slack_view", step=4, error="bad_url"))
         db_set_slack_config("webhook_url", webhook)
         return redirect(url_for("settings_slack_view", step=5))
@@ -2442,11 +2583,12 @@ def settings_slack_test():
             f"{(me.get('user_last') or '').strip()}"
         ).strip()
 
-    channel_name = db_get_slack_config("channel_name") or "this channel"
-    sender = f" from {user_full}" if user_full else ""
+    channel_name = db_get_slack_config("channel_name")
+    channel_display = f"#{channel_name}" if channel_name else "this channel"
+    sender = f" from {_slack_mrkdwn_escape(user_full)}" if user_full else ""
     text = (
         f":dart: Draftboard is connected — this is a test message{sender}.\n"
-        f"{channel_name} will receive warm-intro alerts when you or a "
+        f"{channel_display} will receive warm-intro alerts when you or a "
         f"teammate clicks _Assign to teammate_ → :speech_balloon: *Slack* on "
         f"a connector card."
     )
@@ -2510,6 +2652,19 @@ def _build_slack_assign_payload(target, connection, owner, slack_user_id):
     connector_full = f"{connector_first} {connector_last}".strip() or "your connection"
     connector_linkedin = (connection.get("linkedinUrl") or "").strip()
 
+    # Sanitize every name/string that ends up inside a mrkdwn section. Slack
+    # treats *_~<>& as formatting / link / entity characters; a connector
+    # named "Tom*Bold*" or "<John>" would otherwise corrupt the message
+    # rendering. plain_text fields (button labels) only need <>& escaping,
+    # which Slack accepts as HTML entities — _slack_mrkdwn_escape is more
+    # aggressive than needed for plain_text but doesn't break it.
+    target_first_s = _slack_mrkdwn_escape(target_first)
+    target_full_s = _slack_mrkdwn_escape(target_full)
+    target_title_s = _slack_mrkdwn_escape(target_title)
+    target_company_s = _slack_mrkdwn_escape(target_company)
+    connector_first_s = _slack_mrkdwn_escape(connector_first)
+    connector_full_s = _slack_mrkdwn_escape(connector_full)
+
     # Why connector → target — reuse the existing third-person humanizer that
     # already powers connector-card bullets ("Mindy worked with Bogdan at
     # Microsoft for 26 months, most recently in 2009").
@@ -2521,65 +2676,90 @@ def _build_slack_assign_payload(target, connection, owner, slack_user_id):
         for d in raw_details
     ]
     humanized = [h for h in humanized if h]
-    why_connector_target = humanized[0] if humanized else ""
+    why_connector_target = _slack_mrkdwn_escape(humanized[0]) if humanized else ""
 
-    owner_score = owner.get("score") or 0
+    owner_score = owner.get("score")
     score_strength = _slack_score_label(owner_score)
 
     # ---- Build the message body (mrkdwn). One section, multi-line. ----
-    prospect_line = f"*Prospect:* {target_full}"
+    prospect_line = f"*Prospect:* {target_full_s}"
     sub_bits = []
-    if target_title:
-        sub_bits.append(target_title)
-    if target_company:
-        sub_bits.append(f"at {target_company}")
+    if target_title_s:
+        sub_bits.append(target_title_s)
+    if target_company_s:
+        sub_bits.append(f"at {target_company_s}")
     if sub_bits:
         prospect_line += "  _" + " ".join(sub_bits) + "_"
 
-    connection_line = f"*Connection:* {connector_full}"
-    connection_line += f"  _(your score with {connector_first or 'them'}: {owner_score} — {score_strength})_"
+    connection_line = f"*Connection:* {connector_full_s}"
+    # Drop the parenthetical when the score is unknown — "score 0 — weak" is
+    # more confusing than helpful when it just means "no signal yet."
+    if owner_score and owner_score > 0:
+        connection_line += (
+            f"  _(your score with {connector_first_s or 'them'}: "
+            f"{owner_score} — {score_strength})_"
+        )
 
     why_line = ""
     if why_connector_target:
         # E.g., "*Why Adrian → Yoav:* Adrian worked with Yoav at Microsoft
         # for 26 months, most recently in 2009"
         why_line = (
-            f"*Why {connector_first or 'this connection'} → {target_first or 'them'}:* "
-            f"{why_connector_target}"
+            f"*Why {connector_first_s or 'this connection'} → "
+            f"{target_first_s or 'them'}:* {why_connector_target}"
         )
 
-    headline = f":dart: Hey <@{slack_user_id}>, you can make a warm intro"
+    # `slack_user_id` is normalized at write-time in db_set_team_member,
+    # so it's safe to interpolate raw — but defense-in-depth: re-validate
+    # here in case the row was written before normalization shipped.
+    safe_uid = slack_user_id
+    if not _SLACK_USER_ID_RE.match(safe_uid or ""):
+        # Fallback to the connector's first name to avoid a broken @-mention.
+        # The route caller has already gated on a non-empty mapped ID, so
+        # this branch is paranoia.
+        safe_uid = ""
+    mention = f"<@{safe_uid}>" if safe_uid else "the assigned teammate"
+    headline = f":dart: Hey {mention}, you can make a warm intro"
 
     body_lines = [headline, "", prospect_line, connection_line]
     if why_line:
         body_lines.append(why_line)
     body_text = "\n".join(body_lines)
 
+    # Slack's section-text limit is 3000 chars. Realistic messages are well
+    # under, but a target with a paragraph-long company name + scoreDetails
+    # could trip it. Truncate with a clear marker rather than letting Slack
+    # reject the whole message.
+    if len(body_text) > 2900:
+        body_text = body_text[:2890].rstrip() + "\n_…(truncated)_"
+
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn", "text": body_text}},
     ]
 
     # Action buttons: LinkedIn for the target (always real) + LinkedIn for the
-    # connector when available. Skip Draftboard deep-link for v1 since the
-    # public app URL pattern for a target isn't part of the Integration API
-    # surface — we'd have to guess.
+    # connector when available. Slack rejects buttons with non-http(s) URLs,
+    # so guard against pasted-in javascript: or data: schemes (extremely
+    # unlikely for Draftboard data, but the kit is a reference for customers
+    # who will plug in their own data sources).
     action_elements = []
-    if target_linkedin:
+    if target_linkedin and target_linkedin.startswith(("http://", "https://")):
         action_elements.append({
             "type": "button",
-            "text": {"type": "plain_text", "text": f"View {target_first or 'prospect'} on LinkedIn"},
+            "text": {"type": "plain_text", "text": f"View {target_first or 'prospect'} on LinkedIn"[:75]},
             "url": target_linkedin,
         })
-    if connector_linkedin:
+    if connector_linkedin and connector_linkedin.startswith(("http://", "https://")):
         action_elements.append({
             "type": "button",
-            "text": {"type": "plain_text", "text": f"View {connector_first or 'connector'} on LinkedIn"},
+            "text": {"type": "plain_text", "text": f"View {connector_first or 'connector'} on LinkedIn"[:75]},
             "url": connector_linkedin,
         })
     if action_elements:
         blocks.append({"type": "actions", "elements": action_elements})
 
-    fallback_text = f"Warm intro path: {connector_full} → {target_full}"
+    # Notification-tray preview text — plain text, no mrkdwn parsing.
+    fallback_text = f"Warm intro path: {connector_full} -> {target_full}"
     return {"blocks": blocks, "text": fallback_text}
 
 
@@ -2675,6 +2855,8 @@ def settings_team_view():
             "email": m["email"],
         })
     me, _ = fetch_me()
+    invalid_slack = (request.args.get("invalid_slack") or "").strip()
+    invalid_slack_list = [s for s in invalid_slack.split(",") if s] if invalid_slack else []
     return render_template(
         "settings_team.html",
         rows=rows,
@@ -2682,6 +2864,9 @@ def settings_team_view():
         mapped_emails=sum(1 for r in rows if r["email"]),
         mapped_slack=sum(1 for r in rows if r["slack_user_id"]),
         saved=request.args.get("saved") == "1",
+        invalid_slack_list=invalid_slack_list,
+        slack_configured=slack_is_configured(),
+        slack_webhook_saved=bool(db_get_slack_config("webhook_url")),
         me=me,
         active="settings",
     )
@@ -2693,17 +2878,44 @@ def settings_team_save():
 
     Form field names: `slack_user_id__<owner_id>` and `email__<owner_id>`.
     Empty-string values are treated as "clear the field" (legitimate).
+
+    Validation:
+      - owner_id must be non-empty AND exist in target_owners (rejects
+        crafted form-field names like `slack_user_id__` with empty PK
+        or arbitrary IDs not yet known to the app)
+      - slack_user_id is normalized via _normalize_slack_user_id which
+        strips '@', '<@U…>' mention syntax, and rejects malformed input
     """
-    saved_count = 0
+    valid_owner_ids = {o["id"] for o in db_unique_owners()}
+    invalid_slack = []  # (owner_first_or_id, raw_value)
+    members_by_id = {o["id"]: o for o in db_unique_owners()}
+
     for key, value in request.form.items():
         if key.startswith("slack_user_id__"):
             owner_id = key[len("slack_user_id__"):]
-            db_set_team_member(owner_id, slack_user_id=value)
-            saved_count += 1
+            if not owner_id or owner_id not in valid_owner_ids:
+                continue  # silently skip — likely a stale form
+            normalized = _normalize_slack_user_id(value)
+            if normalized is None:
+                # Non-empty but malformed — collect for inline error
+                friendly = members_by_id.get(owner_id, {}).get("first") or owner_id
+                invalid_slack.append(friendly)
+                continue
+            db_set_team_member(owner_id, slack_user_id=normalized)
         elif key.startswith("email__"):
             owner_id = key[len("email__"):]
+            if not owner_id or owner_id not in valid_owner_ids:
+                continue
             db_set_team_member(owner_id, email=value)
-            saved_count += 1
+
+    if invalid_slack:
+        # Pass back the names of teammates whose Slack IDs were rejected so
+        # the page can show an inline error instead of silently dropping.
+        return redirect(url_for(
+            "settings_team_view",
+            saved="1",
+            invalid_slack=",".join(invalid_slack[:5]),
+        ))
     return redirect(url_for("settings_team_view", saved="1"))
 
 

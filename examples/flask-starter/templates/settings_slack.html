@@ -93,13 +93,22 @@
         </p>
         <label class="block">
           <span class="text-xs uppercase tracking-wider text-slate-500">Channel name</span>
-          <input type="text" name="channel_name" value="{{ channel_name or '#warm-intros' }}"
-                 placeholder="#warm-intros"
-                 class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+          <div class="mt-1 flex rounded-md border border-slate-300 focus-within:ring-2 focus-within:ring-indigo-500 overflow-hidden">
+            <span class="flex items-center px-3 bg-slate-50 text-slate-500 text-sm border-r border-slate-300">#</span>
+            <input type="text" name="channel_name" value="{{ channel_name or 'warm-intros' }}"
+                   placeholder="warm-intros" autofocus
+                   pattern="[A-Za-z0-9._-]{1,80}" required
+                   class="flex-1 px-3 py-2 text-sm focus:outline-none" />
+          </div>
         </label>
         <p class="text-[11px] text-slate-500 mt-1">
-          The <code>#</code> is added automatically if you skip it.
+          Letters, numbers, dashes, dots, underscores. No spaces. The <code>#</code> is added automatically.
         </p>
+        {% if error == 'bad_channel' %}
+          <div class="mt-2 rounded border border-red-300 bg-red-50 px-3 py-2 text-xs text-red-900">
+            That channel name has invalid characters. Slack channel names use letters, numbers, dashes, dots, and underscores only — no spaces.
+          </div>
+        {% endif %}
 
         <div class="mt-4 text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded p-3 leading-relaxed">
           <strong>Don't have a channel for this yet?</strong>
@@ -144,7 +153,7 @@
           <li>In the left sidebar, click <strong>Incoming Webhooks</strong>.</li>
           <li>Toggle <strong>Activate Incoming Webhooks</strong> to <strong>On</strong>.</li>
           <li>Scroll down, click <strong>Add New Webhook to Workspace</strong>.</li>
-          <li>Pick the <strong>{{ channel_name or '#warm-intros' }}</strong> channel from the dropdown → <strong>Allow</strong>.</li>
+          <li>Pick the <strong>#{{ channel_name or 'warm-intros' }}</strong> channel from the dropdown → <strong>Allow</strong>.</li>
           <li>You'll land back on the Incoming Webhooks page. <strong>Copy</strong> the new webhook URL. It looks like <code class="text-[11px]">https://hooks.slack.com/services/T0&hellip;/B0&hellip;/&hellip;</code>.</li>
         </ol>
 
@@ -281,13 +290,19 @@
         <h2 class="text-lg font-semibold mb-2">Send a test message</h2>
         <p class="text-sm text-slate-600 mb-4">
           Click below to post a test message to
-          <strong>{{ channel_name or '(your channel)' }}</strong>. If it
+          <strong>{% if channel_name %}#{{ channel_name }}{% else %}(your channel){% endif %}</strong>. If it
           lands, you're all set — the wizard will mark setup complete. If
           something's wrong, you'll see an error here and can go back to
           fix the webhook URL or channel.
         </p>
 
-        {% if error == "network" %}
+        {% if error == "no_webhook" %}
+          <div class="mb-4 rounded border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900">
+            <strong>No webhook URL on file.</strong> Looks like setup got
+            cleared. <a href="/settings/slack?step=4" class="underline">Go to step 4</a>
+            and paste your Slack webhook URL.
+          </div>
+        {% elif error == "network" %}
           <div class="mb-4 rounded border border-rose-300 bg-rose-50 p-3 text-xs text-rose-800">
             <strong>Couldn't reach Slack.</strong> Check your internet
             connection and try again. If the URL is wrong, go
@@ -295,15 +310,28 @@
             and re-paste it.
           </div>
         {% elif error and error.startswith("slack_") %}
+          {% set raw = error[6:] %}
           <div class="mb-4 rounded border border-rose-300 bg-rose-50 p-3 text-xs text-rose-800">
             <strong>Slack rejected the request:</strong>
-            <code>{{ error[6:] }}</code>.
-            Common causes:
-            <ul class="list-disc list-inside mt-1">
-              <li><code>no_service</code>: the webhook was deleted in Slack</li>
-              <li><code>channel_not_found</code>: the channel was deleted or renamed</li>
-              <li><code>invalid_payload</code>: the URL isn't actually a Slack webhook</li>
-            </ul>
+            <code>{{ raw }}</code>.
+            <p class="mt-1">
+              {% if raw == 'no_service' %}
+                The webhook was deleted in Slack. Recreate it (see step 3) and re-paste at step 4.
+              {% elif raw == 'channel_not_found' %}
+                The channel was renamed or archived. Recreate the webhook against the new channel.
+              {% elif raw == 'invalid_payload' %}
+                The pasted URL isn't actually a Slack webhook (or it's pointing somewhere else).
+              {% elif raw == 'no_team' %}
+                The webhook isn't tied to a workspace anymore — usually means the Slack app was uninstalled.
+              {% elif raw == 'invalid_token' %}
+                The webhook secret in the URL is wrong. Re-copy the URL from Slack.
+              {% else %}
+                Common causes: <code>no_service</code> (webhook deleted),
+                <code>channel_not_found</code> (channel deleted/renamed),
+                <code>invalid_payload</code> (URL isn't a Slack webhook),
+                <code>no_team</code> (Slack app uninstalled).
+              {% endif %}
+            </p>
             <a href="/settings/slack?step=4" class="underline">Go back and re-paste the webhook URL</a>.
           </div>
         {% endif %}
@@ -312,13 +340,14 @@
           <strong>Test message preview:</strong>
           <p class="mt-1 italic">
             🎯 Draftboard is connected — this is a test message{% if me and me.user_first %} from {{ me.user_first }} {{ me.user_last or '' }}{% endif %}.
-            <br>{{ channel_name or '#warm-intros' }} will receive warm-intro alerts when you or a teammate clicks <em>Assign to teammate</em> → 💬 Slack on a connector card.
+            <br>#{{ channel_name or 'warm-intros' }} will receive warm-intro alerts when you or a teammate clicks <em>Assign to teammate</em> → 💬 Slack on a connector card.
           </p>
         </div>
 
         <div class="flex items-center gap-3">
           <button type="submit"
-                  class="rounded-md bg-indigo-600 text-white px-4 py-2 text-sm font-medium hover:bg-indigo-700 inline-flex items-center gap-1.5">
+                  onclick="this.disabled=true; this.innerHTML='Sending…'; this.form.submit();"
+                  class="rounded-md bg-indigo-600 text-white px-4 py-2 text-sm font-medium hover:bg-indigo-700 disabled:opacity-60 disabled:cursor-not-allowed inline-flex items-center gap-1.5">
             <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-3.5 h-3.5"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
             Send test message
           </button>
@@ -336,17 +365,30 @@
             <h2 class="text-lg font-semibold text-emerald-900">Slack connected</h2>
             <p class="text-sm text-emerald-800 mt-1">
               The "Assign to teammate" dropdown on connector cards now
-              shows a <strong>💬 Slack {{ channel_name }}</strong> option
+              shows a <strong>💬 Slack #{{ channel_name }}</strong> option
               alongside the existing <strong>📧 Email</strong> option for
               every teammate with a Slack ID mapped.
             </p>
           </div>
         </div>
 
+        {% if total_teammates > 0 and mapped_slack == 0 %}
+          <div class="mt-4 rounded border border-amber-300 bg-amber-50 px-4 py-3 text-xs text-amber-900 flex items-start gap-2">
+            <span>⚠️</span>
+            <div class="flex-1">
+              <strong>No teammates have Slack IDs mapped yet.</strong>
+              The 💬 Slack rows in the connector-card dropdown won't appear
+              until you map at least one. Visit
+              <a href="/settings/team" class="underline font-semibold">Settings → Team</a>
+              to paste each teammate's Slack user ID.
+            </div>
+          </div>
+        {% endif %}
+
         <dl class="mt-5 grid grid-cols-2 gap-4 text-sm bg-white/60 rounded-md p-4">
           <div>
             <dt class="text-[10px] uppercase tracking-wider text-emerald-700">Channel</dt>
-            <dd class="mt-0.5 font-mono text-slate-900">{{ channel_name or '(not set)' }}</dd>
+            <dd class="mt-0.5 font-mono text-slate-900">{% if channel_name %}#{{ channel_name }}{% else %}(not set){% endif %}</dd>
           </div>
           <div>
             <dt class="text-[10px] uppercase tracking-wider text-emerald-700">Webhook</dt>
@@ -360,7 +402,7 @@
           </div>
           <div>
             <dt class="text-[10px] uppercase tracking-wider text-emerald-700">Set up</dt>
-            <dd class="mt-0.5 text-slate-900">{{ completed_at or '—' }}</dd>
+            <dd class="mt-0.5 text-slate-900">{{ completed_at_display or '—' }}</dd>
           </div>
         </dl>
 
@@ -371,15 +413,20 @@
           </a>
           <form method="POST" action="/settings/slack/test" class="inline">
             <button type="submit"
-                    class="rounded-md border border-slate-300 bg-white text-slate-700 px-3 py-1.5 text-xs hover:bg-slate-50">
+                    onclick="this.disabled=true; this.textContent='Sending…'; this.form.submit();"
+                    class="rounded-md border border-slate-300 bg-white text-slate-700 px-3 py-1.5 text-xs hover:bg-slate-50 disabled:opacity-60">
               Send another test
             </button>
           </form>
+          <a href="/settings/slack?step=2"
+             class="text-xs text-slate-500 hover:text-slate-700">Edit channel name</a>
+          <a href="/settings/slack?step=4"
+             class="text-xs text-slate-500 hover:text-slate-700">Edit webhook URL</a>
           <form method="POST" action="/settings/slack/reset" class="inline ml-auto">
             <button type="submit"
-                    onclick="return confirm('Reset Slack config? Your team_members map (Slack IDs + emails) will NOT be touched — only the webhook + channel.');"
+                    onclick="return confirm('Reset Slack config? Your team_members map (Slack IDs + emails) and your channel name will NOT be touched — only the webhook URL + completion state are cleared, so you can re-paste a different webhook.');"
                     class="rounded-md border border-rose-300 bg-white text-rose-700 px-3 py-1.5 text-xs hover:bg-rose-50">
-              Reset
+              Reset webhook
             </button>
           </form>
         </div>
