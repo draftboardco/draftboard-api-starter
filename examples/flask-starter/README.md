@@ -109,6 +109,8 @@ If both methods miss, the candidate row stays usable — you paste the LinkedIn 
 
 Resolutions are cached in SQLite for 30 days so re-resolving the same email is free. The wizard's "Test it" panel calls the resolver with `force: true` so you can verify your keys without waiting for a cache miss.
 
+For bulk lookups (e.g., resolving every contact from an uploaded scanner JSON in one shot), POST a list of `{name, email}` objects to `/candidates/resolve/batch`. Returns one result per input row in the same order, runs up to 5 lookups in parallel, capped at 500 contacts per call. Per-row failures (malformed email, missing name) come back with `error` set on that row only — they don't abort the batch.
+
 ## Running fully offline
 
 Once `targets_cache` is populated by at least one successful sync, the app
