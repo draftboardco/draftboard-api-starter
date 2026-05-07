@@ -66,7 +66,7 @@ Send them this short paste (or a link to this README's "What teammates do" secti
 > python3 supporter_scan.py
 > ```
 >
-> A browser tab will open for Google sign-in. Grant access. After ~5 minutes
+> A browser tab will open for Google sign-in. Grant access. After ~5-10 minutes
 > the script will write an HTML review file next to itself. **Open that HTML
 > in your browser, untick anyone you don't want shared with me, then click
 > "Save Filtered JSON".** A `..._filtered.json` file will download — send
@@ -81,7 +81,7 @@ Send them this short paste (or a link to this README's "What teammates do" secti
 4. **First-time only**: the script asks permission to install two Python packages (`google-auth-oauthlib`, `google-api-python-client`). Say yes.
 5. **A browser tab opens** for Google sign-in. They'll see "Google hasn't verified this app" — that's expected. Click **Advanced → Go to Draftboard (unsafe)**. (Their email needs to be on the kit author's test-users allowlist — see "Heads up" below.)
 6. **Grant the read-only permissions.**
-7. The script runs ~3-5 minutes, prints a top-10 preview to the terminal, and writes a file called `supporter_scan_<email>_<date>.html` next to itself.
+7. The script runs 5-10 minutes (depending on how many threads + events they have), prints a top-10 preview to the terminal, and writes a file called `supporter_scan_<email>_<date>.html` next to itself.
 8. **Open that HTML file in any browser** (double-click in Finder/Explorer, or drag onto a browser tab). It shows every contact the scan found, scored and sortable.
 9. **Untick anyone they don't want shared.** They can search by name/email, untick all visible at once, etc. The default is everyone ticked.
 10. **Click the blue "Save Filtered JSON →" button** at the top right. A `supporter_scan_<email>_<date>_filtered.json` file downloads.

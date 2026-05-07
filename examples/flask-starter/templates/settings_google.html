@@ -17,14 +17,17 @@
         plus shared meetings — so likely Supporters surface automatically on the
         Candidates page.
         <span class="block mt-1 text-xs text-slate-400">
-          One-time scan of your last 12 months. Takes ~5 minutes. All data stays
+          One-time scan of your last 12 months. Takes ~5-10 minutes. All data stays
           on this laptop in <code class="font-mono">data.db</code>.
         </span>
       </p>
     </header>
 
     {# --- Banners --- #}
-    {% if request.args.get('connected') %}
+    {# Show the post-OAuth "Connected" banner only while sync is in progress
+       and last_synced_at hasn't been written yet — once sync completes the
+       "Last sync" panel below takes over and this banner becomes stale. #}
+    {% if request.args.get('connected') and not status.last_synced_at %}
       <div class="mb-4 rounded-md border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
         ✅ Connected{% if status.account_email %} as <strong>{{ status.account_email }}</strong>{% endif %}.
         Sync is running — watch the progress below.
@@ -151,7 +154,7 @@
           <h2 class="text-base font-semibold text-slate-900">First sync running…</h2>
           <p class="mt-1 text-sm text-slate-600">
             Pulling 12 months of Gmail threads + Calendar events. Don't close
-            this tab — typically ~5 min.
+            this tab — typically 5-10 min depending on inbox size.
           </p>
           <div id="google-sync-pill" class="mt-4 text-xs">
             <!-- populated by JS -->
@@ -209,12 +212,17 @@
     var pill = document.getElementById('google-sync-pill');
     if (!pill) return;
     var pollTimer = null;
-    var lastEnded = 0;
+    // Track whether we observed the sync running on THIS page load. The auto-
+    // reload below only fires on the running→done transition; it must not
+    // fire when the page is loaded fresh and we already see a stale "done"
+    // state from a prior sync (which would loop forever).
+    var sawRunning = false;
 
     function render(state) {
       if (!state) return;
       var stage = state.stage || '';
       if (state.running) {
+        sawRunning = true;
         pill.classList.remove('hidden');
         var label = stage === 'gmail' ? 'Pulling Gmail threads' :
                     stage === 'calendar' ? 'Pulling Calendar events' :
@@ -225,8 +233,10 @@
             '<span class="inline-block w-2 h-2 rounded-full bg-indigo-500 animate-pulse"></span>' +
             '<span>' + label + counter + '</span>' +
           '</div>';
-      } else if (stage === 'done' && state.ended_at && state.ended_at > lastEnded) {
-        lastEnded = state.ended_at;
+      } else if (stage === 'done' && sawRunning) {
+        // We watched the sync go from running to done — reload to swap the
+        // "First sync running" UI for the "Last sync" panel.
+        sawRunning = false;
         pill.classList.remove('hidden');
         pill.innerHTML =
           '<div class="flex items-center gap-2 px-3 py-1.5 rounded-md bg-emerald-50 border border-emerald-200 text-emerald-800">' +

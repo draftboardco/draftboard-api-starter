@@ -133,7 +133,7 @@ The **Candidates** page (`/supporters/candidates`) ranks the people you actually
 
 > **Single-user main app, multi-user via portable scanner.** This Flask kit runs on one laptop. By default the Candidates page shows contacts from **your** Gmail + Calendar only. To pool a teammate's network, send them the portable scanner at `scanner/supporter_scan.py` — they OAuth on their laptop, export a JSON, send it back, you import via `/supporters/import-teammate`. Each contact gets badged with whose network it came from. See **"Pooling teammate networks"** below for the full flow.
 
-**Customer flow is one click:** open `/settings/google` → click **Connect Google** → consent → ~5-minute sync runs → candidates ready. No setup ceremony, no per-customer Google Cloud project. All Gmail + Calendar data stays on your laptop in `data.db` — Draftboard's infrastructure never touches it.
+**Customer flow is one click:** open `/settings/google` → click **Connect Google** → consent → 5-10 minute sync runs → candidates ready. No setup ceremony, no per-customer Google Cloud project. All Gmail + Calendar data stays on your laptop in `data.db` — Draftboard's infrastructure never touches it.
 
 ### Configuring the OAuth client (one-time, you do this once)
 
@@ -173,7 +173,7 @@ For each contact: `(emails_sent + replies × 2 + threads × 3 + meetings × 5) �
 
 ## Pooling teammate networks (portable scanner)
 
-A Draftboard team is multiple people. Each person's Gmail + Calendar history is a different slice of the team's collective network. To pool them, the kit ships a **standalone Python scanner** in `scanner/` that a teammate runs on their own laptop — OAuth + 5 minutes — and exports a JSON file you import into your kit.
+A Draftboard team is multiple people. Each person's Gmail + Calendar history is a different slice of the team's collective network. To pool them, the kit ships a **standalone Python scanner** in `scanner/` that a teammate runs on their own laptop — OAuth + 5-10 minutes — and exports a JSON file you import into your kit.
 
 **Setup (you do this once):**
 

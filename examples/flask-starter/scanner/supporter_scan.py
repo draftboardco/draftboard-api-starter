@@ -738,7 +738,8 @@ def main():
 
     print(f"Signed in as: {my_email}")
     print()
-    print("Scanning your network. This usually takes 3-5 minutes.")
+    print("Scanning your network. This usually takes 5-10 minutes depending on")
+    print("how many threads + events you have in your last 12 months.")
     print()
 
     started = time.time()

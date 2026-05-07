@@ -3231,6 +3231,10 @@ def auth_google_start():
     )
     from flask import session
     session["google_oauth_state"] = state
+    # PKCE: persist the code_verifier across the redirect. The Flow object is
+    # ephemeral; without saving the verifier, the callback's fresh Flow can't
+    # complete the token exchange and Google rejects with "Missing code verifier".
+    session["google_oauth_code_verifier"] = flow.code_verifier
     return redirect(auth_url)
 
 
@@ -3263,13 +3267,24 @@ def auth_google_callback():
     if not expected_state or not got_state or expected_state != got_state:
         return redirect(url_for("settings_google_view") + "?error=state_mismatch")
 
+    # PKCE: restore the code_verifier saved during /auth/google/start. Pop so
+    # it can't be replayed by a second callback.
+    code_verifier = session.pop("google_oauth_code_verifier", None)
     try:
         flow = _google_flow()
+        flow.code_verifier = code_verifier
         flow.fetch_token(authorization_response=request.url)
         creds = flow.credentials
         # Kick off sync — credentials live only inside the worker thread, never persisted.
         start_google_sync(creds)
     except Exception as e:
+        # Log the full traceback to the server console so we can diagnose
+        # callback failures. The user-facing banner stays generic.
+        import traceback
+        print("=" * 70, flush=True)
+        print(f"[google/callback] {type(e).__name__}: {e}", flush=True)
+        print(traceback.format_exc(), flush=True)
+        print("=" * 70, flush=True)
         return redirect(url_for("settings_google_view") + f"?error=callback:{type(e).__name__}")
     return redirect(url_for("settings_google_view") + "?connected=1")
 
