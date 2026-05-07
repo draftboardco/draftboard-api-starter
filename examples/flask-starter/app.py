@@ -2465,6 +2465,176 @@ def settings_slack_test():
     return redirect(url_for("settings_slack_view", step=7))
 
 
+def _slack_score_label(score):
+    """Plain-language strength label for an owner→connection score (0-100ish).
+    The Draftboard API doesn't expose per-owner scoreDetails ('the story') —
+    only a number — so this is the best we can do for the 'why this teammate'
+    line in the Slack message until that API gap closes."""
+    score = int(score or 0)
+    if score >= 90:
+        return "strong"
+    if score >= 70:
+        return "decent"
+    if score >= 50:
+        return "moderate"
+    return "weak"
+
+
+def _build_slack_assign_payload(target, connection, owner, slack_user_id):
+    """Build the Block Kit + fallback-text payload for a teammate-assignment
+    Slack post. Two-perspective 'why' as discussed: scoreDetails-derived
+    sentence for connector→target, score-based label for teammate→connector."""
+    target_first = (target.get("firstName") or "").strip()
+    target_last = (target.get("lastName") or "").strip()
+    target_full = f"{target_first} {target_last}".strip() or "this prospect"
+    target_pos = target.get("position") or {}
+    target_title = (target_pos.get("title") or "").strip()
+    target_company = (target_pos.get("companyName") or "").strip()
+    target_linkedin = (target.get("linkedinUrl") or "").strip()
+
+    connector_first = (connection.get("firstName") or "").strip()
+    connector_last = (connection.get("lastName") or "").strip()
+    connector_full = f"{connector_first} {connector_last}".strip() or "your connection"
+    connector_linkedin = (connection.get("linkedinUrl") or "").strip()
+
+    # Why connector → target — reuse the existing third-person humanizer that
+    # already powers connector-card bullets ("Mindy worked with Bogdan at
+    # Microsoft for 26 months, most recently in 2009").
+    raw_details = connection.get("scoreDetails") or []
+    humanized_subject = connector_first or "they"
+    humanized_object = target_first or "them"
+    humanized = [
+        _humanize_for_card(d, humanized_subject, humanized_object)
+        for d in raw_details
+    ]
+    humanized = [h for h in humanized if h]
+    why_connector_target = humanized[0] if humanized else ""
+
+    owner_score = owner.get("score") or 0
+    score_strength = _slack_score_label(owner_score)
+
+    # ---- Build the message body (mrkdwn). One section, multi-line. ----
+    prospect_line = f"*Prospect:* {target_full}"
+    sub_bits = []
+    if target_title:
+        sub_bits.append(target_title)
+    if target_company:
+        sub_bits.append(f"at {target_company}")
+    if sub_bits:
+        prospect_line += "  _" + " ".join(sub_bits) + "_"
+
+    connection_line = f"*Connection:* {connector_full}"
+    connection_line += f"  _(your score with {connector_first or 'them'}: {owner_score} — {score_strength})_"
+
+    why_line = ""
+    if why_connector_target:
+        # E.g., "*Why Adrian → Yoav:* Adrian worked with Yoav at Microsoft
+        # for 26 months, most recently in 2009"
+        why_line = (
+            f"*Why {connector_first or 'this connection'} → {target_first or 'them'}:* "
+            f"{why_connector_target}"
+        )
+
+    headline = f":dart: Hey <@{slack_user_id}>, you can make a warm intro"
+
+    body_lines = [headline, "", prospect_line, connection_line]
+    if why_line:
+        body_lines.append(why_line)
+    body_text = "\n".join(body_lines)
+
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": body_text}},
+    ]
+
+    # Action buttons: LinkedIn for the target (always real) + LinkedIn for the
+    # connector when available. Skip Draftboard deep-link for v1 since the
+    # public app URL pattern for a target isn't part of the Integration API
+    # surface — we'd have to guess.
+    action_elements = []
+    if target_linkedin:
+        action_elements.append({
+            "type": "button",
+            "text": {"type": "plain_text", "text": f"View {target_first or 'prospect'} on LinkedIn"},
+            "url": target_linkedin,
+        })
+    if connector_linkedin:
+        action_elements.append({
+            "type": "button",
+            "text": {"type": "plain_text", "text": f"View {connector_first or 'connector'} on LinkedIn"},
+            "url": connector_linkedin,
+        })
+    if action_elements:
+        blocks.append({"type": "actions", "elements": action_elements})
+
+    fallback_text = f"Warm intro path: {connector_full} → {target_full}"
+    return {"blocks": blocks, "text": fallback_text}
+
+
+@app.route("/slack/assign", methods=["POST"])
+def slack_assign():
+    """Post a teammate-assignment message to the configured Slack webhook.
+
+    Request JSON: {target_id, connection_id, owner_id}
+
+    Looks up:
+      - target metadata from cached /targets list
+      - the specific Connection (by connection_id) from cached
+        /targets/{id}/connections JSON
+      - the specific owner inside connection.owners[] (so we get their score)
+      - the owner's Slack user ID from team_members
+      - the webhook URL from slack_config
+
+    Posts a Block Kit message tagging the teammate. Returns JSON
+    {ok: bool, error?: str} so the click handler can show a toast.
+    """
+    data = request.get_json(silent=True) or {}
+    target_id = (data.get("target_id") or "").strip()
+    connection_id = (data.get("connection_id") or "").strip()
+    owner_id = (data.get("owner_id") or "").strip()
+
+    if not (target_id and connection_id and owner_id):
+        return jsonify({"ok": False, "error": "missing target_id, connection_id, or owner_id"}), 400
+
+    webhook = db_get_slack_config("webhook_url")
+    if not webhook:
+        return jsonify({"ok": False, "error": "Slack isn't configured yet — visit Settings → Slack"}), 400
+
+    member = db_get_team_member(owner_id) or {}
+    slack_user_id = (member.get("slack_user_id") or "").strip()
+    if not slack_user_id:
+        return jsonify({"ok": False, "error": "this teammate has no Slack ID mapped — visit Settings → Team to add one"}), 400
+
+    targets, _ = fetch_all_targets()
+    target = next((t for t in targets if t.get("id") == target_id), None)
+    if not target:
+        return jsonify({"ok": False, "error": "target not found in local cache"}), 404
+
+    target_connections, _err = fetch_target_connections(target_id)
+    connection = next((c for c in target_connections if c.get("id") == connection_id), None)
+    if not connection:
+        return jsonify({"ok": False, "error": "connection not found for this target"}), 404
+
+    owner = next((o for o in (connection.get("owners") or []) if o.get("id") == owner_id), None)
+    if not owner:
+        return jsonify({"ok": False, "error": "this owner isn't on the connection's owners list"}), 400
+
+    payload = _build_slack_assign_payload(target, connection, owner, slack_user_id)
+
+    try:
+        r = requests.post(webhook, json=payload, timeout=10, allow_redirects=False)
+    except requests.RequestException as e:
+        return jsonify({"ok": False, "error": f"network error posting to Slack: {e}"}), 502
+
+    body = (r.text or "").strip()
+    if r.status_code != 200 or body != "ok":
+        return jsonify({
+            "ok": False,
+            "error": f"Slack returned {r.status_code}: {body[:128]}",
+        }), 502
+
+    return jsonify({"ok": True, "channel": db_get_slack_config("channel_name") or ""})
+
+
 @app.route("/settings/slack/reset", methods=["POST"])
 def settings_slack_reset():
     """Wipe Slack config (webhook URL, channel name, completion timestamps)
