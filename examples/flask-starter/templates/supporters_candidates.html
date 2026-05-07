@@ -109,6 +109,18 @@
       </div>
     {% endif %}
 
+    {# --- Bulk-resolve toolbar (above the filter bar so it persists across filter changes) --- #}
+    {% if has_any_data and unresolved_count > 0 and resolver_status and resolver_status.any_ready %}
+      <div id="bulk-resolve-bar" class="mb-3 flex items-center gap-3 flex-wrap rounded-md border border-indigo-200 bg-indigo-50 px-4 py-2 text-sm text-indigo-900">
+        <strong>{{ unresolved_count }}</strong> candidate{{ '' if unresolved_count == 1 else 's' }} {{ "hasn't" if unresolved_count == 1 else "haven't" }} been looked up on LinkedIn yet.
+        <button id="bulk-resolve-btn" type="button"
+                class="ml-auto inline-flex items-center text-xs px-3 py-1.5 rounded-md bg-indigo-600 text-white font-medium hover:bg-indigo-700">
+          Resolve all LinkedIn URLs →
+        </button>
+        <span id="bulk-resolve-progress" class="hidden text-xs text-indigo-800"></span>
+      </div>
+    {% endif %}
+
     {# --- Filter / search bar --- #}
     {% if has_any_data %}
       <form method="GET" action="/supporters/candidates"
@@ -133,6 +145,27 @@
             </select>
           </div>
         {% endif %}
+        <div>
+          <label for="source" class="block text-[10px] uppercase tracking-wider text-slate-500 mb-1">Source</label>
+          <select name="source" id="source" onchange="this.form.submit()"
+                  class="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500">
+            <option value="" {% if not source %}selected{% endif %}>All</option>
+            <option value="email" {% if source == 'email' %}selected{% endif %}>Email engagement</option>
+            <option value="calendar" {% if source == 'calendar' %}selected{% endif %}>Shared meetings</option>
+          </select>
+        </div>
+        <div>
+          <label for="status_filter" class="block text-[10px] uppercase tracking-wider text-slate-500 mb-1">Show</label>
+          <select name="status_filter" id="status_filter" onchange="this.form.submit()"
+                  class="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500">
+            <option value="active" {% if status_filter == 'active' %}selected{% endif %}>Active (not hidden)</option>
+            <option value="all" {% if status_filter == 'all' %}selected{% endif %}>All including hidden</option>
+            <option value="starred" {% if status_filter == 'starred' %}selected{% endif %}>Starred only</option>
+            <option value="supporter" {% if status_filter == 'supporter' %}selected{% endif %}>Marked as supporter</option>
+            <option value="hidden" {% if status_filter == 'hidden' %}selected{% endif %}>Hidden only</option>
+            <option value="unmarked" {% if status_filter == 'unmarked' %}selected{% endif %}>Not yet marked</option>
+          </select>
+        </div>
         <button type="submit"
                 class="text-xs px-3 py-1.5 rounded-md bg-slate-900 text-white hover:bg-slate-800">
           Apply
@@ -186,10 +219,16 @@
           </thead>
           <tbody class="divide-y divide-slate-100">
             {% for c in candidates %}
-              <tr class="hover:bg-slate-50">
+              <tr class="hover:bg-slate-50 candidate-row {% if c.row_status == 'hidden' %}opacity-50{% endif %}"
+                  data-email="{{ c.email }}" data-status="{{ c.row_status }}">
                 <td class="px-4 py-3 text-xs text-slate-400 align-top">{{ loop.index + (page - 1) * per_page }}</td>
                 <td class="px-4 py-3 align-top">
-                  <div class="font-medium text-slate-900">{{ c.name }}</div>
+                  <div class="font-medium text-slate-900 flex items-center gap-1.5">
+                    {{ c.name }}
+                    {% if c.row_status == 'starred' %}<span class="text-amber-500" title="Starred">★</span>{% endif %}
+                    {% if c.row_status == 'supporter' %}<span class="inline-flex items-center rounded-full bg-emerald-100 text-emerald-800 px-1.5 py-0 text-[10px] font-medium" title="Already added as a Draftboard Supporter">supporter ✓</span>{% endif %}
+                    {% if c.is_first_degree %}<span class="inline-flex items-center rounded-full bg-indigo-100 text-indigo-800 px-1.5 py-0 text-[10px] font-medium" title="In your existing Draftboard 1st-degree connector network — usable as a Supporter today">1st°</span>{% endif %}
+                  </div>
                   <div class="text-xs text-slate-500 truncate">{{ c.email }}</div>
                 </td>
                 <td class="px-4 py-3 align-top">
@@ -220,7 +259,7 @@
                   </span>
                 </td>
                 <td class="px-4 py-3 text-right align-top">
-                  <div class="resolve-cell" data-email="{{ c.email }}">
+                  <div class="resolve-cell flex items-center justify-end gap-1.5" data-email="{{ c.email }}">
                     {% if c.linkedin_url %}
                       <a href="{{ c.linkedin_url }}" target="_blank" rel="noopener"
                          class="inline-flex items-center text-xs px-2.5 py-1 rounded-md border border-emerald-200 bg-emerald-50 text-emerald-800 hover:bg-emerald-100 font-medium"
@@ -241,6 +280,26 @@
                         Resolve LinkedIn URL
                       </button>
                     {% endif %}
+                    {# Triage actions: star, mark as supporter, hide. Three small icon
+                       buttons with toggle-on-click semantics. JS calls /candidates/status
+                       and updates the row visually. #}
+                    <div class="flex items-center gap-0.5 ml-1 border-l border-slate-200 pl-1.5">
+                      <button type="button" data-email="{{ c.email }}" data-status="starred"
+                              title="Star as someone to focus on"
+                              class="status-btn px-1 py-1 rounded-md text-base hover:bg-amber-50 {% if c.row_status == 'starred' %}text-amber-500{% else %}text-slate-300 hover:text-amber-400{% endif %}">
+                        ★
+                      </button>
+                      <button type="button" data-email="{{ c.email }}" data-status="supporter"
+                              title="Already added as a Draftboard Supporter"
+                              class="status-btn px-1 py-1 rounded-md text-base hover:bg-emerald-50 {% if c.row_status == 'supporter' %}text-emerald-600{% else %}text-slate-300 hover:text-emerald-500{% endif %}">
+                        ✓
+                      </button>
+                      <button type="button" data-email="{{ c.email }}" data-status="hidden"
+                              title="Hide from default view"
+                              class="status-btn px-1 py-1 rounded-md text-sm hover:bg-rose-50 {% if c.row_status == 'hidden' %}text-rose-500{% else %}text-slate-300 hover:text-rose-400{% endif %}">
+                        ⌀
+                      </button>
+                    </div>
                   </div>
                 </td>
               </tr>
@@ -256,7 +315,7 @@
             Showing {{ (page - 1) * per_page + 1 }}–{{ [page * per_page, total] | min }} of {{ total }}
           </div>
           <div class="flex gap-1">
-            {% set qs = ('&q=' ~ query if query else '') ~ ('&contributor=' ~ contributor if contributor else '') %}
+            {% set qs = ('&q=' ~ query if query else '') ~ ('&contributor=' ~ contributor if contributor else '') ~ ('&source=' ~ source if source else '') ~ ('&status_filter=' ~ status_filter if status_filter and status_filter != 'active' else '') %}
             {% if page > 1 %}
               <a href="?page={{ page - 1 }}{{ qs }}" class="px-2 py-1 rounded-md border border-slate-300 bg-white hover:bg-slate-50">← Prev</a>
             {% endif %}
@@ -361,6 +420,80 @@
     }
 
     document.querySelectorAll('.resolve-btn').forEach(wireResolveButton);
+
+    // --- Triage status buttons (star / supporter-mark / hide) ---
+    // Click toggles: pressing the same status again clears it.
+    document.querySelectorAll('.status-btn').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var email = btn.dataset.email;
+        var newStatus = btn.dataset.status;
+        var row = btn.closest('.candidate-row');
+        if (!row) return;
+        var current = row.dataset.status || '';
+        // Toggle: clicking the active status clears it.
+        if (current === newStatus) newStatus = '';
+        fetch('/candidates/status', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: email, status: newStatus })
+        })
+          .then(function (r) { return r.json(); })
+          .then(function (data) {
+            if (data.error) { showToast(data.error); return; }
+            row.dataset.status = newStatus;
+            // Reload — simplest way to re-render the row's status badges +
+            // the active filter. Cheap on a 50-row page.
+            window.location.reload();
+          })
+          .catch(function () { showToast('Network error — try again.'); });
+      });
+    });
+
+    // --- Bulk resolve all LinkedIn URLs ---
+    var bulkBtn = document.getElementById('bulk-resolve-btn');
+    var bulkProgress = document.getElementById('bulk-resolve-progress');
+    if (bulkBtn) {
+      bulkBtn.addEventListener('click', function () {
+        if (!confirm('Resolve LinkedIn URLs for all unresolved candidates? Each lookup uses a small bit of your Apollo / Google CSE quota.')) return;
+        bulkBtn.disabled = true;
+        bulkBtn.textContent = 'Resolving…';
+        bulkProgress.classList.remove('hidden');
+        var totalResolved = 0;
+
+        function nextChunk() {
+          fetch('/candidates/unresolved')
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+              var remaining = data.remaining || 0;
+              if (!data.contacts || data.contacts.length === 0) {
+                bulkProgress.textContent = '✓ Done — found ' + totalResolved + ' LinkedIn URLs. Reloading…';
+                setTimeout(function () { window.location.reload(); }, 1200);
+                return;
+              }
+              bulkProgress.textContent =
+                'Looking up ' + data.contacts.length + ' contacts (' + remaining + ' total remaining). This batch takes ~1-3 min…';
+              return fetch('/candidates/resolve/batch', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ contacts: data.contacts })
+              })
+                .then(function (r) { return r.json(); })
+                .then(function (resp) {
+                  totalResolved += (resp.hits || 0);
+                  bulkProgress.textContent =
+                    'Found ' + totalResolved + ' so far. Continuing…';
+                  setTimeout(nextChunk, 200);
+                });
+            })
+            .catch(function (e) {
+              bulkProgress.textContent = '✗ Error: ' + (e && e.message || 'unknown');
+              bulkBtn.disabled = false;
+              bulkBtn.textContent = 'Resolve all LinkedIn URLs →';
+            });
+        }
+        nextChunk();
+      });
+    }
 
     // Relative timestamps
     document.querySelectorAll('.rel-ts').forEach(function (el) {

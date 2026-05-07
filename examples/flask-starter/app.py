@@ -448,6 +448,19 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_teammate_contacts_contributor ON teammate_contacts(contributor_email)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_teammate_contacts_email ON teammate_contacts(email)")
 
+        # Per-candidate triage state (set by the user from the candidates page).
+        # `status` is one of: 'starred', 'hidden', 'supporter', or absent.
+        # Default view filters out 'hidden'. 'supporter' = "I've already added
+        # this person as a Draftboard Supporter manually" (informational badge).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS candidate_status (
+                email TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_candidate_status_status ON candidate_status(status)")
+
         # Migration: drop the older `oauth_tokens` + `google_sync_state` tables
         # from the BYO architecture. Their data was always per-install and
         # ephemeral, so dropping is safe.
@@ -2875,7 +2888,7 @@ def score_contact(emails_sent, replies_received, threads_count, meetings_count, 
     return int(base * recency)
 
 
-def db_query_candidates(limit=200, offset=0, query="", contributor=""):
+def db_query_candidates(limit=200, offset=0, query="", contributor="", source="", status_filter="active"):
     """Merge gmail + calendar contacts (the local user's own scan) AND any
     imported teammate scans, score each, return top N.
 
@@ -2889,9 +2902,13 @@ def db_query_candidates(limit=200, offset=0, query="", contributor=""):
     newsletters (received → never replied). Calendar-only contacts are kept
     unconditionally since attending a shared meeting IS bidirectional.
 
-    `contributor` filter, when non-empty, restricts to a single contributor's
-    contacts. Pass "__self__" to see only the local user's own; pass a
-    teammate's email to see only theirs.
+    Filters:
+    - `contributor`: when non-empty, restricts to one contributor. "__self__"
+      = local user only; teammate email = just that teammate.
+    - `source`: "" all, "email" only contacts with bidirectional email,
+      "calendar" only contacts with shared meetings.
+    - `status_filter`: "active" (default — hides 'hidden'), "all", "starred",
+      "supporter", "hidden", "unmarked".
     """
     now = int(time.time())
     me_email = (db_app_state_get("google_account_email", "") or "").strip().lower()
@@ -2960,11 +2977,31 @@ def db_query_candidates(limit=200, offset=0, query="", contributor=""):
     if contributor:
         where_clauses.append("contributor_email = ?")
         args.append(contributor)
+    if source == "email":
+        where_clauses.append("(emails_sent >= 1 AND replies_received >= 1)")
+    elif source == "calendar":
+        where_clauses.append("meetings_count >= 1")
     if where_clauses:
         full_sql += " WHERE " + " AND ".join(where_clauses)
     with _db_lock, _db_connect() as conn:
         cur = conn.execute(full_sql, args)
         rows = cur.fetchall()
+        # Pull status map in one go so we can filter + label rows in Python.
+        status_cur = conn.execute("SELECT email, status FROM candidate_status")
+        status_map = {r[0]: r[1] for r in status_cur.fetchall()}
+        # 1st-degree connection lookup: build a set of normalized LinkedIn URLs
+        # from the user's existing Draftboard connector_paths network.
+        # Powers the "1st-degree ✓" / "connect on LinkedIn first →" badge.
+        firstdegree_cur = conn.execute(
+            "SELECT DISTINCT LOWER(RTRIM(connector_linkedin, '/')) "
+            "FROM connector_paths WHERE connector_linkedin != ''"
+        )
+        firstdegree_set = {r[0] for r in firstdegree_cur.fetchall() if r[0]}
+        # And a separate lookup for resolved LinkedIn URLs from the resolver.
+        resolved_cur = conn.execute(
+            "SELECT email, linkedin_url FROM linkedin_resolutions WHERE linkedin_url IS NOT NULL AND linkedin_url != ''"
+        )
+        resolved_map = {r[0]: r[1] for r in resolved_cur.fetchall()}
     candidates = []
     for r in rows:
         contributor_email = r[0]
@@ -2980,6 +3017,26 @@ def db_query_candidates(limit=200, offset=0, query="", contributor=""):
         last_contact_at = max(last_emailed_at, last_met_at)
         days_ago = ((now - last_contact_at) / 86400.0) if last_contact_at else None
         score = score_contact(emails_sent, replies_received, threads_count, meetings_count, days_ago)
+        # Status filter — applied in Python so the SQL union stays simple.
+        row_status = status_map.get(email, "")
+        if status_filter == "active" and row_status == "hidden":
+            continue
+        if status_filter == "starred" and row_status != "starred":
+            continue
+        if status_filter == "hidden" and row_status != "hidden":
+            continue
+        if status_filter == "supporter" and row_status != "supporter":
+            continue
+        if status_filter == "unmarked" and row_status:
+            continue
+        # 1st-degree check: if this candidate has a resolved LinkedIn URL,
+        # see if it appears in the user's connector_paths network.
+        linkedin_url = resolved_map.get(email, "")
+        is_first_degree = False
+        if linkedin_url:
+            norm = _normalize_linkedin(linkedin_url)
+            if norm and norm in firstdegree_set:
+                is_first_degree = True
         # Render-time labels for the contributor.
         if contributor_email == "__self__":
             contributor_label = "you"
@@ -2999,10 +3056,74 @@ def db_query_candidates(limit=200, offset=0, query="", contributor=""):
             "score": score,
             "contributor_email": contributor_email,
             "contributor_label": contributor_label,
+            "row_status": row_status,
+            "is_first_degree": is_first_degree,
         })
     candidates.sort(key=lambda c: (-c["score"], -c["threads_count"], c["email"]))
     total = len(candidates)
     return candidates[offset:offset + limit], total
+
+
+def db_set_candidate_status(email, status):
+    """Set or clear a candidate's triage status. Empty status removes the row."""
+    email = (email or "").strip().lower()
+    if not email:
+        return
+    with _db_lock, _db_connect() as conn:
+        if status:
+            conn.execute(
+                "INSERT INTO candidate_status (email, status, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(email) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at",
+                (email, status, int(time.time())),
+            )
+        else:
+            conn.execute("DELETE FROM candidate_status WHERE email = ?", (email,))
+        conn.commit()
+
+
+def db_count_unresolved_candidates():
+    """Count candidates that have NO row in linkedin_resolutions (i.e. never
+    been tried). Used by the bulk-resolve toolbar button. Excludes hidden
+    candidates by default since the user already triaged them out."""
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute("""
+            SELECT COUNT(*) FROM (
+                SELECT email FROM gmail_contacts WHERE emails_sent >= 1 AND replies_received >= 1
+                UNION
+                SELECT email FROM calendar_contacts WHERE meetings_count >= 1
+                UNION
+                SELECT email FROM teammate_contacts WHERE meetings_count >= 1 OR (emails_sent >= 1 AND replies_received >= 1)
+            ) AS c
+            WHERE c.email NOT IN (SELECT email FROM linkedin_resolutions)
+              AND c.email NOT IN (SELECT email FROM candidate_status WHERE status = 'hidden')
+        """)
+        return cur.fetchone()[0]
+
+
+def db_unresolved_candidate_emails(limit=500):
+    """Return up to `limit` (email, name) tuples for candidates that haven't
+    been resolved yet. Names come from gmail_contacts, calendar_contacts, or
+    teammate_contacts in that priority. Used to feed the bulk-resolve flow."""
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute("""
+            SELECT c.email,
+                   COALESCE(NULLIF(gn.name, ''), NULLIF(cn.name, ''), NULLIF(tn.name, ''), '') AS name
+            FROM (
+                SELECT email FROM gmail_contacts WHERE emails_sent >= 1 AND replies_received >= 1
+                UNION
+                SELECT email FROM calendar_contacts WHERE meetings_count >= 1
+                UNION
+                SELECT email FROM teammate_contacts WHERE meetings_count >= 1 OR (emails_sent >= 1 AND replies_received >= 1)
+            ) AS c
+            LEFT JOIN gmail_contacts    gn ON c.email = gn.email
+            LEFT JOIN calendar_contacts cn ON c.email = cn.email
+            LEFT JOIN teammate_contacts tn ON c.email = tn.email
+            WHERE c.email NOT IN (SELECT email FROM linkedin_resolutions)
+              AND c.email NOT IN (SELECT email FROM candidate_status WHERE status = 'hidden')
+            ORDER BY c.email
+            LIMIT ?
+        """, (limit,))
+        return [(row[0], row[1] or row[0]) for row in cur.fetchall()]
 
 
 def db_list_contributors():
@@ -3305,8 +3426,11 @@ def supporters_candidates_view():
     per_page = 50
     query = (request.args.get("q") or "").strip()
     contributor = (request.args.get("contributor") or "").strip()
+    source = (request.args.get("source") or "").strip()
+    status_filter = (request.args.get("status_filter") or "active").strip()
     candidates, total = db_query_candidates(
-        limit=per_page, offset=(page - 1) * per_page, query=query, contributor=contributor
+        limit=per_page, offset=(page - 1) * per_page,
+        query=query, contributor=contributor, source=source, status_filter=status_filter,
     )
     # Hydrate each candidate with its cached LinkedIn-resolution result (if any)
     # so already-resolved rows render with the URL inline. Fresh candidates
@@ -3337,6 +3461,7 @@ def supporters_candidates_view():
     contributors = db_list_contributors()
     resolver_keys = _load_resolver_keys()
     resolver_status = _resolver_status(resolver_keys)
+    unresolved_count = db_count_unresolved_candidates()
     return render_template(
         "supporters_candidates.html",
         candidates=candidates,
@@ -3347,12 +3472,46 @@ def supporters_candidates_view():
         query=query,
         contributor=contributor,
         contributors=contributors,
+        source=source,
+        status_filter=status_filter,
+        unresolved_count=unresolved_count,
         status=status,
         sync_state=sync_state,
         resolver_status=resolver_status,
         active="candidates",
         api_key_set=bool(API_KEY),
     )
+
+
+@app.route("/candidates/status", methods=["POST"])
+def candidates_set_status():
+    """Set or toggle a candidate's triage status. JSON body:
+       {"email": "...", "status": "starred"|"hidden"|"supporter"|""}
+       Empty status clears."""
+    if not request.is_json:
+        return jsonify({"error": "JSON body required"}), 400
+    body = request.get_json(silent=True) or {}
+    email = (body.get("email") or "").strip().lower()
+    status = (body.get("status") or "").strip()
+    if not email:
+        return jsonify({"error": "email required"}), 400
+    if status and status not in ("starred", "hidden", "supporter"):
+        return jsonify({"error": f"unknown status: {status}"}), 400
+    db_set_candidate_status(email, status)
+    return jsonify({"ok": True, "email": email, "status": status})
+
+
+@app.route("/candidates/unresolved", methods=["GET"])
+def candidates_unresolved_list():
+    """Return up to 500 (name, email) pairs the bulk-resolve button can feed
+    into /candidates/resolve/batch. The JS pulls a chunk, posts it, then
+    pulls the next chunk until the count drops to 0."""
+    rows = db_unresolved_candidate_emails(limit=500)
+    return jsonify({
+        "count": len(rows),
+        "remaining": db_count_unresolved_candidates(),
+        "contacts": [{"email": e, "name": n} for e, n in rows],
+    })
 
 
 @app.route("/supporters/import-teammate", methods=["GET", "POST"])
