@@ -2345,6 +2345,7 @@ def settings_slack_view():
     teammates = db_unique_owners()
     members = db_all_team_members()
     mapped_slack = sum(1 for m in members.values() if m.get("slack_user_id"))
+    me, _ = fetch_me()
 
     return render_template(
         "settings_slack.html",
@@ -2355,6 +2356,7 @@ def settings_slack_view():
         error=request.args.get("error", ""),
         total_teammates=len(teammates),
         mapped_slack=mapped_slack,
+        me=me,
         active="settings",
     )
 
@@ -2405,8 +2407,72 @@ def settings_slack_save():
         # Just advance.
         return redirect(url_for("settings_slack_view", step=6))
 
-    # Step 6 lands in the next iteration.
+    # Step 6 (test message) is handled by /settings/slack/test, not here.
     return redirect(url_for("settings_slack_view"))
+
+
+@app.route("/settings/slack/test", methods=["POST"])
+def settings_slack_test():
+    """Send a real Slack test message via the configured webhook. On success,
+    record `last_test_at` + `setup_completed_at` and bounce the user to the
+    "Slack connected ✓" overview (step 7). On failure, bounce back to step 6
+    with a descriptive ?error= param so the user can see what went wrong."""
+    webhook = db_get_slack_config("webhook_url")
+    if not webhook:
+        return redirect(url_for("settings_slack_view", step=4, error="no_webhook"))
+
+    me, _ = fetch_me()
+    user_full = ""
+    if me:
+        user_full = (
+            f"{(me.get('user_first') or '').strip()} "
+            f"{(me.get('user_last') or '').strip()}"
+        ).strip()
+
+    channel_name = db_get_slack_config("channel_name") or "this channel"
+    sender = f" from {user_full}" if user_full else ""
+    text = (
+        f":dart: Draftboard is connected — this is a test message{sender}.\n"
+        f"{channel_name} will receive warm-intro alerts when you or a "
+        f"teammate clicks _Assign to teammate_ → :speech_balloon: *Slack* on "
+        f"a connector card."
+    )
+
+    try:
+        # allow_redirects=False so a fake/dead webhook (which Slack 302s away
+        # from) doesn't masquerade as success when the redirect target 200s.
+        r = requests.post(
+            webhook, json={"text": text}, timeout=10, allow_redirects=False
+        )
+    except requests.RequestException:
+        return redirect(url_for("settings_slack_view", step=6, error="network"))
+
+    # Canonical Slack-incoming-webhook success: HTTP 200 + body == "ok".
+    # Anything else (other status codes, empty body, body with an error code
+    # like "no_service") is a failure we report to the user.
+    body = (r.text or "").strip()
+    if r.status_code != 200 or body != "ok":
+        reason = body or f"http_{r.status_code}"
+        # Sanitize for URL: spaces/punct out, max 32 chars.
+        reason = re.sub(r"[^A-Za-z0-9_-]+", "_", reason)[:32] or f"http_{r.status_code}"
+        return redirect(url_for(
+            "settings_slack_view", step=6, error=f"slack_{reason}"
+        ))
+
+    now = int(time.time())
+    db_set_slack_config("last_test_at", str(now))
+    db_set_slack_config("setup_completed_at", str(now))
+    return redirect(url_for("settings_slack_view", step=7))
+
+
+@app.route("/settings/slack/reset", methods=["POST"])
+def settings_slack_reset():
+    """Wipe Slack config (webhook URL, channel name, completion timestamps)
+    and bounce back to step 1 so the user can re-run the wizard. Leaves
+    team_members intact since email mappings are still useful even when
+    Slack is offline."""
+    db_clear_slack_config()
+    return redirect(url_for("settings_slack_view", step=1))
 
 
 @app.route("/settings/team", methods=["GET"])

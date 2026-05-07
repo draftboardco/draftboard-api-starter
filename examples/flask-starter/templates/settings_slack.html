@@ -275,36 +275,114 @@
         </p>
       </div>
 
-    {# ---------- Step 6: placeholder until next iteration ---------- #}
+    {# ---------- Step 6: Send test message ---------- #}
     {% elif current_step == 6 %}
-      <div class="bg-amber-50 border border-amber-200 rounded-lg p-6 text-sm">
-        <h2 class="font-semibold text-amber-900 mb-1">
-          Step 6 (test message) coming next
-        </h2>
-        <p class="text-amber-900">
-          Channel <strong>{{ channel_name or '(not set)' }}</strong> is saved
-          {% if webhook_url %}and webhook URL is stored{% endif %}.
-          {{ mapped_slack }} teammate{{ '' if mapped_slack == 1 else 's' }}
-          mapped. The Test step ships in the next iteration.
+      <form method="POST" action="/settings/slack/test" class="bg-white border border-slate-200 rounded-lg p-6 shadow-sm">
+        <h2 class="text-lg font-semibold mb-2">Send a test message</h2>
+        <p class="text-sm text-slate-600 mb-4">
+          Click below to post a test message to
+          <strong>{{ channel_name or '(your channel)' }}</strong>. If it
+          lands, you're all set — the wizard will mark setup complete. If
+          something's wrong, you'll see an error here and can go back to
+          fix the webhook URL or channel.
         </p>
-        <div class="mt-4 flex items-center gap-3">
-          <a href="/settings/slack?step=5"
-             class="text-sm text-slate-500 hover:text-slate-700">← Back to teammates</a>
-          <a href="/settings/team"
-             class="text-sm text-indigo-600 hover:underline">Adjust teammate map →</a>
-        </div>
-      </div>
 
-    {# ---------- Step 7: Done overview (also reachable when fully configured) ---------- #}
+        {% if error == "network" %}
+          <div class="mb-4 rounded border border-rose-300 bg-rose-50 p-3 text-xs text-rose-800">
+            <strong>Couldn't reach Slack.</strong> Check your internet
+            connection and try again. If the URL is wrong, go
+            <a href="/settings/slack?step=4" class="underline">back to step 4</a>
+            and re-paste it.
+          </div>
+        {% elif error and error.startswith("slack_") %}
+          <div class="mb-4 rounded border border-rose-300 bg-rose-50 p-3 text-xs text-rose-800">
+            <strong>Slack rejected the request:</strong>
+            <code>{{ error[6:] }}</code>.
+            Common causes:
+            <ul class="list-disc list-inside mt-1">
+              <li><code>no_service</code>: the webhook was deleted in Slack</li>
+              <li><code>channel_not_found</code>: the channel was deleted or renamed</li>
+              <li><code>invalid_payload</code>: the URL isn't actually a Slack webhook</li>
+            </ul>
+            <a href="/settings/slack?step=4" class="underline">Go back and re-paste the webhook URL</a>.
+          </div>
+        {% endif %}
+
+        <div class="mb-4 px-4 py-3 rounded bg-slate-50 border border-slate-200 text-xs text-slate-700">
+          <strong>Test message preview:</strong>
+          <p class="mt-1 italic">
+            🎯 Draftboard is connected — this is a test message{% if me and me.user_first %} from {{ me.user_first }} {{ me.user_last or '' }}{% endif %}.
+            <br>{{ channel_name or '#warm-intros' }} will receive warm-intro alerts when you or a teammate clicks <em>Assign to teammate</em> → 💬 Slack on a connector card.
+          </p>
+        </div>
+
+        <div class="flex items-center gap-3">
+          <button type="submit"
+                  class="rounded-md bg-indigo-600 text-white px-4 py-2 text-sm font-medium hover:bg-indigo-700 inline-flex items-center gap-1.5">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-3.5 h-3.5"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+            Send test message
+          </button>
+          <a href="/settings/slack?step=5"
+             class="text-sm text-slate-500 hover:text-slate-700">← Back</a>
+        </div>
+      </form>
+
+    {# ---------- Step 7: Done overview (reached via test success or auto-resume) ---------- #}
     {% else %}
-      <div class="bg-emerald-50 border border-emerald-200 rounded-lg p-6 text-sm">
-        <h2 class="font-semibold text-emerald-900 mb-1">Slack connected ✓</h2>
-        <p class="text-emerald-900">
-          Channel: <strong>{{ channel_name or '(not set)' }}</strong>
-        </p>
-        <p class="mt-2 text-emerald-900">
-          Reset / re-install ships in a later step.
-        </p>
+      <div class="bg-emerald-50 border border-emerald-200 rounded-lg p-6">
+        <div class="flex items-start gap-3">
+          <div class="flex-shrink-0 w-10 h-10 rounded-full bg-emerald-200 text-emerald-800 flex items-center justify-center text-lg">✓</div>
+          <div class="flex-1 min-w-0">
+            <h2 class="text-lg font-semibold text-emerald-900">Slack connected</h2>
+            <p class="text-sm text-emerald-800 mt-1">
+              The "Assign to teammate" dropdown on connector cards now
+              shows a <strong>💬 Slack {{ channel_name }}</strong> option
+              alongside the existing <strong>📧 Email</strong> option for
+              every teammate with a Slack ID mapped.
+            </p>
+          </div>
+        </div>
+
+        <dl class="mt-5 grid grid-cols-2 gap-4 text-sm bg-white/60 rounded-md p-4">
+          <div>
+            <dt class="text-[10px] uppercase tracking-wider text-emerald-700">Channel</dt>
+            <dd class="mt-0.5 font-mono text-slate-900">{{ channel_name or '(not set)' }}</dd>
+          </div>
+          <div>
+            <dt class="text-[10px] uppercase tracking-wider text-emerald-700">Webhook</dt>
+            <dd class="mt-0.5 font-mono text-slate-900 truncate" title="{{ webhook_url }}">
+              {{ webhook_url[:32] ~ '…' if webhook_url|length > 32 else webhook_url }}
+            </dd>
+          </div>
+          <div>
+            <dt class="text-[10px] uppercase tracking-wider text-emerald-700">Teammates with Slack IDs</dt>
+            <dd class="mt-0.5 font-semibold text-slate-900">{{ mapped_slack }} of {{ total_teammates }}</dd>
+          </div>
+          <div>
+            <dt class="text-[10px] uppercase tracking-wider text-emerald-700">Set up</dt>
+            <dd class="mt-0.5 text-slate-900">{{ completed_at or '—' }}</dd>
+          </div>
+        </dl>
+
+        <div class="mt-5 flex items-center gap-3 flex-wrap">
+          <a href="/settings/team"
+             class="rounded-md border border-emerald-600 text-emerald-800 bg-white px-3 py-1.5 text-xs font-medium hover:bg-emerald-50">
+            Manage teammates →
+          </a>
+          <form method="POST" action="/settings/slack/test" class="inline">
+            <button type="submit"
+                    class="rounded-md border border-slate-300 bg-white text-slate-700 px-3 py-1.5 text-xs hover:bg-slate-50">
+              Send another test
+            </button>
+          </form>
+          <form method="POST" action="/settings/slack/reset" class="inline ml-auto">
+            <button type="submit"
+                    onclick="return confirm('Reset Slack config? Your team_members map (Slack IDs + emails) will NOT be touched — only the webhook + channel.');"
+                    class="rounded-md border border-rose-300 bg-white text-rose-700 px-3 py-1.5 text-xs hover:bg-rose-50">
+              Reset
+            </button>
+          </form>
+        </div>
       </div>
     {% endif %}
 
