@@ -195,6 +195,69 @@
     showToast('Drafted email to teammate. Add their email address in the "To" field before sending.', 6000);
   };
 
+  // Assign-via-Slack: POST to /slack/assign. Posts a Block Kit message that
+  // tags the mapped teammate in the configured channel. No new tab; success
+  // and failure both show a toast in the current page so the user stays in
+  // their flow.
+  window.assignViaSlack = function (e, link) {
+    if (e && e.preventDefault) e.preventDefault();
+    if (link.dataset.posting === '1') return; // double-click guard
+    link.dataset.posting = '1';
+
+    var targetId = link.getAttribute('data-target-id') || '';
+    var connectionId = link.getAttribute('data-connection-id') || '';
+    var ownerId = link.getAttribute('data-owner-id') || '';
+    var teammateFirst = link.getAttribute('data-teammate-first') || 'teammate';
+
+    var label = link.querySelector('span.flex-1');
+    var originalLabel = label ? label.innerHTML : '';
+    if (label) label.textContent = 'Posting to Slack…';
+
+    fetch('/slack/assign', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        target_id: targetId,
+        connection_id: connectionId,
+        owner_id: ownerId,
+      }),
+    })
+      .then(function (r) {
+        return r.json().then(function (j) { return { ok: r.ok, body: j }; });
+      })
+      .then(function (res) {
+        link.dataset.posting = '';
+        if (label) label.innerHTML = originalLabel;
+        if (res.ok && res.body && res.body.ok) {
+          var channel = res.body.channel ? '#' + res.body.channel : 'Slack';
+          showToast('Posted to ' + channel + '. ' + teammateFirst + " was @-mentioned.", 5000);
+          var menu = link.closest('ul');
+          if (menu) menu.classList.add('hidden');
+        } else {
+          var raw = (res.body && res.body.error) || '';
+          // Map known Slack-side codes to plain-English guidance.
+          var humanized = raw;
+          if (/no_service/.test(raw)) {
+            humanized = "the webhook was deleted in Slack. Re-set it up at Settings → Slack.";
+          } else if (/channel_not_found/.test(raw)) {
+            humanized = "the configured channel was renamed or deleted. Recreate the webhook against the new channel.";
+          } else if (/no_team/.test(raw)) {
+            humanized = "the Slack app was uninstalled. Reinstall it and re-paste the webhook at Settings → Slack.";
+          } else if (/invalid_payload/.test(raw)) {
+            humanized = "the saved URL isn't actually a Slack webhook. Re-paste it at Settings → Slack.";
+          } else if (/^Slack returned 302/.test(raw)) {
+            humanized = "the webhook URL is fake or has been revoked. Re-paste a real one at Settings → Slack.";
+          }
+          showToast("Slack post didn't go through: " + humanized, 8000);
+        }
+      })
+      .catch(function (err) {
+        link.dataset.posting = '';
+        if (label) label.innerHTML = originalLabel;
+        showToast("Slack post didn't go through (network error): " + (err && err.message ? err.message : 'unknown'), 7000);
+      });
+  };
+
   // Account-drawer left-column target click → swap the right-column connectors
   // panel without losing the targets list. Lives here (not in the drawer
   // template) because <script> tags inserted via innerHTML don't execute.
