@@ -1551,12 +1551,15 @@ def _build_assign_to_teammate_draft(target, connection, teammate):
     body = "\n\n".join(body_parts)
     subject = f"Quick ask: warm intro to {target_full}?"
 
-    # Look up the teammate's email so the Gmail compose URL can pre-fill To:
+    # Look up the teammate's email + Slack ID so the Gmail compose URL can
+    # pre-fill To:, and the Slack row only appears when we know the handle.
     teammate_email = ""
+    teammate_slack_user_id = ""
     if teammate_id:
         member = db_get_team_member(teammate_id)
         if member:
             teammate_email = member.get("email") or ""
+            teammate_slack_user_id = member.get("slack_user_id") or ""
 
     return {
         "teammate_id": teammate_id,
@@ -1567,6 +1570,7 @@ def _build_assign_to_teammate_draft(target, connection, teammate):
         ).strip(),
         "teammate_initials": _initials(teammate.get("firstName"), teammate.get("lastName")),
         "teammate_email": teammate_email,
+        "teammate_slack_user_id": teammate_slack_user_id,
         "subject": subject,
         "body": body,
         "gmail_url": _gmail_compose_url(subject, body, to=teammate_email or None),
@@ -1628,6 +1632,13 @@ def _enrich_connection(target, connection, requested_set=None, my_user_id=None):
         _build_assign_to_teammate_draft(target, connection, o) for o in other_owners
     ]
 
+    # Slack rendering hint for the dropdown: the template only shows a
+    # "💬 Slack #channel" row for a teammate when BOTH are true:
+    #   1. the workspace has Slack configured (webhook URL + completed setup)
+    #   2. that specific teammate has a slack_user_id mapped in team_members
+    slack_on = slack_is_configured()
+    slack_channel = (db_get_slack_config("channel_name") or "").strip() if slack_on else ""
+
     return {
         "id": cid,
         "name": f"{first} {last}".strip() or "(no name)",
@@ -1642,6 +1653,8 @@ def _enrich_connection(target, connection, requested_set=None, my_user_id=None):
         "is_owned_by_me": is_owned_by_me,
         "other_owners": other_owners,
         "assign_drafts": assign_drafts,
+        "slack_configured": slack_on,
+        "slack_channel_name": slack_channel,
         "draft_message": messages["plain"],
         "draft_html": messages["html"],
         "draft_plain_fallback": messages["plain_fallback"],
