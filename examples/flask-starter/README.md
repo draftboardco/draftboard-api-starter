@@ -78,7 +78,7 @@ The first page load takes ~1 minute on a workspace with thousands of targets (th
 - `app.py` — Flask app, all routes, SQLite-backed connection cache, parallel sync worker + scheduler, ownership logic, message templating
 - `linkedin_resolver.py` — Apollo + Google CSE + gpt-4o-mini resolver module powering the `/candidates/resolve` route and the `/settings/linkedin-resolver` wizard
 - `templates/` — Jinja templates. `_nav.html` is the top bar with the sync-progress pill. `_drawer_skeleton.html` is the slide-in drawer container plus its JS (drawer routing, clipboard copy, toast, account-drawer target switching, Slack-assign click handler). `_connector_card.html` is the path detail card shared between every drawer (with the Assign-to-teammate dropdown that grows Slack rows when configured). `_owner_filter.html` is the team-member filter dropdown shared by Targets, Accounts, and New paths. `settings_team.html` maps each teammate to a Slack user ID + email. `settings_slack.html` is the 7-step Slack-setup wizard. `settings_linkedin_resolver.html` is the BYO-keys wizard for Apollo + Google CSE + OpenAI.
-- `requirements.txt` — Flask + requests + openai (the resolver uses gpt-4o-mini; the rest of the app has no LLM calls)
+- `requirements.txt` — Flask + requests + google-auth-oauthlib + google-api-python-client + cryptography (Google Workspace integration) + openai (resolver uses gpt-4o-mini)
 - `env.example` — copy to `.env` and fill in your real key. Slack is configured in-app (no env vars). Resolver keys can also be set in-app via the wizard.
 - `data.db` — SQLite cache, created on first run. Gitignored. Delete it to force a full re-sync.
 
