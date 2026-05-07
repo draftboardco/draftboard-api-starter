@@ -197,6 +197,17 @@ SYNC_INTERVAL_HOURS = float(os.environ.get("SYNC_INTERVAL_HOURS", "12"))  # back
 AUTO_SYNC_ENABLED = os.environ.get("AUTO_SYNC_ENABLED", "true").strip().lower() not in ("false", "0", "no", "off")
 
 app = Flask(__name__)
+# Cap request bodies at 2 MiB. Without this, a malicious or malformed payload
+# to /candidates/resolve/batch (or any other endpoint) can balloon the
+# customer's laptop process. The kit's normal request bodies are tiny
+# (form posts, small JSON), so 2 MiB is generous.
+app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
+
+# Per-field input caps for resolve endpoints. Apollo / CSE / OpenAI all reject
+# huge values, but we cap before the network call so the customer's process
+# can't be DOS'd by a payload full of multi-MB strings.
+RESOLVE_NAME_MAX_LEN = 256
+RESOLVE_EMAIL_MAX_LEN = 320  # RFC 5321 max email length
 
 # In-memory caches for the lightweight endpoints (targets list, tags list, /me).
 _targets_cache = {"data": None, "error": None, "fetched_at": 0}
@@ -714,7 +725,11 @@ def db_app_state_set(key, value):
 def db_get_resolution(email: str, ttl_sec: int = RESOLUTION_CACHE_TTL):
     """Return a cached resolution dict for this email, or None if missing /
     expired. Email is normalized (lowercased) before lookup so 'Bogdan@X.com'
-    and 'bogdan@x.com' share a row."""
+    and 'bogdan@x.com' share a row.
+
+    Returned shape matches the fresh-resolve shape exactly (same keys,
+    `cached: True`) so callers can index either branch without a shape check.
+    """
     if not email:
         return None
     key = email.strip().lower()
@@ -729,12 +744,14 @@ def db_get_resolution(email: str, ttl_sec: int = RESOLUTION_CACHE_TTL):
     if not row:
         return None
     return {
+        "email": key,
         "name": row[0],
         "linkedin_url": row[1],
         "full_name": row[2],
         "confidence": row[3],
         "source": row[4],
         "reasoning": row[5],
+        "query": "",        # not persisted; present so the shape matches fresh
         "resolved_at": row[6],
         "error": row[7],
         "cached": True,
@@ -2407,23 +2424,26 @@ RESOLVE_BATCH_WORKERS = 5
 
 def _resolve_one_for_batch(name: str, email: str, keys: dict, force: bool) -> dict:
     """Single-row resolver used by the batch worker pool. Mirrors the
-    cache-first logic of /candidates/resolve. Tagged with `email` so the
-    caller can correlate results back to their input row even if order
-    shifts."""
+    cache-first logic of /candidates/resolve. Always returns the same shape
+    so the caller can build a uniform response regardless of which branch
+    fired (cache hit, malformed input, fresh resolution)."""
     out_email = email.strip().lower()
+    base_err = {
+        "email": out_email, "name": name,
+        "linkedin_url": None, "full_name": None,
+        "confidence": "none", "source": "none",
+        "query": "", "resolved_at": int(time.time()),
+        "cached": False,
+    }
     if not name.strip() or not email.strip():
-        return {"email": out_email, "error": "name and email are required",
-                "linkedin_url": None, "confidence": "none", "source": "none",
-                "reasoning": "Missing name or email.", "cached": False}
+        return {**base_err, "error": "name and email are required", "reasoning": "Missing name or email."}
     if not _looks_like_email(email):
-        return {"email": out_email, "error": "email is malformed",
-                "linkedin_url": None, "confidence": "none", "source": "none",
-                "reasoning": "Email looks malformed.", "cached": False}
+        return {**base_err, "error": "email is malformed", "reasoning": "Email looks malformed."}
 
     if not force:
         cached = db_get_resolution(email)
         if cached is not None:
-            return {**cached, "email": out_email}
+            return cached  # already shape-matched
 
     result = resolve_linkedin(
         name, email,
@@ -2434,7 +2454,13 @@ def _resolve_one_for_batch(name: str, email: str, keys: dict, force: bool) -> di
     )
     db_put_resolution(email, name, result)
     result.pop("_transient", None)
-    return {**result, "email": out_email, "cached": False}
+    return {
+        "email": out_email,
+        "name": name,
+        "resolved_at": int(time.time()),
+        **result,
+        "cached": False,
+    }
 
 
 @app.route("/candidates/resolve/batch", methods=["POST"])
@@ -2479,13 +2505,17 @@ def candidates_resolve_batch():
     # file per row.
     keys = _load_resolver_keys()
 
-    # Each row keeps its input index so we can re-order at the end.
+    # Each row keeps its input index so we can re-order at the end. Per-field
+    # length caps prevent a single fat row from ballooning the worker process
+    # before it ever hits Apollo/CSE/OpenAI.
     indexed = []
     for i, c in enumerate(contacts):
         if not isinstance(c, dict):
             indexed.append((i, "", ""))
             continue
-        indexed.append((i, str(c.get("name") or ""), str(c.get("email") or "")))
+        nm = str(c.get("name") or "")[:RESOLVE_NAME_MAX_LEN]
+        em = str(c.get("email") or "")[:RESOLVE_EMAIL_MAX_LEN]
+        indexed.append((i, nm, em))
 
     results: list[dict | None] = [None] * len(indexed)
     with ThreadPoolExecutor(max_workers=RESOLVE_BATCH_WORKERS) as pool:
@@ -2530,8 +2560,8 @@ def candidates_resolve():
     if not request.is_json:
         return jsonify({"error": "JSON body required (Content-Type: application/json)"}), 400
     body = request.get_json(silent=True) or {}
-    name = (body.get("name") or "").strip()
-    email = (body.get("email") or "").strip()
+    name = (body.get("name") or "").strip()[:RESOLVE_NAME_MAX_LEN]
+    email = (body.get("email") or "").strip()[:RESOLVE_EMAIL_MAX_LEN]
     force = bool(body.get("force"))
 
     if not name or not email:
@@ -2557,7 +2587,15 @@ def candidates_resolve():
     # detail doesn't leak into the public JSON.
     db_put_resolution(email, name, result)
     result.pop("_transient", None)
-    return jsonify({**result, "cached": False})
+    # Match the cached-response shape exactly so callers can index either
+    # branch without a shape check.
+    return jsonify({
+        "email": email.strip().lower(),
+        "name": name,
+        "resolved_at": int(time.time()),
+        **result,
+        "cached": False,
+    })
 
 
 # Kick off the scheduled-sync daemon on module import (fires every

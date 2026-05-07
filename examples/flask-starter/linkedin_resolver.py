@@ -198,9 +198,16 @@ def _try_apollo(name: str, email: str, apollo_key: str) -> tuple[dict | None, st
         return None, "apollo rate-limited"
     if r.status_code >= 500:
         return None, f"apollo {r.status_code}"
-    if r.status_code != 200:
-        # Other 4xx — likely a definitive "didn't find them"
+    if r.status_code == 404:
+        # Apollo's documented "we don't have this person" response — safe to
+        # cache as a definitive miss.
         return None, None
+    if r.status_code != 200:
+        # 400/422/etc — could be malformed input on our side, schema drift on
+        # Apollo's side, or a transient validation hiccup. Don't cache it as
+        # a definitive miss — let the next call retry.
+        _log(f"apollo HTTP {r.status_code}")
+        return None, f"apollo {r.status_code}"
     try:
         data = r.json() or {}
     except ValueError:
