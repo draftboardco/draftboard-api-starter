@@ -43,10 +43,12 @@
           <li><code class="font-mono text-xs bg-slate-100 px-1 rounded">cd examples/flask-starter</code></li>
           <li><code class="font-mono text-xs bg-slate-100 px-1 rounded">python3 scanner/build_dist.py</code> (reads your OAuth client from <code class="font-mono text-xs">~/.draftboard-secrets/google.env</code>)</li>
           <li>DM them <code class="font-mono text-xs bg-slate-100 px-1 rounded">scanner/dist/supporter_scan.py</code></li>
-          <li>They run <code class="font-mono text-xs bg-slate-100 px-1 rounded">python3 supporter_scan.py</code>, OAuth, send back the JSON it creates</li>
+          <li>They run <code class="font-mono text-xs bg-slate-100 px-1 rounded">python3 supporter_scan.py</code>, OAuth, get an <strong>HTML review page</strong> alongside the script</li>
+          <li>They open the HTML in their browser, untick anyone they don't want shared, click <strong>Save Filtered JSON</strong> — a JSON file downloads</li>
+          <li>They send THAT filtered JSON back to you (not the HTML)</li>
         </ol>
         <p>
-          Full instructions for them: <a href="https://github.com/" class="underline" target="_blank" rel="noopener">scanner/README.md</a> in the kit (open it in your repo and paste relevant parts in the DM).
+          Full instructions for them: <code class="font-mono text-xs bg-slate-100 px-1 rounded">scanner/README.md</code> — copy the "What teammates do" section into your DM.
         </p>
         <p class="text-xs text-slate-500">
           <strong>Important:</strong> their email needs to be on your project's

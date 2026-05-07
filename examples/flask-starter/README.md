@@ -171,13 +171,14 @@ A Draftboard team is multiple people. Each person's Gmail + Calendar history is 
 
 1. **Build the distributable**: `python3 scanner/build_dist.py` (reads the secrets file, writes `scanner/dist/supporter_scan.py` with the credentials baked in). The `dist/` directory is gitignored — never commit it.
 2. **DM the file to your teammate** — Slack attachment, email, private gist. Don't post publicly: anyone with the file can use your OAuth client to consent on their own Google.
-3. **They run** `python3 supporter_scan.py` on their laptop. The script auto-installs missing packages, opens a browser for Google sign-in, scans 12 months of metadata, drops a `supporter_scan_<email>_<date>.json` next to itself, prints a top-10 preview.
-4. **They send the JSON back** to you (Slack DM, email).
-5. **You import** at `/supporters/import-teammate` — drag-drop the file, click Import. Their contacts merge into your Candidates page, badged with their name in the **From** column.
+3. **They run** `python3 supporter_scan.py` on their laptop. The script auto-installs missing packages, opens a browser for Google sign-in, scans 12 months of metadata, then writes a `supporter_scan_<email>_<date>.html` file next to itself.
+4. **They open that HTML in their browser**, see every contact the scan found in a sortable table with checkboxes, untick anyone they don't want shared, click **Save Filtered JSON** — a `_filtered.json` downloads.
+5. **They send the filtered JSON back** to you (Slack DM, email). Nothing leaves their laptop until they explicitly send the file.
+6. **You import** at `/supporters/import-teammate` — drag-drop the file, click Import. Their contacts merge into your Candidates page, badged with their name in the **From** column.
 
 Re-imports from the same teammate replace their prior data (idempotent). The "Imported scans" section on the import page lists all your contributors with a Remove button per teammate. The contributor filter on the Candidates page lets you slice the list to just one person's network.
 
-The scanner reads metadata only — From/To/Cc/Date headers, attendee lists. Never message bodies. The JSON contains contact emails, names, and aggregate counts. Privacy stays equivalent to what the kit already does: Draftboard's infrastructure never touches any of it; the JSON only travels between you and your teammate via whatever channel you DM through.
+The scanner reads metadata only — From/To/Cc/Date headers, attendee lists. Never message bodies. The HTML and the resulting JSON both contain contact emails, names, and aggregate counts; nothing else. Privacy stays equivalent to what the kit already does: Draftboard's infrastructure never touches any of it. The HTML stays on the teammate's laptop unless they choose to send it; the filtered JSON only travels between them and you via whatever channel you DM through.
 
 Full teammate-facing instructions are in [`scanner/README.md`](scanner/README.md).
 

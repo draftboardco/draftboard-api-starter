@@ -15,20 +15,29 @@ The flow is asymmetric: **you** (the kit author) build the script once with your
     scanner/dist/supporter_scan.py  ──DM──►  supporter_scan.py
                                                 │ python3
                                                 ▼
-                                             Google OAuth
-                                                │ (in browser)
+                                             Google OAuth (browser)
+                                                │
                                                 ▼
-                                             supporter_scan_*.json
+                                             supporter_scan_*.html
+                                                │ (open in browser, review)
+                                                │ click "Save Filtered JSON"
+                                                ▼
+                                             supporter_scan_*_filtered.json
                                                 │
                                        ◄──email/Slack─┘
        │
        ▼
-    /supporters/import-teammate
+    /supporters/import-teammate (upload)
        │
        ▼
     Their contacts pooled into the
     candidates page, tagged "from <teammate>"
 ```
+
+The HTML review step is intentional — your teammate sees every contact the
+scanner found and decides individually who to share with you. The script
+**only outputs HTML**; the actual JSON gets generated client-side when
+they click Save.
 
 ## One-time setup (kit author)
 
@@ -50,17 +59,19 @@ DM `scanner/dist/supporter_scan.py` directly: Slack attachment, email, private G
 Send them this short paste (or a link to this README's "What teammates do" section):
 
 > Hey, here's a Python script that scans your Gmail/Calendar (last 12 months,
-> metadata only — no message contents) and outputs a JSON of your top
-> contacts. Save it somewhere on your laptop and run:
+> metadata only — no message contents) so I can pool your network into our
+> shared Supporters list. Save it somewhere on your laptop and run:
 >
 > ```
 > python3 supporter_scan.py
 > ```
 >
 > A browser tab will open for Google sign-in. Grant access. After ~5 minutes
-> it'll print a summary and drop a file like `supporter_scan_you_2026-05-07.json`
-> next to the script. Send that file back to me — I'll import it into our
-> Draftboard kit and your network will show up in our shared Supporters list.
+> the script will write an HTML review file next to itself. **Open that HTML
+> in your browser, untick anyone you don't want shared with me, then click
+> "Save Filtered JSON".** A `..._filtered.json` file will download — send
+> THAT file back to me. Nothing leaves your laptop until you click Save and
+> attach the file yourself.
 
 ## What teammates do
 
@@ -70,8 +81,11 @@ Send them this short paste (or a link to this README's "What teammates do" secti
 4. **First-time only**: the script asks permission to install two Python packages (`google-auth-oauthlib`, `google-api-python-client`). Say yes.
 5. **A browser tab opens** for Google sign-in. They'll see "Google hasn't verified this app" — that's expected. Click **Advanced → Go to Draftboard (unsafe)**. (Their email needs to be on the kit author's test-users allowlist — see "Heads up" below.)
 6. **Grant the read-only permissions.**
-7. The script runs ~3-5 minutes, prints a top-10 preview, and writes `supporter_scan_<email>_<date>.json` next to itself.
-8. **Send that JSON file back** to whoever asked them to run it.
+7. The script runs ~3-5 minutes, prints a top-10 preview to the terminal, and writes a file called `supporter_scan_<email>_<date>.html` next to itself.
+8. **Open that HTML file in any browser** (double-click in Finder/Explorer, or drag onto a browser tab). It shows every contact the scan found, scored and sortable.
+9. **Untick anyone they don't want shared.** They can search by name/email, untick all visible at once, etc. The default is everyone ticked.
+10. **Click the blue "Save Filtered JSON →" button** at the top right. A `supporter_scan_<email>_<date>_filtered.json` file downloads.
+11. **Send that JSON file** (the one with `_filtered` in the name) back to whoever asked them to run the script.
 
 ### Heads up
 

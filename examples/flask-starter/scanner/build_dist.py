@@ -112,7 +112,9 @@ def main():
     print()
     print("Next: DM this file directly to a teammate (Slack attachment, email,")
     print("private gist). They run it on their laptop with `python3 supporter_scan.py`,")
-    print("OAuth in their browser, get a JSON file, and send it back to you.")
+    print("OAuth in their browser, then open the resulting HTML review file,")
+    print("untick anyone they don't want shared, and send the filtered JSON")
+    print("back to you. Full instructions in scanner/README.md.")
     print()
     print("Do NOT commit dist/ to git — it's already gitignored.")
 
