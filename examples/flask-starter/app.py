@@ -209,6 +209,43 @@ app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
 RESOLVE_NAME_MAX_LEN = 256
 RESOLVE_EMAIL_MAX_LEN = 320  # RFC 5321 max email length
 
+
+def _load_or_create_local_secret(filename, length=32):
+    """Read or generate a per-install secret stored in ~/.draftboard-secrets/.
+
+    Used for the Flask session cookie (which carries the Google OAuth `state`
+    nonce across the consent redirect). All local — never leaves the machine.
+    Files are 600-permissioned on creation.
+    """
+    secrets_dir = os.path.expanduser("~/.draftboard-secrets")
+    path = os.path.join(secrets_dir, filename)
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as f:
+                data = f.read().strip()
+            if data:
+                return data
+        except OSError:
+            pass
+    try:
+        os.makedirs(secrets_dir, exist_ok=True)
+        data = os.urandom(length)
+        with open(path, "wb") as f:
+            f.write(data)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return data
+    except OSError:
+        # If we can't write to ~/.draftboard-secrets, fall back to in-memory.
+        # The Flask session will reset on every restart and Google OAuth tokens
+        # won't persist across restarts — but the app still works mid-session.
+        return os.urandom(length)
+
+
+app.secret_key = _load_or_create_local_secret("flask_session_secret")
+
 # In-memory caches for the lightweight endpoints (targets list, tags list, /me).
 _targets_cache = {"data": None, "error": None, "fetched_at": 0}
 _tags_cache = {"data": None, "error": None, "fetched_at": 0}
@@ -216,7 +253,10 @@ _me_cache = {"data": None, "error": None, "fetched_at": 0}
 ME_CACHE_TTL = 600
 
 # SQLite-backed persistent caches: per-target connections + intro_requests state.
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.db")
+# DB_PATH override exists so tests can point at a throwaway file (e.g.
+# /tmp/test.db) without ever touching the production data.db. Default is
+# data.db next to this file. NEVER hardcode a test path here.
+DB_PATH = os.environ.get("DRAFTBOARD_DB_PATH") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.db")
 _db_lock = threading.Lock()
 
 # Background sync worker state.
@@ -381,6 +421,85 @@ def init_db():
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_connector_paths_key ON connector_paths(connector_key)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_connector_paths_score ON connector_paths(score DESC)")
+
+        # --- Google Workspace integration tables ---
+        # One-time scoring use case — the user clicks Connect Google, we run a
+        # single sync, populate the candidate tables, throw the access token
+        # away. No refresh tokens stored (avoids the 7-day testing-mode token
+        # expiry and the encryption ceremony around it). Re-syncing is just
+        # a fresh OAuth consent flow.
+        #
+        # Sync timing + last-account info live in the existing `app_state` K/V
+        # table under keys `google_account_email` and `google_last_synced_at`.
+
+        # Aggregated per-contact stats from the last 12 months of Gmail.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS gmail_contacts (
+                email TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                emails_sent INTEGER NOT NULL DEFAULT 0,
+                replies_received INTEGER NOT NULL DEFAULT 0,
+                threads_count INTEGER NOT NULL DEFAULT 0,
+                last_contact_at INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_gmail_contacts_threads ON gmail_contacts(threads_count DESC)")
+
+        # Aggregated per-contact stats from the last 12 months of Calendar.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS calendar_contacts (
+                email TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                meetings_count INTEGER NOT NULL DEFAULT 0,
+                last_met_at INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_calendar_contacts_meetings ON calendar_contacts(meetings_count DESC)")
+
+        # Imported teammate scans — populated by /supporters/import-teammate.
+        # Each row carries the contributor (whose Gmail/Calendar this came from)
+        # so the candidates page can badge "From <teammate>". Composite primary
+        # key on (contributor_email, email) means re-importing from the same
+        # teammate UPDATEs in place; importing from a different teammate adds
+        # a parallel row even for the same contact (you might both know Alice).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS teammate_contacts (
+                contributor_email TEXT NOT NULL,
+                contributor_name TEXT NOT NULL DEFAULT '',
+                email TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                emails_sent INTEGER NOT NULL DEFAULT 0,
+                replies_received INTEGER NOT NULL DEFAULT 0,
+                threads_count INTEGER NOT NULL DEFAULT 0,
+                meetings_count INTEGER NOT NULL DEFAULT 0,
+                last_contact_at INTEGER NOT NULL DEFAULT 0,
+                imported_at INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (contributor_email, email)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_teammate_contacts_contributor ON teammate_contacts(contributor_email)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_teammate_contacts_email ON teammate_contacts(email)")
+
+        # Per-candidate triage state (set by the user from the candidates page).
+        # `status` is one of: 'starred', 'hidden', 'supporter', or absent.
+        # Default view filters out 'hidden'. 'supporter' = "I've already added
+        # this person as a Draftboard Supporter manually" (informational badge).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS candidate_status (
+                email TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_candidate_status_status ON candidate_status(status)")
+
+        # Migration: drop the older `oauth_tokens` + `google_sync_state` tables
+        # from the BYO architecture. Their data was always per-install and
+        # ephemeral, so dropping is safe.
+        conn.execute("DROP TABLE IF EXISTS oauth_tokens")
+        conn.execute("DROP TABLE IF EXISTS google_sync_state")
 
         # LinkedIn resolution cache. One row per email — when /candidates/resolve
         # finds a person's LinkedIn URL via Apollo or Google CSE, we cache the
@@ -2539,7 +2658,1147 @@ def sync_start():
     return jsonify({"started": started, "force": force, "state": sync_progress_snapshot()})
 
 
-# ---------- Team Settings page ----------
+# =====================================================================
+# Google Workspace integration (centralized OAuth, one-time sync)
+# =====================================================================
+#
+# Customer clicks "Connect Google" → Google consent → we exchange the auth
+# code for an access token, run ONE sync (~5 min), persist aggregated
+# per-contact stats to SQLite, throw the token away. No refresh tokens, no
+# encryption, no daemons, no 7-day expiry to manage.
+#
+# Re-syncing is just clicking Connect again. Each click is a fresh OAuth
+# flow + a fresh sync.
+#
+# Credentials: a SINGLE Draftboard-owned OAuth client (registered in the
+# "Draftboard Supporters" Google Cloud project, in Testing mode). Customers
+# whose email is on the project's test-users allowlist (managed by you in
+# the GCP console) can connect; everyone else gets Google's standard
+# "access blocked" message.
+#
+# Privacy: all Gmail + Calendar data stays on the customer's laptop in
+# `data.db`. Nothing is sent to Draftboard's infrastructure. The only thing
+# Draftboard sees during the OAuth flow is Google's confirmation that a
+# user with email X granted access to client Y — standard OAuth telemetry.
+
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/calendar.readonly",
+    "openid",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile",
+]
+
+GOOGLE_REDIRECT_URI = os.environ.get(
+    "GOOGLE_OAUTH_REDIRECT", "http://localhost:5050/auth/google/callback"
+).strip()
+GOOGLE_HISTORY_DAYS = int(os.environ.get("GOOGLE_HISTORY_DAYS", "365"))
+GOOGLE_THREADS_CAP = int(os.environ.get("GOOGLE_THREADS_CAP", "2000"))
+GOOGLE_EVENTS_CAP = int(os.environ.get("GOOGLE_EVENTS_CAP", "2500"))
+
+# Lazy imports — google-auth-oauthlib and google-api-python-client are in
+# requirements.txt; if the venv hasn't installed them yet we surface a clean
+# error instead of crashing on boot.
+_google_libs_error = None
+try:
+    from google_auth_oauthlib.flow import Flow as _GoogleFlow  # noqa: F401
+    from googleapiclient.discovery import build as _google_build  # noqa: F401
+    from googleapiclient.errors import HttpError as _GoogleHttpError  # noqa: F401
+except ImportError as _e:
+    _google_libs_error = (
+        f"Google integration libraries not installed ({_e}). Run "
+        "`pip install -r requirements.txt` to enable Gmail + Calendar sync."
+    )
+
+# Google's library refuses to issue a token over plain HTTP unless this is
+# set. We only override it when the redirect URI is loopback — anyone forking
+# this kit and deploying behind a real domain MUST not silently accept HTTP
+# OAuth callbacks.
+def _is_loopback_redirect(uri):
+    return uri.startswith("http://localhost") or uri.startswith("http://127.0.0.1") or uri.startswith("http://[::1]")
+
+
+if _is_loopback_redirect(GOOGLE_REDIRECT_URI):
+    os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
+else:
+    # Make sure a previous loopback run can't leak this setting into a deploy.
+    os.environ.pop("OAUTHLIB_INSECURE_TRANSPORT", None)
+
+
+def _google_libs_ready():
+    return _google_libs_error is None
+
+
+def _load_google_oauth_client():
+    """Load the centralized Google OAuth client_id + client_secret.
+
+    Priority order:
+      1. GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET env vars
+      2. .env file in this app's directory
+      3. ~/.draftboard-secrets/google.env (DRAFTBOARD_STARTER_GOOGLE_CLIENT_ID +
+         _SECRET, or plain GOOGLE_CLIENT_ID/_SECRET as a fallback)
+
+    Returns (client_id, client_secret, source_label).
+    """
+    cid = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
+    cs = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
+    if cid and cs:
+        return cid, cs, "GOOGLE_CLIENT_ID/SECRET env vars"
+
+    def _parse_env_file(path, accept_export=False):
+        out = {}
+        try:
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if accept_export and line.startswith("export "):
+                        line = line[len("export "):].strip()
+                    if "=" in line:
+                        k, _, v = line.partition("=")
+                        out[k.strip()] = v.strip().strip('"').strip("'")
+        except OSError:
+            pass
+        return out
+
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    env_path = os.path.join(app_dir, ".env")
+    if os.path.exists(env_path):
+        vals = _parse_env_file(env_path)
+        cid = vals.get("GOOGLE_CLIENT_ID", "").strip()
+        cs = vals.get("GOOGLE_CLIENT_SECRET", "").strip()
+        if cid and cs:
+            return cid, cs, env_path
+
+    secrets_path = os.path.expanduser("~/.draftboard-secrets/google.env")
+    if os.path.exists(secrets_path):
+        vals = _parse_env_file(secrets_path, accept_export=True)
+        cid = (vals.get("DRAFTBOARD_STARTER_GOOGLE_CLIENT_ID")
+               or vals.get("GOOGLE_CLIENT_ID") or "").strip()
+        cs = (vals.get("DRAFTBOARD_STARTER_GOOGLE_CLIENT_SECRET")
+              or vals.get("GOOGLE_CLIENT_SECRET") or "").strip()
+        if cid and cs:
+            return cid, cs, secrets_path
+
+    return "", "", None
+
+
+GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, _google_creds_source = _load_google_oauth_client()
+if GOOGLE_CLIENT_ID:
+    print(f"[draftboard-starter] Loaded Google OAuth client from: {_google_creds_source}")
+else:
+    print("[draftboard-starter] No Google OAuth client configured. The Candidates feature will show a 'not connected' state until one is set.")
+
+
+def _google_flow():
+    if not _google_libs_ready():
+        raise RuntimeError(_google_libs_error)
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET):
+        raise RuntimeError("Google OAuth client not configured.")
+    client_config = {
+        "web": {
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [GOOGLE_REDIRECT_URI],
+        }
+    }
+    flow = _GoogleFlow.from_client_config(client_config, scopes=GOOGLE_SCOPES)
+    flow.redirect_uri = GOOGLE_REDIRECT_URI
+    return flow
+
+
+def google_status():
+    """Snapshot of integration state for the templates."""
+    return {
+        "libs_ready": _google_libs_ready(),
+        "libs_error": _google_libs_error,
+        "client_configured": bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET),
+        "client_source": _google_creds_source or "",
+        "account_email": db_app_state_get("google_account_email", "") or "",
+        "last_synced_at": int(db_app_state_get("google_last_synced_at", "0") or 0),
+        "last_error": db_app_state_get("google_last_error", "") or "",
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+    }
+
+
+# --- Header parsing helpers ----------------------------------------------
+
+# Use stdlib email.utils — it correctly handles quoted display names with
+# embedded commas (`"Last, First" <a@b.com>`), folded headers, and group
+# syntax. The regex+split approach we tried first fractured those.
+from email.utils import getaddresses as _getaddresses
+
+
+def _parse_addresses(header_value):
+    """Parse a From/To/Cc header into (name, email) tuples. Lowercases email."""
+    if not header_value:
+        return []
+    out = []
+    for name, email in _getaddresses([header_value]):
+        email = (email or "").strip().lower()
+        if not email or "@" not in email:
+            continue
+        out.append(((name or "").strip(), email))
+    return out
+
+
+_NOREPLY_PREFIXES = (
+    "noreply", "no-reply", "donotreply", "do-not-reply", "notifications",
+    "notification", "alert", "alerts", "support", "help", "info", "hello",
+    "team", "billing", "receipts", "invoice", "invoices", "hr", "press",
+    "marketing", "newsletter", "news", "updates", "system", "automated",
+    "calendar-notification", "auto-confirm",
+)
+
+
+def _is_noise_email(email):
+    if not email or "@" not in email:
+        return True
+    local, _, domain = email.partition("@")
+    local = local.lower()
+    domain = domain.lower()
+    if domain in ("googlegroups.com", "calendar.google.com", "resource.calendar.google.com"):
+        return True
+    if local.startswith(_NOREPLY_PREFIXES):
+        return True
+    if "+" in local and any(local.startswith(p) for p in ("bounce", "bounces")):
+        return True
+    return False
+
+
+# --- Gmail fetcher --------------------------------------------------------
+
+def fetch_gmail_threads(creds, my_email, days=GOOGLE_HISTORY_DAYS, cap=GOOGLE_THREADS_CAP, progress_cb=None):
+    """Pull up to `cap` threads from the last `days` days, return per-contact stats."""
+    service = _google_build("gmail", "v1", credentials=creds, cache_discovery=False)
+    me = (my_email or "").lower()
+
+    thread_ids = []
+    page_token = None
+    q = f"newer_than:{days}d"
+    while len(thread_ids) < cap:
+        page_size = min(500, cap - len(thread_ids))
+        resp = service.users().threads().list(
+            userId="me", q=q, maxResults=page_size, pageToken=page_token
+        ).execute()
+        for t in resp.get("threads", []) or []:
+            thread_ids.append(t["id"])
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+
+    contacts = {}
+    total = len(thread_ids)
+    if progress_cb:
+        progress_cb(0, total)
+
+    for i, tid in enumerate(thread_ids):
+        try:
+            thread = service.users().threads().get(
+                userId="me", id=tid, format="metadata",
+                metadataHeaders=["From", "To", "Cc", "Date"],
+            ).execute()
+        except _GoogleHttpError:
+            if (i + 1) % 50 == 0 and progress_cb:
+                progress_cb(i + 1, total)
+            continue
+
+        thread_contacts = {}
+        most_recent_ts = 0
+        for msg in thread.get("messages", []) or []:
+            headers = {h.get("name", "").lower(): h.get("value", "") for h in
+                       (msg.get("payload", {}).get("headers", []) or [])}
+            from_addrs = _parse_addresses(headers.get("from", ""))
+            to_addrs = _parse_addresses(headers.get("to", ""))
+            cc_addrs = _parse_addresses(headers.get("cc", ""))
+            try:
+                msg_ts = int(msg.get("internalDate", "0")) // 1000
+            except (TypeError, ValueError):
+                msg_ts = 0
+            if msg_ts > most_recent_ts:
+                most_recent_ts = msg_ts
+
+            sender_email = from_addrs[0][1] if from_addrs else ""
+            sent_by_me = sender_email == me
+
+            participants = []
+            for nm, em in from_addrs + to_addrs + cc_addrs:
+                if em == me or _is_noise_email(em):
+                    continue
+                participants.append((nm, em))
+
+            for nm, em in participants:
+                rec = thread_contacts.setdefault(em, {"name": "", "sent_by_me": 0, "replies": 0})
+                if nm and not rec["name"]:
+                    rec["name"] = nm
+                if sent_by_me:
+                    rec["sent_by_me"] += 1
+                elif em == sender_email:
+                    rec["replies"] += 1
+
+        for em, rec in thread_contacts.items():
+            agg = contacts.setdefault(em, {
+                "name": "", "emails_sent": 0, "replies_received": 0,
+                "threads_count": 0, "last_contact_at": 0,
+            })
+            if rec["name"] and not agg["name"]:
+                agg["name"] = rec["name"]
+            agg["emails_sent"] += rec["sent_by_me"]
+            agg["replies_received"] += rec["replies"]
+            agg["threads_count"] += 1
+            if most_recent_ts > agg["last_contact_at"]:
+                agg["last_contact_at"] = most_recent_ts
+
+        if progress_cb and (i + 1) % 25 == 0:
+            progress_cb(i + 1, total)
+
+    if progress_cb:
+        progress_cb(total, total)
+    return contacts
+
+
+# --- Calendar fetcher ----------------------------------------------------
+
+def fetch_calendar_events(creds, my_email, days=GOOGLE_HISTORY_DAYS, cap=GOOGLE_EVENTS_CAP, progress_cb=None):
+    """Pull up to `cap` events from the last `days` days, aggregate per-attendee."""
+    service = _google_build("calendar", "v3", credentials=creds, cache_discovery=False)
+    me = (my_email or "").lower()
+
+    from datetime import datetime, timedelta, timezone
+    time_min = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    time_max = datetime.now(timezone.utc).isoformat()
+
+    contacts = {}
+    page_token = None
+    processed = 0
+    while True:
+        page_size = min(2500, cap - processed)
+        if page_size <= 0:
+            break
+        resp = service.events().list(
+            calendarId="primary",
+            timeMin=time_min,
+            timeMax=time_max,
+            singleEvents=True,
+            orderBy="startTime",
+            maxResults=page_size,
+            pageToken=page_token,
+        ).execute()
+        events = resp.get("items", []) or []
+        for ev in events:
+            attendees = ev.get("attendees", []) or []
+            if not attendees:
+                processed += 1
+                continue
+            my_resp = next(
+                (a.get("responseStatus") for a in attendees if (a.get("email") or "").lower() == me),
+                None,
+            )
+            if my_resp == "declined":
+                processed += 1
+                continue
+            ts_str = (ev.get("start") or {}).get("dateTime") or (ev.get("start") or {}).get("date") or ""
+            ts = 0
+            if ts_str:
+                try:
+                    if "T" in ts_str:
+                        ts = int(datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp())
+                    else:
+                        ts = int(datetime.fromisoformat(ts_str).replace(tzinfo=timezone.utc).timestamp())
+                except (TypeError, ValueError):
+                    ts = 0
+            for a in attendees:
+                email = (a.get("email") or "").lower()
+                if not email or email == me or _is_noise_email(email):
+                    continue
+                if a.get("responseStatus") == "declined":
+                    continue
+                rec = contacts.setdefault(email, {"name": "", "meetings_count": 0, "last_met_at": 0})
+                nm = a.get("displayName") or ""
+                if nm and not rec["name"]:
+                    rec["name"] = nm
+                rec["meetings_count"] += 1
+                if ts > rec["last_met_at"]:
+                    rec["last_met_at"] = ts
+            processed += 1
+        if progress_cb and processed % 100 == 0:
+            progress_cb(processed, processed)
+        page_token = resp.get("nextPageToken")
+        if not page_token or processed >= cap:
+            break
+    if progress_cb:
+        progress_cb(processed, processed)
+    return contacts
+
+
+# --- Persistence ---------------------------------------------------------
+
+def db_replace_gmail_contacts(contacts):
+    now = int(time.time())
+    with _db_lock, _db_connect() as conn:
+        conn.execute("DELETE FROM gmail_contacts")
+        for email, c in contacts.items():
+            conn.execute(
+                "INSERT INTO gmail_contacts (email, name, emails_sent, replies_received, "
+                "threads_count, last_contact_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (email, c.get("name", ""), c.get("emails_sent", 0),
+                 c.get("replies_received", 0), c.get("threads_count", 0),
+                 c.get("last_contact_at", 0), now),
+            )
+        conn.commit()
+
+
+def db_replace_calendar_contacts(contacts):
+    now = int(time.time())
+    with _db_lock, _db_connect() as conn:
+        conn.execute("DELETE FROM calendar_contacts")
+        for email, c in contacts.items():
+            conn.execute(
+                "INSERT INTO calendar_contacts (email, name, meetings_count, last_met_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (email, c.get("name", ""), c.get("meetings_count", 0),
+                 c.get("last_met_at", 0), now),
+            )
+        conn.commit()
+
+
+def db_clear_google_data():
+    """Wipe synced Gmail + Calendar data + the recorded sync metadata + the
+    in-memory sync-state pill (so it doesn't keep showing 'stage=done' from
+    the prior sync)."""
+    with _db_lock, _db_connect() as conn:
+        conn.execute("DELETE FROM gmail_contacts")
+        conn.execute("DELETE FROM calendar_contacts")
+        conn.execute("DELETE FROM app_state WHERE key IN ('google_account_email', 'google_last_synced_at', 'google_last_error')")
+        conn.commit()
+    with _google_sync_lock:
+        _google_sync_state.update({
+            "running": False, "stage": "", "processed": 0, "total": 0,
+            "started_at": 0, "ended_at": 0, "last_error": "", "account_email": "",
+        })
+
+
+# --- Scoring + candidate query ------------------------------------------
+
+def score_contact(emails_sent, replies_received, threads_count, meetings_count, last_contact_days_ago):
+    """Per-contact relationship-strength score. See README."""
+    base = (emails_sent or 0) + 2 * (replies_received or 0) + 3 * (threads_count or 0) + 5 * (meetings_count or 0)
+    if last_contact_days_ago is None:
+        return 0
+    recency = max(0.1, 1.0 - (last_contact_days_ago / 365.0))
+    return int(base * recency)
+
+
+def db_query_candidates(limit=200, offset=0, query="", contributor="", source="", status_filter="active"):
+    """Merge gmail + calendar contacts (the local user's own scan) AND any
+    imported teammate scans, score each, return top N.
+
+    Each candidate row carries `contributor_email` + `contributor_name`. The
+    local user's own contacts use the special contributor_email value
+    `__self__` (the candidates page renders that as "you").
+
+    BIDIRECTIONAL FILTER: an email-only contact must have at least one
+    outbound email from the contributor AND at least one reply from them.
+    This cuts cold-outreach prospects (sent → no reply) and inbound
+    newsletters (received → never replied). Calendar-only contacts are kept
+    unconditionally since attending a shared meeting IS bidirectional.
+
+    Filters:
+    - `contributor`: when non-empty, restricts to one contributor. "__self__"
+      = local user only; teammate email = just that teammate.
+    - `source`: "" all, "email" only contacts with bidirectional email,
+      "calendar" only contacts with shared meetings.
+    - `status_filter`: "active" (default — hides 'hidden'), "all", "starred",
+      "supporter", "hidden", "unmarked".
+    """
+    now = int(time.time())
+    me_email = (db_app_state_get("google_account_email", "") or "").strip().lower()
+    me_name = ""  # We only persist email; the candidates page can show "you" instead.
+
+    # Local user's own gmail+calendar (with bidirectional filter).
+    sql_self_left = """
+        SELECT
+          '__self__' AS contributor_email,
+          '' AS contributor_name,
+          g.email AS email,
+          COALESCE(NULLIF(g.name, ''), NULLIF(c.name, ''), '') AS name,
+          g.emails_sent AS emails_sent,
+          g.replies_received AS replies_received,
+          g.threads_count AS threads_count,
+          COALESCE(c.meetings_count, 0) AS meetings_count,
+          g.last_contact_at AS last_emailed_at,
+          COALESCE(c.last_met_at, 0) AS last_met_at
+        FROM gmail_contacts g
+        LEFT JOIN calendar_contacts c ON g.email = c.email
+        WHERE
+          (g.emails_sent >= 1 AND g.replies_received >= 1)
+          OR COALESCE(c.meetings_count, 0) >= 1
+    """
+    sql_self_right = """
+        SELECT
+          '__self__' AS contributor_email,
+          '' AS contributor_name,
+          c.email AS email,
+          COALESCE(NULLIF(c.name, ''), '') AS name,
+          0 AS emails_sent,
+          0 AS replies_received,
+          0 AS threads_count,
+          c.meetings_count AS meetings_count,
+          0 AS last_emailed_at,
+          c.last_met_at AS last_met_at
+        FROM calendar_contacts c
+        WHERE c.email NOT IN (SELECT email FROM gmail_contacts)
+          AND c.meetings_count >= 1
+    """
+    # Imported teammate scans (same bidirectional filter applied per-contributor).
+    sql_teammate = """
+        SELECT
+          tc.contributor_email AS contributor_email,
+          tc.contributor_name AS contributor_name,
+          tc.email AS email,
+          tc.name AS name,
+          tc.emails_sent AS emails_sent,
+          tc.replies_received AS replies_received,
+          tc.threads_count AS threads_count,
+          tc.meetings_count AS meetings_count,
+          tc.last_contact_at AS last_emailed_at,
+          tc.last_contact_at AS last_met_at
+        FROM teammate_contacts tc
+        WHERE
+          (tc.emails_sent >= 1 AND tc.replies_received >= 1)
+          OR tc.meetings_count >= 1
+    """
+    full_sql = f"SELECT * FROM ({sql_self_left} UNION ALL {sql_self_right} UNION ALL {sql_teammate})"
+    args = []
+    where_clauses = []
+    if query:
+        where_clauses.append("(LOWER(email) LIKE ? OR LOWER(name) LIKE ?)")
+        like = f"%{query.lower()}%"
+        args.extend([like, like])
+    if contributor:
+        where_clauses.append("contributor_email = ?")
+        args.append(contributor)
+    if source == "email":
+        where_clauses.append("(emails_sent >= 1 AND replies_received >= 1)")
+    elif source == "calendar":
+        where_clauses.append("meetings_count >= 1")
+    if where_clauses:
+        full_sql += " WHERE " + " AND ".join(where_clauses)
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(full_sql, args)
+        rows = cur.fetchall()
+        # Pull status map in one go so we can filter + label rows in Python.
+        status_cur = conn.execute("SELECT email, status FROM candidate_status")
+        status_map = {r[0]: r[1] for r in status_cur.fetchall()}
+        # 1st-degree connection lookup: build a set of normalized LinkedIn URLs
+        # from the user's existing Draftboard connector_paths network.
+        # Powers the "1st°" badge on candidate rows.
+        #
+        # Normalization is done in Python (not SQL) so it matches
+        # _normalize_linkedin exactly — that helper strips query strings + anchors
+        # in addition to lowercasing and dropping trailing slashes. SQL-side
+        # normalization would miss matches when connector_paths has tracking
+        # suffixes (e.g. ?utm_source=...) that the resolver's URL doesn't.
+        firstdegree_cur = conn.execute(
+            "SELECT DISTINCT connector_linkedin FROM connector_paths "
+            "WHERE connector_linkedin != ''"
+        )
+        firstdegree_set = {
+            _normalize_linkedin(r[0]) for r in firstdegree_cur.fetchall() if r[0]
+        }
+        firstdegree_set.discard("")
+        # And a separate lookup for resolved LinkedIn URLs from the resolver.
+        resolved_cur = conn.execute(
+            "SELECT email, linkedin_url FROM linkedin_resolutions WHERE linkedin_url IS NOT NULL AND linkedin_url != ''"
+        )
+        resolved_map = {r[0]: r[1] for r in resolved_cur.fetchall()}
+    candidates = []
+    for r in rows:
+        contributor_email = r[0]
+        contributor_name = r[1]
+        email = r[2]
+        name = r[3]
+        emails_sent = r[4]
+        replies_received = r[5]
+        threads_count = r[6]
+        meetings_count = r[7]
+        last_emailed_at = r[8]
+        last_met_at = r[9]
+        last_contact_at = max(last_emailed_at, last_met_at)
+        days_ago = ((now - last_contact_at) / 86400.0) if last_contact_at else None
+        score = score_contact(emails_sent, replies_received, threads_count, meetings_count, days_ago)
+        # Status filter — applied in Python so the SQL union stays simple.
+        row_status = status_map.get(email, "")
+        if status_filter == "active" and row_status == "hidden":
+            continue
+        if status_filter == "starred" and row_status != "starred":
+            continue
+        if status_filter == "hidden" and row_status != "hidden":
+            continue
+        if status_filter == "supporter" and row_status != "supporter":
+            continue
+        if status_filter == "unmarked" and row_status:
+            continue
+        # 1st-degree check: if this candidate has a resolved LinkedIn URL,
+        # see if it appears in the user's connector_paths network.
+        linkedin_url = resolved_map.get(email, "")
+        is_first_degree = False
+        if linkedin_url:
+            norm = _normalize_linkedin(linkedin_url)
+            if norm and norm in firstdegree_set:
+                is_first_degree = True
+        # Render-time labels for the contributor.
+        if contributor_email == "__self__":
+            contributor_label = "you"
+        elif contributor_name:
+            contributor_label = contributor_name
+        else:
+            contributor_label = contributor_email
+        candidates.append({
+            "email": email,
+            "name": name or email,
+            "emails_sent": emails_sent,
+            "replies_received": replies_received,
+            "threads_count": threads_count,
+            "meetings_count": meetings_count,
+            "last_contact_at": last_contact_at,
+            "days_ago": int(days_ago) if days_ago is not None else None,
+            "score": score,
+            "contributor_email": contributor_email,
+            "contributor_label": contributor_label,
+            "row_status": row_status,
+            "is_first_degree": is_first_degree,
+        })
+    candidates.sort(key=lambda c: (-c["score"], -c["threads_count"], c["email"]))
+    total = len(candidates)
+    return candidates[offset:offset + limit], total
+
+
+def db_set_candidate_status(email, status):
+    """Set or clear a candidate's triage status. Empty status removes the row."""
+    email = (email or "").strip().lower()
+    if not email:
+        return
+    with _db_lock, _db_connect() as conn:
+        if status:
+            conn.execute(
+                "INSERT INTO candidate_status (email, status, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(email) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at",
+                (email, status, int(time.time())),
+            )
+        else:
+            conn.execute("DELETE FROM candidate_status WHERE email = ?", (email,))
+        conn.commit()
+
+
+def db_count_unresolved_candidates():
+    """Count candidates that have NO row in linkedin_resolutions (i.e. never
+    been tried). Used by the bulk-resolve toolbar button. Excludes hidden
+    candidates by default since the user already triaged them out.
+
+    The "qualifying candidate" definition here MUST stay equivalent to what
+    db_query_candidates produces. The two queries use slightly different
+    shapes (this one is a flat UNION of three table-specific SELECTs;
+    db_query_candidates does a LEFT JOIN on the self side to surface the
+    meeting count alongside email columns) but the resulting *email sets*
+    are equivalent: a row qualifies if it's in gmail_contacts with
+    bidirectional email engagement, OR in calendar_contacts with at least
+    one meeting, OR in teammate_contacts meeting either rule. Keep these
+    rules in lock-step or the bulk-resolve "N unresolved" counter will
+    drift from the actual list of rows on the page."""
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute("""
+            SELECT COUNT(*) FROM (
+                SELECT email FROM gmail_contacts WHERE emails_sent >= 1 AND replies_received >= 1
+                UNION
+                SELECT email FROM calendar_contacts WHERE meetings_count >= 1
+                UNION
+                SELECT email FROM teammate_contacts WHERE meetings_count >= 1 OR (emails_sent >= 1 AND replies_received >= 1)
+            ) AS c
+            WHERE c.email NOT IN (SELECT email FROM linkedin_resolutions)
+              AND c.email NOT IN (SELECT email FROM candidate_status WHERE status = 'hidden')
+        """)
+        return cur.fetchone()[0]
+
+
+def db_unresolved_candidate_emails(limit=500):
+    """Return up to `limit` (email, name) tuples for candidates that haven't
+    been resolved yet. Names come from gmail_contacts, calendar_contacts, or
+    teammate_contacts in that priority. Used to feed the bulk-resolve flow."""
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute("""
+            SELECT c.email,
+                   COALESCE(NULLIF(gn.name, ''), NULLIF(cn.name, ''), NULLIF(tn.name, ''), '') AS name
+            FROM (
+                SELECT email FROM gmail_contacts WHERE emails_sent >= 1 AND replies_received >= 1
+                UNION
+                SELECT email FROM calendar_contacts WHERE meetings_count >= 1
+                UNION
+                SELECT email FROM teammate_contacts WHERE meetings_count >= 1 OR (emails_sent >= 1 AND replies_received >= 1)
+            ) AS c
+            LEFT JOIN gmail_contacts    gn ON c.email = gn.email
+            LEFT JOIN calendar_contacts cn ON c.email = cn.email
+            LEFT JOIN teammate_contacts tn ON c.email = tn.email
+            WHERE c.email NOT IN (SELECT email FROM linkedin_resolutions)
+              AND c.email NOT IN (SELECT email FROM candidate_status WHERE status = 'hidden')
+            ORDER BY c.email
+            LIMIT ?
+        """, (limit,))
+        return [(row[0], row[1] or row[0]) for row in cur.fetchall()]
+
+
+def db_list_contributors():
+    """Return all contributors who have rows in candidates: '__self__' (if the
+    local user has synced) plus every imported teammate."""
+    out = []
+    with _db_lock, _db_connect() as conn:
+        # Self
+        cur = conn.execute("SELECT COUNT(*) FROM gmail_contacts")
+        gc = cur.fetchone()[0]
+        cur = conn.execute("SELECT COUNT(*) FROM calendar_contacts")
+        cc = cur.fetchone()[0]
+        if gc > 0 or cc > 0:
+            out.append({"email": "__self__", "name": "you", "row_count": gc + cc, "imported_at": 0})
+        # Teammates
+        cur = conn.execute(
+            "SELECT contributor_email, MAX(contributor_name), COUNT(*), MAX(imported_at) "
+            "FROM teammate_contacts GROUP BY contributor_email"
+        )
+        for row in cur.fetchall():
+            out.append({"email": row[0], "name": row[1] or row[0], "row_count": row[2], "imported_at": row[3] or 0})
+    return out
+
+
+def db_import_teammate_scan(payload):
+    """Validate + persist a parsed scanner JSON. Returns (count_imported,
+    contributor_email, error_or_None). Re-imports from the same teammate
+    UPDATE in place via INSERT OR REPLACE."""
+    if not isinstance(payload, dict):
+        return 0, "", "JSON root must be an object."
+    if payload.get("scan_type") != "draftboard_supporter_scan":
+        return 0, "", "Not a Draftboard supporter scan file (scan_type mismatch)."
+    if int(payload.get("schema_version", 0)) != 1:
+        return 0, "", f"Unsupported schema_version: {payload.get('schema_version')}"
+    scanned_by = payload.get("scanned_by") or {}
+    contributor_email = (scanned_by.get("email") or "").strip().lower()
+    contributor_name = (scanned_by.get("name") or "").strip()
+    if not contributor_email or "@" not in contributor_email:
+        return 0, "", "scanned_by.email is missing or invalid."
+
+    gmail_rows = payload.get("gmail_contacts") or []
+    cal_rows = payload.get("calendar_contacts") or []
+    # Merge by email — a contact in both gets a single row with combined counts.
+    merged = {}
+    for c in gmail_rows:
+        em = (c.get("email") or "").strip().lower()
+        if not em or "@" not in em:
+            continue
+        merged[em] = {
+            "name": c.get("name") or "",
+            "emails_sent": int(c.get("emails_sent") or 0),
+            "replies_received": int(c.get("replies_received") or 0),
+            "threads_count": int(c.get("threads_count") or 0),
+            "meetings_count": 0,
+            "last_contact_at": int(c.get("last_contact_at") or 0),
+        }
+    for c in cal_rows:
+        em = (c.get("email") or "").strip().lower()
+        if not em or "@" not in em:
+            continue
+        d = merged.setdefault(em, {
+            "name": c.get("name") or "",
+            "emails_sent": 0, "replies_received": 0, "threads_count": 0,
+            "meetings_count": 0, "last_contact_at": 0,
+        })
+        d["meetings_count"] = int(c.get("meetings_count") or 0)
+        last_met = int(c.get("last_met_at") or 0)
+        if last_met > d["last_contact_at"]:
+            d["last_contact_at"] = last_met
+        if not d["name"] and c.get("name"):
+            d["name"] = c["name"]
+
+    now = int(time.time())
+    count = 0
+    with _db_lock, _db_connect() as conn:
+        # Wipe any existing rows for this contributor first so removed contacts
+        # don't linger from a previous import.
+        conn.execute("DELETE FROM teammate_contacts WHERE contributor_email = ?", (contributor_email,))
+        for em, d in merged.items():
+            conn.execute(
+                "INSERT INTO teammate_contacts (contributor_email, contributor_name, email, name, "
+                "emails_sent, replies_received, threads_count, meetings_count, last_contact_at, imported_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (contributor_email, contributor_name, em, d["name"],
+                 d["emails_sent"], d["replies_received"], d["threads_count"],
+                 d["meetings_count"], d["last_contact_at"], now),
+            )
+            count += 1
+        conn.commit()
+    return count, contributor_email, None
+
+
+def db_remove_teammate_contributor(contributor_email):
+    """Wipe all rows for one contributor (the 'remove a teammate' button)."""
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM teammate_contacts WHERE contributor_email = ?",
+            (contributor_email.strip().lower(),),
+        )
+        conn.commit()
+        return cur.rowcount
+
+
+# --- One-time sync worker ------------------------------------------------
+
+_google_sync_lock = threading.Lock()
+_google_sync_state = {
+    "running": False,
+    "stage": "",
+    "processed": 0,
+    "total": 0,
+    "started_at": 0,
+    "ended_at": 0,
+    "last_error": "",
+    "account_email": "",
+}
+_google_sync_thread = None
+
+
+def _set_google_sync_state(**kwargs):
+    with _google_sync_lock:
+        _google_sync_state.update(kwargs)
+
+
+def google_sync_progress_snapshot():
+    with _google_sync_lock:
+        snap = dict(_google_sync_state)
+    if snap["total"] > 0:
+        snap["percent"] = int(100 * snap["processed"] / snap["total"])
+    else:
+        snap["percent"] = 0
+    return snap
+
+
+def _google_sync_worker(creds):
+    """Run one sync end-to-end. Credentials are passed in memory and discarded
+    when this function returns — never persisted."""
+    started = int(time.time())
+    _set_google_sync_state(running=True, stage="starting", processed=0, total=0,
+                           started_at=started, ended_at=0, last_error="")
+    try:
+        try:
+            oauth2 = _google_build("oauth2", "v2", credentials=creds, cache_discovery=False)
+            profile = oauth2.userinfo().get().execute() or {}
+            my_email = (profile.get("email") or "").lower()
+        except Exception:
+            gmail = _google_build("gmail", "v1", credentials=creds, cache_discovery=False)
+            my_email = (gmail.users().getProfile(userId="me").execute() or {}).get("emailAddress", "").lower()
+
+        if my_email:
+            db_app_state_set("google_account_email", my_email)
+            _set_google_sync_state(account_email=my_email)
+
+        # Gmail
+        _set_google_sync_state(stage="gmail", processed=0, total=0)
+        def _gmail_progress(p, t):
+            _set_google_sync_state(stage="gmail", processed=p, total=t)
+        gmail_contacts = fetch_gmail_threads(creds, my_email, progress_cb=_gmail_progress)
+        db_replace_gmail_contacts(gmail_contacts)
+
+        # Calendar
+        _set_google_sync_state(stage="calendar", processed=0, total=0)
+        def _cal_progress(p, t):
+            _set_google_sync_state(stage="calendar", processed=p, total=t)
+        calendar_contacts = fetch_calendar_events(creds, my_email, progress_cb=_cal_progress)
+        db_replace_calendar_contacts(calendar_contacts)
+
+        ended = int(time.time())
+        db_app_state_set("google_last_synced_at", str(ended))
+        db_app_state_set("google_last_error", "")
+        _set_google_sync_state(running=False, stage="done", ended_at=ended, last_error="")
+    except Exception as e:
+        msg = f"{type(e).__name__}: {e}"
+        db_app_state_set("google_last_error", msg)
+        _set_google_sync_state(running=False, stage="error", ended_at=int(time.time()), last_error=msg)
+
+
+def start_google_sync(creds):
+    """Kick off the one-time sync. Returns True if started, False if one's
+    already in flight."""
+    global _google_sync_thread
+    with _google_sync_lock:
+        if _google_sync_state["running"]:
+            return False
+        _google_sync_state["running"] = True
+    _google_sync_thread = threading.Thread(
+        target=_google_sync_worker, args=(creds,), daemon=True, name="google-sync"
+    )
+    _google_sync_thread.start()
+    return True
+
+
+# --- Routes --------------------------------------------------------------
+
+@app.route("/settings/google", methods=["GET"])
+def settings_google_view():
+    """Status page: 'Connect Google' button OR last-synced banner + Re-sync."""
+    status = google_status()
+    sync_state = google_sync_progress_snapshot()
+    return render_template(
+        "settings_google.html",
+        status=status,
+        sync_state=sync_state,
+        active="settings_google",
+        api_key_set=bool(API_KEY),
+    )
+
+
+@app.route("/settings/google/clear-data", methods=["POST"])
+def settings_google_clear_data():
+    """Wipe the synced contact data + last-synced metadata."""
+    db_clear_google_data()
+    return redirect(url_for("settings_google_view") + "?cleared=1")
+
+
+@app.route("/auth/google/start", methods=["GET"])
+def auth_google_start():
+    if not _google_libs_ready():
+        return redirect(url_for("settings_google_view") + "?error=libs_missing")
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET):
+        return redirect(url_for("settings_google_view") + "?error=client_not_configured")
+    flow = _google_flow()
+    auth_url, state = flow.authorization_url(
+        access_type="online",  # one-time use, no refresh token needed
+        include_granted_scopes="true",
+    )
+    from flask import session
+    session["google_oauth_state"] = state
+    # PKCE: persist the code_verifier across the redirect. The Flow object is
+    # ephemeral; without saving the verifier, the callback's fresh Flow can't
+    # complete the token exchange and Google rejects with "Missing code verifier".
+    session["google_oauth_code_verifier"] = flow.code_verifier
+    return redirect(auth_url)
+
+
+@app.route("/auth/google/callback", methods=["GET"])
+def auth_google_callback():
+    if not _google_libs_ready():
+        return redirect(url_for("settings_google_view") + "?error=libs_missing")
+    from flask import session
+    # Pop the state nonce up front so it can't be replayed by a second callback.
+    expected_state = session.pop("google_oauth_state", "")
+    got_state = request.args.get("state", "")
+
+    err = request.args.get("error")
+    if err:
+        # Map Google's standard error codes to friendly internal codes the
+        # /settings/google template can render with a recovery message.
+        if err == "access_denied":
+            # Two cases: customer cancelled, OR their email isn't on the
+            # test-users allowlist. Google's `error_description` distinguishes
+            # them; pass it through so the template can switch on it.
+            desc = (request.args.get("error_description") or "").lower()
+            if "test users" in desc or "verification" in desc or "blocked" in desc:
+                return redirect(url_for("settings_google_view") + "?error=access_blocked")
+            return redirect(url_for("settings_google_view") + "?error=access_cancelled")
+        return redirect(url_for("settings_google_view") + f"?error={err}")
+
+    # Reject if state is missing on either side OR doesn't match. The previous
+    # logic short-circuited the comparison when either side was empty, leaving
+    # the callback open to CSRF.
+    if not expected_state or not got_state or expected_state != got_state:
+        return redirect(url_for("settings_google_view") + "?error=state_mismatch")
+
+    # PKCE: restore the code_verifier saved during /auth/google/start. Pop so
+    # it can't be replayed by a second callback.
+    code_verifier = session.pop("google_oauth_code_verifier", None)
+    try:
+        flow = _google_flow()
+        flow.code_verifier = code_verifier
+        flow.fetch_token(authorization_response=request.url)
+        creds = flow.credentials
+        # Kick off sync — credentials live only inside the worker thread, never persisted.
+        start_google_sync(creds)
+    except Exception as e:
+        # Log the full traceback to the server console so we can diagnose
+        # callback failures. The user-facing banner stays generic.
+        import traceback
+        print("=" * 70, flush=True)
+        print(f"[google/callback] {type(e).__name__}: {e}", flush=True)
+        print(traceback.format_exc(), flush=True)
+        print("=" * 70, flush=True)
+        return redirect(url_for("settings_google_view") + f"?error=callback:{type(e).__name__}")
+    return redirect(url_for("settings_google_view") + "?connected=1")
+
+
+@app.route("/google/sync/status", methods=["GET"])
+def google_sync_status():
+    return jsonify(google_sync_progress_snapshot())
+
+
+@app.route("/supporters/candidates", methods=["GET"])
+def supporters_candidates_view():
+    """Ranked list of high-engagement contacts from the local user's Gmail
+    + Calendar, plus any imported teammate scans."""
+    try:
+        page = max(1, int(request.args.get("page") or "1"))
+    except ValueError:
+        page = 1
+    per_page = 50
+    query = (request.args.get("q") or "").strip()
+    contributor = (request.args.get("contributor") or "").strip()
+    source = (request.args.get("source") or "").strip()
+    status_filter = (request.args.get("status_filter") or "active").strip()
+    candidates, total = db_query_candidates(
+        limit=per_page, offset=(page - 1) * per_page,
+        query=query, contributor=contributor, source=source, status_filter=status_filter,
+    )
+    # Hydrate each candidate with its cached LinkedIn-resolution result (if any)
+    # so already-resolved rows render with the URL inline. Fresh candidates
+    # render the "Resolve" button; the JS handler hits /candidates/resolve and
+    # mutates the row in place on success.
+    #
+    # `resolution_attempted` distinguishes "we tried and got nothing" (show
+    # Retry) from "we never tried" (show Resolve). The resolver leaves
+    # `error` NULL on plain "no match" results, so we have to look at the
+    # cache row's existence, not just at the error column.
+    for c in candidates:
+        cached = db_get_resolution(c["email"])
+        if cached:
+            c["linkedin_url"] = cached.get("linkedin_url") or ""
+            c["resolution_source"] = cached.get("source") or ""
+            c["resolution_confidence"] = cached.get("confidence") or ""
+            c["resolution_error"] = cached.get("error") or cached.get("reasoning") or ""
+            c["resolution_attempted"] = True
+        else:
+            c["linkedin_url"] = ""
+            c["resolution_source"] = ""
+            c["resolution_confidence"] = ""
+            c["resolution_error"] = ""
+            c["resolution_attempted"] = False
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    status = google_status()
+    sync_state = google_sync_progress_snapshot()
+    contributors = db_list_contributors()
+    resolver_keys = _load_resolver_keys()
+    resolver_status = _resolver_status(resolver_keys)
+    unresolved_count = db_count_unresolved_candidates()
+    return render_template(
+        "supporters_candidates.html",
+        candidates=candidates,
+        total=total,
+        page=page,
+        total_pages=total_pages,
+        per_page=per_page,
+        query=query,
+        contributor=contributor,
+        contributors=contributors,
+        source=source,
+        status_filter=status_filter,
+        unresolved_count=unresolved_count,
+        status=status,
+        sync_state=sync_state,
+        resolver_status=resolver_status,
+        active="candidates",
+        api_key_set=bool(API_KEY),
+    )
+
+
+@app.route("/candidates/status", methods=["POST"])
+def candidates_set_status():
+    """Set or toggle a candidate's triage status. JSON body:
+       {"email": "...", "status": "starred"|"hidden"|"supporter"|""}
+       Empty status clears."""
+    if not request.is_json:
+        return jsonify({"error": "JSON body required"}), 400
+    body = request.get_json(silent=True) or {}
+    email = (body.get("email") or "").strip().lower()
+    status = (body.get("status") or "").strip()
+    if not email:
+        return jsonify({"error": "email required"}), 400
+    # RFC 5321 caps email at 254 chars; we keep some headroom but reject
+    # obviously-wrong inputs so a curl-loop or scripted-misuse can't bloat
+    # the candidate_status table to a ridiculous size.
+    if len(email) > 320:
+        return jsonify({"error": "email too long"}), 400
+    if status and status not in ("starred", "hidden", "supporter"):
+        return jsonify({"error": f"unknown status: {status}"}), 400
+    db_set_candidate_status(email, status)
+    return jsonify({"ok": True, "email": email, "status": status})
+
+
+@app.route("/candidates/unresolved", methods=["GET"])
+def candidates_unresolved_list():
+    """Return up to 500 (name, email) pairs the bulk-resolve button can feed
+    into /candidates/resolve/batch. The JS pulls a chunk, posts it, then
+    pulls the next chunk until the count drops to 0."""
+    rows = db_unresolved_candidate_emails(limit=500)
+    return jsonify({
+        "count": len(rows),
+        "remaining": db_count_unresolved_candidates(),
+        "contacts": [{"email": e, "name": n} for e, n in rows],
+    })
+
+
+@app.route("/supporters/import-teammate", methods=["GET", "POST"])
+def supporters_import_teammate_view():
+    """Upload a teammate's supporter_scan_*.json. Validates schema, replaces
+    any prior import from the same teammate, redirects with a summary."""
+    error = None
+    summary = None
+    if request.method == "POST":
+        upload = request.files.get("scan_file")
+        if not upload or not upload.filename:
+            error = "No file selected. Pick the supporter_scan_*.json a teammate sent you."
+        else:
+            try:
+                payload = json.loads(upload.read().decode("utf-8"))
+            except (ValueError, UnicodeDecodeError) as e:
+                error = f"Couldn't parse JSON: {e}"
+                payload = None
+            if payload is not None:
+                count, contributor, err = db_import_teammate_scan(payload)
+                if err:
+                    error = err
+                else:
+                    return redirect(
+                        url_for("supporters_candidates_view")
+                        + f"?contributor={contributor}&imported=1&imported_count={count}"
+                    )
+
+    contributors = db_list_contributors()
+    return render_template(
+        "import_teammate.html",
+        error=error,
+        summary=summary,
+        contributors=[c for c in contributors if c["email"] != "__self__"],
+        active="candidates",
+        api_key_set=bool(API_KEY),
+    )
+
+
+@app.route("/supporters/remove-teammate", methods=["POST"])
+def supporters_remove_teammate():
+    contributor_email = (request.form.get("contributor_email") or "").strip().lower()
+    if not contributor_email:
+        return redirect(url_for("supporters_import_teammate_view"))
+    removed = db_remove_teammate_contributor(contributor_email)
+    return redirect(url_for("supporters_import_teammate_view") + f"?removed={removed}")
+
+
+# =====================================================================
+# Slack assignment + Team Settings (from main; opt-in feature, Gmail-default)
+# =====================================================================
+# Flat editable map of every owner that has appeared in your workspace's
+# connection data. Pulls owner identity from `target_owners` (already
+# populated by the existing sync), lets the user paste a Slack user ID and
+# email per teammate. The saved values feed:
+#   - Slack assign feature (uses slack_user_id for @-mentions)
+#   - Compose-email-to-teammate flow (uses email to pre-fill Gmail's To: field)
+# Independent of Slack — useful immediately just for the email map.
 # Flat editable map of every owner that has appeared in your workspace's
 # connection data. Pulls owner identity from `target_owners` (already
 # populated by the existing sync), lets the user paste a Slack user ID and
@@ -3098,7 +4357,9 @@ def settings_team_save():
     return redirect(url_for("settings_team_view", saved="1"))
 
 
-# ---------- LinkedIn resolver routes ----------
+# =====================================================================
+# LinkedIn resolver wiring (tied to linkedin_resolver.py)
+# =====================================================================
 
 def _resolver_status(keys: dict) -> dict:
     """Summarize which resolver methods are usable given the configured keys.

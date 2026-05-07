@@ -23,7 +23,7 @@
     <section class="mb-6 rounded-lg border border-slate-200 bg-white p-6 shadow-sm">
       <h2 class="text-lg font-semibold mb-2">What this does</h2>
       <p class="text-sm text-slate-700 mb-3">
-        When you connect Gmail + Calendar (separate setup), the app finds high-engagement contacts and shows them on the Candidates page. To import any of them as a Draftboard Target, we need their LinkedIn URL. This page configures how we find that URL automatically.
+        When you connect Gmail + Calendar (separate setup), the app finds high-engagement contacts and shows them on the Supporters page. To import any of them as a Draftboard Target, we need their LinkedIn URL. This page configures how we find that URL automatically.
       </p>
       <p class="text-sm text-slate-700 mb-3">
         We try two methods, in order:
@@ -33,7 +33,7 @@
         <li><strong>Google search + AI ranking</strong> — fallback. Searches the web for "{first name} {company} linkedin", then asks gpt-4o-mini to pick the right profile. Slower but cheap.</li>
       </ol>
       <p class="text-sm text-slate-700">
-        All three keys are <strong>optional</strong>. Leave any blank and we just skip that method. If neither method finds the URL, the candidate row stays usable — you can paste a LinkedIn URL manually before importing.
+        All three keys are <strong>optional</strong>. Leave any blank and we just skip that method. If neither method finds the URL, the row stays usable — you can paste a LinkedIn URL manually before importing.
       </p>
       <div class="mt-4 rounded-md border border-blue-200 bg-blue-50 px-4 py-3 text-xs text-blue-900">
         <strong>Privacy:</strong> every lookup runs locally on your laptop. Names + emails go to Apollo and Google CSE per-call as needed. Draftboard's servers never see this data.

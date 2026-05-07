@@ -1,0 +1,580 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Draftboard — Supporters</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+  <div class="max-w-5xl mx-auto px-6 py-10">
+    {% include "_nav.html" %}
+
+    <header class="mb-6 flex items-end justify-between flex-wrap gap-3">
+      <div>
+        <h1 class="text-2xl font-semibold tracking-tight">Supporters</h1>
+        <p class="text-sm text-slate-500 mt-1">
+          Find potential Supporters in your Gmail and Calendar (and your
+          teammates' networks), then mark the ones you actually want to
+          add as Supporters in Draftboard.
+          <span class="block mt-1 text-xs text-slate-400">
+            Ranked by how often you actually engage — emails back-and-forth,
+            threads, and shared meetings, weighted toward recency.
+          </span>
+        </p>
+      </div>
+      <div class="flex items-center gap-2">
+        <a href="/supporters/import-teammate"
+           class="inline-flex items-center text-xs px-3 py-1.5 rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">
+          + Import teammate scan
+        </a>
+        <a href="/settings/google"
+           class="inline-flex items-center text-xs px-3 py-1.5 rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">
+          Google settings
+        </a>
+        {% if status.last_synced_at %}
+          <a href="/auth/google/start"
+             class="inline-flex items-center text-xs px-3 py-1.5 rounded-md bg-slate-900 text-white hover:bg-slate-800"
+             title="Asks Google for permission again — tokens aren't stored between syncs.">
+            Re-sync
+          </a>
+        {% endif %}
+      </div>
+    </header>
+
+    {# --- Resolver-not-configured banner — only when there's at least one row to act on --- #}
+    {% if has_any_data and resolver_status and not resolver_status.any_ready %}
+      <div class="mb-4 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900 flex items-start gap-3 flex-wrap">
+        <div class="flex-1">
+          <strong>LinkedIn resolver isn't configured.</strong>
+          The "Resolve LinkedIn URL" buttons below need either an Apollo key or a Google Custom Search + OpenAI key combo.
+          Without them, you can still browse the list and import people manually by pasting LinkedIn URLs.
+        </div>
+        <a href="/settings/linkedin-resolver"
+           class="text-xs px-3 py-1.5 rounded-md bg-slate-900 text-white hover:bg-slate-800">
+          Set up resolver →
+        </a>
+      </div>
+    {% endif %}
+
+    {# --- Imported banner --- #}
+    {% if request.args.get('imported') %}
+      <div class="mb-4 rounded-md border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
+        ✅ Imported {{ request.args.get('imported_count') or '' }} contact{{ '' if request.args.get('imported_count') == '1' else 's' }}
+        {% if contributor %}from <strong>{{ contributor }}</strong>{% endif %}.
+        They're now mixed into your Supporters list below.
+      </div>
+    {% endif %}
+
+    {# --- Connection status banners --- #}
+    {# `has_any_data` controls whether to show empty-state guidance vs the
+       real candidates UI. Broad definition: any contributor (your own or a
+       teammate's) means there's data to render. #}
+    {% set has_any_data = status.last_synced_at or contributors %}
+    {% if not status.libs_ready %}
+      <div class="mb-6 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">
+        <strong>Python dependencies missing.</strong> Run
+        <code class="font-mono text-xs bg-white px-1 py-0.5 rounded border border-rose-200">.venv/bin/pip install -r requirements.txt</code>
+        and restart, then come back.
+      </div>
+    {% elif not status.client_configured %}
+      <div class="mb-6 rounded-md border border-rose-300 bg-rose-50 px-5 py-4 text-sm text-rose-900">
+        <p class="font-medium">Google OAuth client isn't configured.</p>
+        <p class="mt-1">
+          Set <code class="font-mono text-xs">GOOGLE_CLIENT_ID</code> + <code class="font-mono text-xs">GOOGLE_CLIENT_SECRET</code> as env vars,
+          or in <code class="font-mono text-xs">~/.draftboard-secrets/google.env</code>, and restart.
+        </p>
+      </div>
+    {% elif not has_any_data and not sync_state.running %}
+      <div class="mb-6 rounded-md border border-amber-300 bg-amber-50 px-5 py-4 text-sm text-amber-900">
+        <p class="font-medium">No data yet.</p>
+        <p class="mt-1 text-amber-800">
+          Two ways to populate this page:
+        </p>
+        <ul class="mt-2 list-disc list-inside text-amber-800 text-xs space-y-1">
+          <li>Connect <strong>your own</strong> Google to score your contacts.</li>
+          <li>Or import a JSON from a teammate who ran the portable scanner.</li>
+        </ul>
+        <div class="mt-3 flex gap-2">
+          <a href="/auth/google/start"
+             class="inline-flex items-center text-xs px-3 py-1.5 rounded-md bg-indigo-600 text-white hover:bg-indigo-700">
+            Connect Google →
+          </a>
+          <a href="/supporters/import-teammate"
+             class="inline-flex items-center text-xs px-3 py-1.5 rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">
+            Import teammate scan
+          </a>
+        </div>
+      </div>
+    {% elif sync_state.running %}
+      <div class="mb-6 rounded-md border border-indigo-200 bg-indigo-50 px-5 py-4 text-sm text-indigo-900">
+        <p class="font-medium">Sync running…</p>
+        <p class="mt-1">Pulling 12 months of Gmail + Calendar. 5-10 minutes depending on inbox size.</p>
+        <div id="sync-pill" class="mt-3 hidden text-xs"></div>
+      </div>
+    {% endif %}
+
+    {# --- Bulk-resolve toolbar (above the filter bar so it persists across filter changes) --- #}
+    {% if has_any_data and unresolved_count > 0 and resolver_status and resolver_status.any_ready %}
+      <div id="bulk-resolve-bar" class="mb-3 flex items-center gap-3 flex-wrap rounded-md border border-indigo-200 bg-indigo-50 px-4 py-2 text-sm text-indigo-900">
+        <strong>{{ unresolved_count }}</strong> {{ "person hasn't" if unresolved_count == 1 else "people haven't" }} been looked up on LinkedIn yet.
+        <button id="bulk-resolve-btn" type="button"
+                class="ml-auto inline-flex items-center text-xs px-3 py-1.5 rounded-md bg-indigo-600 text-white font-medium hover:bg-indigo-700">
+          Resolve all LinkedIn URLs →
+        </button>
+        <span id="bulk-resolve-progress" class="hidden text-xs text-indigo-800"></span>
+      </div>
+    {% endif %}
+
+    {# --- Filter / search bar --- #}
+    {% if has_any_data %}
+      <form method="GET" action="/supporters/candidates"
+            class="mb-6 flex items-end gap-3 flex-wrap bg-white border border-slate-200 rounded-lg p-4 shadow-sm">
+        <div class="flex-1 min-w-[180px]">
+          <label for="q" class="block text-[10px] uppercase tracking-wider text-slate-500 mb-1">Search</label>
+          <input type="text" name="q" id="q" value="{{ query }}"
+                 placeholder="Name or email"
+                 class="w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500" />
+        </div>
+        {% if contributors|length > 1 %}
+          <div>
+            <label for="contributor" class="block text-[10px] uppercase tracking-wider text-slate-500 mb-1">Contributor</label>
+            <select name="contributor" id="contributor" onchange="this.form.submit()"
+                    class="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500">
+              <option value="">Everyone ({{ contributors|length }})</option>
+              {% for ct in contributors %}
+                <option value="{{ ct.email }}" {% if contributor == ct.email %}selected{% endif %}>
+                  {% if ct.email == '__self__' %}You{% else %}{{ ct.name }}{% endif %} ({{ ct.row_count }})
+                </option>
+              {% endfor %}
+            </select>
+          </div>
+        {% endif %}
+        <div>
+          <label for="source" class="block text-[10px] uppercase tracking-wider text-slate-500 mb-1">Source</label>
+          <select name="source" id="source" onchange="this.form.submit()"
+                  class="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500">
+            <option value="" {% if not source %}selected{% endif %}>All</option>
+            <option value="email" {% if source == 'email' %}selected{% endif %}>Email engagement</option>
+            <option value="calendar" {% if source == 'calendar' %}selected{% endif %}>Shared meetings</option>
+          </select>
+        </div>
+        <div>
+          <label for="status_filter" class="block text-[10px] uppercase tracking-wider text-slate-500 mb-1">Show</label>
+          <select name="status_filter" id="status_filter" onchange="this.form.submit()"
+                  class="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500">
+            <option value="active" {% if status_filter == 'active' %}selected{% endif %}>Active (not hidden)</option>
+            <option value="all" {% if status_filter == 'all' %}selected{% endif %}>All including hidden</option>
+            <option value="starred" {% if status_filter == 'starred' %}selected{% endif %}>Starred only</option>
+            <option value="supporter" {% if status_filter == 'supporter' %}selected{% endif %}>Marked as supporter</option>
+            <option value="hidden" {% if status_filter == 'hidden' %}selected{% endif %}>Hidden only</option>
+            <option value="unmarked" {% if status_filter == 'unmarked' %}selected{% endif %}>Not yet marked</option>
+          </select>
+        </div>
+        <button type="submit"
+                class="text-xs px-3 py-1.5 rounded-md bg-slate-900 text-white hover:bg-slate-800">
+          Apply
+        </button>
+        <div class="ml-auto text-xs text-slate-500">
+          {{ total }} {{ "person" if total == 1 else "people" }}
+          {% if status.last_synced_at %}
+            · your last sync <span data-ts="{{ status.last_synced_at }}" class="rel-ts">{{ status.last_synced_at }}</span>
+          {% endif %}
+        </div>
+      </form>
+    {% endif %}
+
+    {# --- Supporters table --- #}
+    {% if total == 0 %}
+      {% if has_any_data %}
+        <div class="rounded-lg border border-dashed border-slate-300 bg-white py-16 px-6 text-center">
+          <p class="text-base font-medium text-slate-700">Nobody matches these filters.</p>
+          <p class="mt-2 text-sm text-slate-500 max-w-md mx-auto">
+            {% if query or contributor %}
+              Try clearing the search or contributor filter.
+            {% else %}
+              We didn't find any contacts with bidirectional email engagement
+              or shared meetings. If your inbox is light on threaded
+              conversations, you may not have enough signal yet.
+            {% endif %}
+          </p>
+        </div>
+      {% endif %}
+    {% else %}
+      <div class="bg-white border border-slate-200 rounded-lg shadow-sm overflow-hidden">
+        <table class="w-full text-sm">
+          <thead class="bg-slate-50 text-slate-500">
+            <tr class="text-left">
+              <th class="px-4 py-2 font-medium text-[11px] uppercase tracking-wider w-8">#</th>
+              <th class="px-4 py-2 font-medium text-[11px] uppercase tracking-wider">Contact</th>
+              <th class="px-4 py-2 font-medium text-[11px] uppercase tracking-wider"
+                  title="Whose network this contact came from. 'You' means your own Gmail/Calendar; teammate names come from imported scans.">
+                From
+              </th>
+              <th class="px-4 py-2 font-medium text-[11px] uppercase tracking-wider text-right">Threads</th>
+              <th class="px-4 py-2 font-medium text-[11px] uppercase tracking-wider text-right">Replies</th>
+              <th class="px-4 py-2 font-medium text-[11px] uppercase tracking-wider text-right">Meetings</th>
+              <th class="px-4 py-2 font-medium text-[11px] uppercase tracking-wider text-right">Last contact</th>
+              <th class="px-4 py-2 font-medium text-[11px] uppercase tracking-wider text-right"
+                  title="(emails + replies×2 + threads×3 + meetings×5) × recency_decay. Higher = more engaged.">
+                Score
+              </th>
+              <th class="px-4 py-2 font-medium text-[11px] uppercase tracking-wider"></th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-slate-100">
+            {% for c in candidates %}
+              <tr class="hover:bg-slate-50 candidate-row {% if c.row_status == 'hidden' %}opacity-50{% endif %}"
+                  data-email="{{ c.email }}" data-status="{{ c.row_status }}">
+                <td class="px-4 py-3 text-xs text-slate-400 align-top">{{ loop.index + (page - 1) * per_page }}</td>
+                <td class="px-4 py-3 align-top">
+                  <div class="font-medium text-slate-900 flex items-center gap-1.5">
+                    {{ c.name }}
+                    {% if c.row_status == 'starred' %}<span class="text-amber-500" title="Starred">★</span>{% endif %}
+                    {% if c.row_status == 'supporter' %}<span class="inline-flex items-center rounded-full bg-emerald-100 text-emerald-800 px-1.5 py-0 text-[10px] font-medium" title="Already added as a Draftboard Supporter">supporter ✓</span>{% endif %}
+                    {% if c.is_first_degree %}<span class="inline-flex items-center rounded-full bg-indigo-100 text-indigo-800 px-1.5 py-0 text-[10px] font-medium" title="In your existing Draftboard 1st-degree connector network — usable as a Supporter today">1st°</span>{% endif %}
+                  </div>
+                  <div class="text-xs text-slate-500 truncate">{{ c.email }}</div>
+                </td>
+                <td class="px-4 py-3 align-top">
+                  {% if c.contributor_email == '__self__' %}
+                    <span class="inline-flex items-center rounded-full bg-slate-100 text-slate-600 px-2 py-0.5 text-xs font-medium">you</span>
+                  {% else %}
+                    <span class="inline-flex items-center rounded-full bg-amber-50 text-amber-700 px-2 py-0.5 text-xs font-medium" title="{{ c.contributor_email }}">
+                      {{ c.contributor_label }}
+                    </span>
+                  {% endif %}
+                </td>
+                <td class="px-4 py-3 text-right tabular-nums align-top">{{ c.threads_count }}</td>
+                <td class="px-4 py-3 text-right tabular-nums align-top">{{ c.replies_received }}</td>
+                <td class="px-4 py-3 text-right tabular-nums align-top">{{ c.meetings_count }}</td>
+                <td class="px-4 py-3 text-right text-xs text-slate-500 align-top">
+                  {% if c.days_ago is not none %}
+                    {% if c.days_ago == 0 %}today
+                    {% elif c.days_ago < 7 %}{{ c.days_ago }}d ago
+                    {% elif c.days_ago < 30 %}{{ (c.days_ago / 7) | round(0, 'floor') | int }}w ago
+                    {% elif c.days_ago < 365 %}{{ (c.days_ago / 30) | round(0, 'floor') | int }}mo ago
+                    {% else %}{{ (c.days_ago / 365) | round(1) }}y ago
+                    {% endif %}
+                  {% else %}—{% endif %}
+                </td>
+                <td class="px-4 py-3 text-right align-top">
+                  <span class="inline-flex items-center rounded-full bg-indigo-50 text-indigo-700 px-2 py-0.5 text-xs font-medium tabular-nums">
+                    {{ c.score }}
+                  </span>
+                </td>
+                <td class="px-4 py-3 text-right align-top">
+                  <div class="resolve-cell flex items-center justify-end gap-1.5" data-email="{{ c.email }}">
+                    {% if c.linkedin_url %}
+                      <a href="{{ c.linkedin_url }}" target="_blank" rel="noopener"
+                         class="inline-flex items-center text-xs px-2.5 py-1 rounded-md border border-emerald-200 bg-emerald-50 text-emerald-800 hover:bg-emerald-100 font-medium"
+                         title="Resolved via {{ c.resolution_source }} ({{ c.resolution_confidence }} confidence)">
+                        Open LinkedIn ↗
+                      </a>
+                    {% elif c.resolution_attempted %}
+                      <button type="button"
+                              data-name="{{ c.name }}" data-email="{{ c.email }}"
+                              class="resolve-btn text-xs px-2.5 py-1 rounded-md border border-slate-300 bg-white text-slate-500 hover:bg-slate-50"
+                              title="Last attempt: {{ c.resolution_error or 'no match' }}">
+                        Retry
+                      </button>
+                    {% else %}
+                      <button type="button"
+                              data-name="{{ c.name }}" data-email="{{ c.email }}"
+                              class="resolve-btn text-xs px-2.5 py-1 rounded-md border border-slate-300 bg-white text-slate-600 hover:bg-slate-50">
+                        Resolve LinkedIn URL
+                      </button>
+                    {% endif %}
+                    {# Triage actions: star, mark as supporter, hide. Three small icon
+                       buttons with toggle-on-click semantics. JS calls /candidates/status
+                       and updates the row visually. #}
+                    <div class="flex items-center gap-0.5 ml-1 border-l border-slate-200 pl-1.5">
+                      <button type="button" data-email="{{ c.email }}" data-status="starred"
+                              title="Star as someone to focus on"
+                              class="status-btn px-1 py-1 rounded-md text-base hover:bg-amber-50 {% if c.row_status == 'starred' %}text-amber-500{% else %}text-slate-300 hover:text-amber-400{% endif %}">
+                        ★
+                      </button>
+                      <button type="button" data-email="{{ c.email }}" data-status="supporter"
+                              title="Already added as a Draftboard Supporter"
+                              class="status-btn px-1 py-1 rounded-md text-base hover:bg-emerald-50 {% if c.row_status == 'supporter' %}text-emerald-600{% else %}text-slate-300 hover:text-emerald-500{% endif %}">
+                        ✓
+                      </button>
+                      <button type="button" data-email="{{ c.email }}" data-status="hidden"
+                              title="Hide from default view"
+                              class="status-btn px-1 py-1 rounded-md text-sm hover:bg-rose-50 {% if c.row_status == 'hidden' %}text-rose-500{% else %}text-slate-300 hover:text-rose-400{% endif %}">
+                        ⌀
+                      </button>
+                    </div>
+                  </div>
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+
+      {# --- Pagination --- #}
+      {% if total_pages > 1 %}
+        <div class="mt-4 flex items-center justify-between text-xs text-slate-500">
+          <div>
+            Showing {{ (page - 1) * per_page + 1 }}–{{ [page * per_page, total] | min }} of {{ total }}
+          </div>
+          <div class="flex gap-1">
+            {% set qs = ('&q=' ~ query if query else '') ~ ('&contributor=' ~ contributor if contributor else '') ~ ('&source=' ~ source if source else '') ~ ('&status_filter=' ~ status_filter if status_filter and status_filter != 'active' else '') %}
+            {% if page > 1 %}
+              <a href="?page={{ page - 1 }}{{ qs }}" class="px-2 py-1 rounded-md border border-slate-300 bg-white hover:bg-slate-50">← Prev</a>
+            {% endif %}
+            <span class="px-2 py-1 text-slate-400">Page {{ page }} / {{ total_pages }}</span>
+            {% if page < total_pages %}
+              <a href="?page={{ page + 1 }}{{ qs }}" class="px-2 py-1 rounded-md border border-slate-300 bg-white hover:bg-slate-50">Next →</a>
+            {% endif %}
+          </div>
+        </div>
+      {% endif %}
+    {% endif %}
+
+    <footer class="mt-10 text-xs text-slate-400 text-center">
+      Draftboard API starter · Supporters · Re-sync any time from
+      <a href="/settings/google" class="underline hover:text-slate-500">Google settings</a>
+    </footer>
+  </div>
+
+  {# --- Toast --- #}
+  <div id="toast" class="fixed bottom-6 right-6 z-50 hidden">
+    <div class="bg-slate-900 text-white text-sm px-4 py-2 rounded-md shadow-lg max-w-sm"></div>
+  </div>
+
+  <script>
+  (function () {
+    function showToast(msg) {
+      var t = document.getElementById('toast');
+      if (!t) return;
+      t.querySelector('div').textContent = msg;
+      t.classList.remove('hidden');
+      clearTimeout(window._toastTimer);
+      window._toastTimer = setTimeout(function () { t.classList.add('hidden'); }, 4000);
+    }
+
+    // Resolve LinkedIn URL — POST to /candidates/resolve, mutate row in place.
+    function escapeHtml(s) {
+      return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+      });
+    }
+
+    function renderResolved(cell, data) {
+      var url = data.linkedin_url;
+      var src = data.source || '';
+      var conf = data.confidence || '';
+      if (url) {
+        cell.innerHTML =
+          '<a href="' + escapeHtml(url) + '" target="_blank" rel="noopener" ' +
+          'class="inline-flex items-center text-xs px-2.5 py-1 rounded-md border border-emerald-200 bg-emerald-50 text-emerald-800 hover:bg-emerald-100 font-medium" ' +
+          'title="Resolved via ' + escapeHtml(src) + ' (' + escapeHtml(conf) + ' confidence)">' +
+          'Open LinkedIn ↗</a>';
+      } else {
+        var msg = data.error || 'No LinkedIn profile found.';
+        cell.innerHTML =
+          '<button type="button" data-name="' + escapeHtml(data.name || '') + '" data-email="' + escapeHtml(data.email || '') + '" ' +
+          'title="' + escapeHtml(msg) + '" ' +
+          'class="resolve-btn text-xs px-2.5 py-1 rounded-md border border-slate-300 bg-white text-slate-500 hover:bg-slate-50">' +
+          'Retry</button>';
+        wireResolveButton(cell.querySelector('.resolve-btn'));
+      }
+    }
+
+    function wireResolveButton(btn) {
+      if (!btn) return;
+      btn.addEventListener('click', function () {
+        var cell = btn.closest('.resolve-cell');
+        var name = btn.dataset.name || '';
+        var email = btn.dataset.email || '';
+        if (!email) return;
+        btn.disabled = true;
+        var orig = btn.textContent;
+        btn.textContent = 'Resolving…';
+        fetch('/candidates/resolve', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: name, email: email })
+        })
+          .then(function (r) {
+            return r.json().then(function (data) { return { ok: r.ok, status: r.status, data: data }; });
+          })
+          .then(function (resp) {
+            if (!resp.ok) {
+              btn.disabled = false;
+              btn.textContent = orig;
+              var err = (resp.data && resp.data.error) || ('Server error ' + resp.status);
+              showToast(err);
+              return;
+            }
+            renderResolved(cell, resp.data);
+            if (resp.data.linkedin_url) {
+              showToast('Found LinkedIn URL for ' + (name || email));
+            } else {
+              showToast('No LinkedIn profile found for ' + (name || email));
+            }
+          })
+          .catch(function (e) {
+            btn.disabled = false;
+            btn.textContent = orig;
+            showToast('Network error — try again.');
+          });
+      });
+    }
+
+    document.querySelectorAll('.resolve-btn').forEach(wireResolveButton);
+
+    // --- Triage status buttons (star / supporter-mark / hide) ---
+    // Click toggles: pressing the same status again clears it.
+    document.querySelectorAll('.status-btn').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var email = btn.dataset.email;
+        var newStatus = btn.dataset.status;
+        var row = btn.closest('.candidate-row');
+        if (!row) return;
+        var current = row.dataset.status || '';
+        // Toggle: clicking the active status clears it.
+        if (current === newStatus) newStatus = '';
+        fetch('/candidates/status', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: email, status: newStatus })
+        })
+          .then(function (r) { return r.json(); })
+          .then(function (data) {
+            if (data.error) { showToast(data.error); return; }
+            row.dataset.status = newStatus;
+            // Reload — simplest way to re-render the row's status badges +
+            // the active filter. Cheap on a 50-row page.
+            window.location.reload();
+          })
+          .catch(function () { showToast('Network error — try again.'); });
+      });
+    });
+
+    // --- Bulk resolve all LinkedIn URLs ---
+    var bulkBtn = document.getElementById('bulk-resolve-btn');
+    var bulkProgress = document.getElementById('bulk-resolve-progress');
+    if (bulkBtn) {
+      bulkBtn.addEventListener('click', function () {
+        if (!confirm('Resolve LinkedIn URLs for everyone who hasn\'t been looked up yet? Each lookup uses a small bit of your Apollo / Google CSE quota.')) return;
+        bulkBtn.disabled = true;
+        bulkBtn.textContent = 'Resolving…';
+        bulkProgress.classList.remove('hidden');
+        var totalResolved = 0;
+
+        function nextChunk() {
+          fetch('/candidates/unresolved')
+            .then(function (r) {
+              if (!r.ok) throw new Error('unresolved-list HTTP ' + r.status);
+              return r.json();
+            })
+            .then(function (data) {
+              var remaining = data.remaining || 0;
+              if (!data.contacts || data.contacts.length === 0) {
+                bulkProgress.textContent = '✓ Done — found ' + totalResolved + ' LinkedIn URLs. Reloading…';
+                setTimeout(function () { window.location.reload(); }, 1200);
+                return;
+              }
+              bulkProgress.textContent =
+                'Looking up ' + data.contacts.length + ' contacts (' + remaining + ' total remaining). This batch takes ~1-3 min…';
+              return fetch('/candidates/resolve/batch', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ contacts: data.contacts })
+              })
+                .then(function (r) {
+                  // The batch endpoint returns 400 with {error: ...} for empty/oversized
+                  // payloads. Without this check, an error response would be parsed as
+                  // a normal result and the loop would re-fire forever — silently burning
+                  // API quota and CPU.
+                  if (!r.ok) {
+                    return r.json().catch(function () { return {}; })
+                      .then(function (body) {
+                        throw new Error('batch HTTP ' + r.status + ': ' + (body.error || 'unknown'));
+                      });
+                  }
+                  return r.json();
+                })
+                .then(function (resp) {
+                  totalResolved += (resp.hits || 0);
+                  bulkProgress.textContent =
+                    'Found ' + totalResolved + ' so far. Continuing…';
+                  setTimeout(nextChunk, 200);
+                });
+            })
+            .catch(function (e) {
+              bulkProgress.textContent = '✗ Stopped: ' + (e && e.message || 'unknown error');
+              bulkBtn.disabled = false;
+              bulkBtn.textContent = 'Resolve all LinkedIn URLs →';
+            });
+        }
+        nextChunk();
+      });
+    }
+
+    // Relative timestamps
+    document.querySelectorAll('.rel-ts').forEach(function (el) {
+      var ts = parseInt(el.dataset.ts, 10) * 1000;
+      if (!ts) return;
+      var diff = (Date.now() - ts) / 1000;
+      var label;
+      if (diff < 60) label = Math.round(diff) + 's ago';
+      else if (diff < 3600) label = Math.round(diff/60) + 'm ago';
+      else if (diff < 86400) label = Math.round(diff/3600) + 'h ago';
+      else label = Math.round(diff/86400) + 'd ago';
+      el.textContent = label;
+    });
+
+    // Sync progress polling (no manual re-sync button — it's a link to /auth/google/start)
+    var pill = document.getElementById('sync-pill');
+    var pollTimer = null;
+
+    function renderPill(state) {
+      if (!pill || !state) return;
+      if (!state.running) {
+        pill.classList.add('hidden');
+        return;
+      }
+      pill.classList.remove('hidden');
+      var stage = state.stage || 'starting';
+      var label = stage === 'gmail' ? 'Pulling Gmail threads' :
+                  stage === 'calendar' ? 'Pulling Calendar events' :
+                  'Starting sync';
+      var counter = state.total > 0 ? ' (' + state.processed + ' / ' + state.total + ')' : '';
+      pill.innerHTML =
+        '<span class="inline-flex items-center gap-2 px-2 py-0.5 rounded-md bg-indigo-50 border border-indigo-200 text-indigo-800">' +
+          '<span class="inline-block w-1.5 h-1.5 rounded-full bg-indigo-500 animate-pulse"></span>' +
+          label + counter +
+        '</span>';
+    }
+
+    function poll() {
+      fetch('/google/sync/status')
+        .then(function (r) { return r.json(); })
+        .then(function (state) {
+          renderPill(state);
+          if (!state.running && pollTimer) {
+            clearInterval(pollTimer);
+            pollTimer = null;
+            // If we just transitioned out of running and we had no rows, refresh.
+            if ({{ 'true' if total == 0 else 'false' }}) {
+              setTimeout(function () { window.location.reload(); }, 800);
+            }
+          }
+        })
+        .catch(function () {});
+    }
+
+    // If sync is in progress on page load, start polling.
+    poll();
+    setTimeout(function () {
+      poll();
+      if (!pollTimer) pollTimer = setInterval(poll, 2500);
+    }, 800);
+  })();
+  </script>
+</body>
+</html>
