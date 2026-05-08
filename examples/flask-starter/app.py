@@ -1051,6 +1051,8 @@ def db_put_resolution(email: str, name: str, result: dict):
             ),
         )
         conn.commit()
+    # New resolution may unlock a supporter→connector match — drop the cache.
+    invalidate_supporter_attribution_cache()
 
 
 def db_unique_owners():
@@ -1927,6 +1929,66 @@ def _build_assign_to_teammate_draft(target, connection, teammate):
     }
 
 
+# Cache of {normalized_linkedin_url: [contributor_display, ...]} drawn from
+# scanner-imported supporters that have been LinkedIn-resolved. Refreshed at
+# most every _SUPPORTER_ATTRIBUTION_TTL seconds, so a drawer with hundreds of
+# connections doesn't fire hundreds of identical JOIN queries.
+_SUPPORTER_ATTRIBUTION_TTL = 60
+_supporter_attribution_cache = {"data": None, "fetched_at": 0}
+
+
+def db_supporter_attribution_map():
+    """Returns dict {normalized_linkedin_url: [contributor_display, ...]}.
+
+    For every (teammate-uploaded supporter, resolved LinkedIn URL) pair, lists
+    the contributing teammates. Drives the "⭐ Supporter (Sarah's list)" badge
+    on connector cards — when path data shows a connector who's also someone a
+    teammate flagged via the scanner, we surface the overlap inline.
+
+    Empty when no scanner imports have happened OR no resolutions have run.
+    The data hard-depends on:
+      1. Teammate ran the portable scanner → rows in `teammate_contacts`
+      2. Those rows were LinkedIn-resolved (manual or batch on Supporters page)
+         → matching rows in `linkedin_resolutions` with linkedin_url set
+
+    Without (2), we can't match — the scanner gives us emails, the path API
+    gives us LinkedIn URLs, and the resolver is the only bridge.
+    """
+    cache = _supporter_attribution_cache
+    now = time.time()
+    if cache["data"] is not None and (now - cache["fetched_at"]) < _SUPPORTER_ATTRIBUTION_TTL:
+        return cache["data"]
+    out = {}
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT lr.linkedin_url, tc.contributor_name, tc.contributor_email "
+            "FROM teammate_contacts tc "
+            "JOIN linkedin_resolutions lr ON lr.email = tc.email "
+            "WHERE lr.linkedin_url IS NOT NULL AND lr.linkedin_url != ''"
+        )
+        for url, contrib_name, contrib_email in cur.fetchall():
+            key = _normalize_linkedin(url)
+            if not key:
+                continue
+            display = (contrib_name or "").strip() or (contrib_email or "").strip()
+            if not display:
+                continue
+            bucket = out.setdefault(key, [])
+            if display not in bucket:
+                bucket.append(display)
+    cache["data"] = out
+    cache["fetched_at"] = now
+    return out
+
+
+def invalidate_supporter_attribution_cache():
+    """Drop the in-memory map so the next read rebuilds. Call this after any
+    write that could change the result: a scanner import, or a successful
+    LinkedIn resolution. Cheap; the rebuild is one indexed JOIN."""
+    _supporter_attribution_cache["data"] = None
+    _supporter_attribution_cache["fetched_at"] = 0
+
+
 def _enrich_connection(target, connection, requested_set=None, my_user_id=None):
     """Format a Connection for the drawer template.
 
@@ -1989,6 +2051,14 @@ def _enrich_connection(target, connection, requested_set=None, my_user_id=None):
     slack_on = slack_is_configured()
     slack_channel = (db_get_slack_config("channel_name") or "").strip() if slack_on else ""
 
+    # Supporter cross-reference: is this connector someone a teammate has
+    # flagged via the scanner? Match is on normalized LinkedIn URL, so it
+    # only fires for resolved supporters (the scanner exports email-only).
+    norm_li = _normalize_linkedin(connection.get("linkedinUrl") or "")
+    supporter_attributions = (
+        db_supporter_attribution_map().get(norm_li, []) if norm_li else []
+    )
+
     return {
         "id": cid,
         "name": f"{first} {last}".strip() or "(no name)",
@@ -2005,6 +2075,7 @@ def _enrich_connection(target, connection, requested_set=None, my_user_id=None):
         "assign_drafts": assign_drafts,
         "slack_configured": slack_on,
         "slack_channel_name": slack_channel,
+        "supporter_attributions": supporter_attributions,
         "draft_message": messages["plain"],
         "draft_html": messages["html"],
         "draft_plain_fallback": messages["plain_fallback"],
@@ -3437,6 +3508,8 @@ def db_import_teammate_scan(payload):
             )
             count += 1
         conn.commit()
+    # Scanner import changed which supporters exist — drop the badge cache.
+    invalidate_supporter_attribution_cache()
     return count, contributor_email, None
 
 
@@ -3448,7 +3521,9 @@ def db_remove_teammate_contributor(contributor_email):
             (contributor_email.strip().lower(),),
         )
         conn.commit()
-        return cur.rowcount
+    # Removing a contributor changes the badge map.
+    invalidate_supporter_attribution_cache()
+    return cur.rowcount
 
 
 # --- One-time sync worker ------------------------------------------------
