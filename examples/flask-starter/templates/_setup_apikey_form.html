@@ -1,0 +1,94 @@
+{# Paste-form for the Draftboard API key. Used both inline on /setup when no
+   key is configured, AND inside the "Replace API key" expandable when one is.
+
+   Validation flow:
+     1. Empty / wrong shape → bounce with api_key_error param, render banner
+     2. Network failure → bounce with api_key_error=network, show
+        "Save without verifying" follow-up button
+     3. Slack-style 401/403 → bounce with api_key_error=rejected
+     4. 200 → persist + reload + render success state on the next page load
+#}
+
+{# ---- Inline error banners ---- #}
+{% if api_key_error == "empty" %}
+  <div class="mt-2 text-xs text-rose-900 bg-rose-50 border border-rose-200 rounded px-3 py-2">
+    Paste your API key first.
+  </div>
+{% elif api_key_error == "bad_shape" %}
+  <div class="mt-2 text-xs text-rose-900 bg-rose-50 border border-rose-200 rounded px-3 py-2">
+    That doesn't look like a Draftboard key — they all start with <code>db-api_</code>. Double-check what you pasted.
+  </div>
+{% elif api_key_error == "too_long" %}
+  <div class="mt-2 text-xs text-rose-900 bg-rose-50 border border-rose-200 rounded px-3 py-2">
+    The pasted value is too long to be a Draftboard API key. Make sure you're not including extra whitespace or unrelated text.
+  </div>
+{% elif api_key_error == "rejected" %}
+  <div class="mt-2 text-xs text-rose-900 bg-rose-50 border border-rose-200 rounded px-3 py-2">
+    <strong>Draftboard rejected that key.</strong>
+    Check <a href="https://intros.draftboard.com" target="_blank" rel="noopener" class="underline">intros.draftboard.com → Settings → API Keys</a> — the key may have been revoked or never existed.
+  </div>
+{% elif api_key_error == "rate_limited" %}
+  <div class="mt-2 text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded px-3 py-2">
+    Draftboard rate-limited the validation call. Try again in a minute, or save without verifying (the next real request will fail loudly if the key is bad).
+  </div>
+{% elif api_key_error == "network" %}
+  <div class="mt-2 text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded px-3 py-2">
+    <strong>Couldn't reach Draftboard.</strong> Could be your internet, a corporate proxy, or DNS. You can save the key without verifying — the next real request will tell us if it's good.
+  </div>
+{% elif api_key_error and api_key_error.startswith("http_") %}
+  <div class="mt-2 text-xs text-rose-900 bg-rose-50 border border-rose-200 rounded px-3 py-2">
+    Unexpected response from Draftboard (HTTP {{ api_key_error[5:] }}). Try again, or save without verifying.
+  </div>
+{% endif %}
+
+{% if api_key_unverified %}
+  <div class="mt-2 text-xs text-emerald-900 bg-emerald-50 border border-emerald-200 rounded px-3 py-2">
+    Saved without verifying. The kit will start using this key immediately — if it's bad, you'll see a 403 on the next page load.
+  </div>
+{% endif %}
+
+{# ---- Paste form ---- #}
+<form method="POST" action="/setup/api-key" class="mt-3" autocomplete="off">
+  <label class="block">
+    <span class="text-xs uppercase tracking-wider text-slate-500">Paste your Draftboard API key</span>
+    <input type="text" name="api_key"
+           placeholder="db-api_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+           required pattern="db-api_.+" maxlength="256"
+           autofocus
+           spellcheck="false"
+           class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+  </label>
+  <div class="mt-3 flex items-center gap-2 flex-wrap">
+    <button type="submit"
+            onclick="this.disabled=true; this.textContent='Validating…'; this.form.submit();"
+            class="rounded-md bg-indigo-600 text-white px-4 py-1.5 text-sm font-medium hover:bg-indigo-700 disabled:opacity-60 disabled:cursor-not-allowed">
+      Validate &amp; save
+    </button>
+    {% if api_key_error == "network" or api_key_error == "rate_limited" %}
+      <button type="submit" name="save_unverified" value="1"
+              class="rounded-md border border-amber-400 bg-amber-50 text-amber-900 px-3 py-1.5 text-xs hover:bg-amber-100">
+        Save without verifying
+      </button>
+    {% endif %}
+  </div>
+</form>
+
+{# ---- Show me how to find my API key (the click-by-click) ---- #}
+<details class="mt-3 group">
+  <summary class="text-xs text-indigo-600 cursor-pointer hover:underline select-none">
+    Show me how to find my Draftboard API key →
+  </summary>
+  <div class="mt-3 px-4 py-3 rounded-md bg-slate-50 border border-slate-200 text-xs text-slate-700 leading-relaxed">
+    <ol class="list-decimal list-inside space-y-1.5">
+      <li>Open <a href="https://intros.draftboard.com" target="_blank" rel="noopener" class="text-indigo-600 hover:underline">intros.draftboard.com</a> and sign in to your workspace.</li>
+      <li>Click your avatar (top-right) → <strong>Settings</strong>.</li>
+      <li>In the left sidebar, click <strong>API Keys</strong>.</li>
+      <li>Click <strong>Generate API key</strong>. Give it a label (e.g. <code>local-starter-kit</code>) so you remember which install uses it.</li>
+      <li>Copy the key — it starts with <code>db-api_</code> and looks like a UUID. <strong>It's only shown once.</strong> If you lose it, generate a new one (and revoke the old).</li>
+      <li>Paste it into the field above and click <strong>Validate &amp; save</strong>.</li>
+    </ol>
+    <p class="mt-3 text-[11px] text-slate-500">
+      The key is stored locally in <code>~/.draftboard-secrets/draftboard-api-starter</code> with file permissions <code>0600</code> (owner-only). It never leaves your machine.
+    </p>
+  </div>
+</details>

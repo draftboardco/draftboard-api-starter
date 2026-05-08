@@ -176,11 +176,81 @@ API_KEY, _api_key_source = _load_api_key()
 if API_KEY:
     print(f"[draftboard-starter] Loaded API key from: {_api_key_source}")
 else:
-    print("[draftboard-starter] No API key found. Set one of:")
+    print("[draftboard-starter] No API key found. Visit the /setup page to paste one,")
+    print("  or set one of these and restart:")
     print("  - DRAFTBOARD_API_KEY environment variable")
     print("  - .env file in the app directory (DRAFTBOARD_API_KEY=db-api_...)")
     print("  - ~/.draftboard-secrets/draftboard-api-starter (file containing the key)")
-    print("  Then restart the server.")
+
+
+# Cache of the current API key so a paste in /setup is picked up live (next
+# request, no server restart). 5-second TTL means a manual edit to the secrets
+# file is also seen quickly. The module-global API_KEY is kept in sync as a
+# side-effect so existing `if not API_KEY:` guards still work.
+_API_KEY_CACHE_TTL = 5
+_api_key_cache = {"fetched_at": 0}
+
+
+def _current_api_key(force=False):
+    """Return the current Draftboard API key, reloading from disk if the
+    in-memory copy is older than _API_KEY_CACHE_TTL seconds (or if force=True
+    after a paste-and-save). Source-of-truth helper used by _auth_headers()."""
+    global API_KEY, _api_key_source
+    now = time.time()
+    if not force and (now - _api_key_cache["fetched_at"]) < _API_KEY_CACHE_TTL:
+        return API_KEY
+    new_key, new_source = _load_api_key()
+    API_KEY = new_key
+    _api_key_source = new_source
+    _api_key_cache["fetched_at"] = now
+    return API_KEY
+
+
+def _save_api_key_to_secrets(key: str) -> None:
+    """Write a Draftboard API key to ~/.draftboard-secrets/draftboard-api-starter
+    atomically. Reuses the exact 0600 + atomic-rename pattern as
+    _save_resolver_keys so a crash mid-write can't leave the file truncated
+    or world-readable. After the write, callers should invoke
+    _current_api_key(force=True) to pick the new value up live."""
+    secrets_dir = os.path.expanduser("~/.draftboard-secrets")
+    secrets_path = os.path.join(secrets_dir, "draftboard-api-starter")
+    os.makedirs(secrets_dir, mode=0o700, exist_ok=True)
+    tmp = secrets_path + ".tmp"
+    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write((key or "").strip() + "\n")
+    os.replace(tmp, secrets_path)
+
+
+def _validate_api_key(key: str, timeout: int = 10):
+    """Try GET /me with the given key. Returns (ok, me_or_reason).
+    - On 200: (True, me_dict_with_user+org)
+    - On 401/403: (False, "rejected")
+    - On 429: (False, "rate_limited")
+    - On any other HTTP: (False, "http_<code>")
+    - On network/timeout: (False, "network")
+    """
+    try:
+        r = requests.get(
+            f"{API_BASE}/me",
+            headers={
+                "Authorization": f"Bearer {(key or '').strip()}",
+                "Content-Type": "application/json",
+            },
+            timeout=timeout,
+        )
+    except requests.RequestException:
+        return False, "network"
+    if r.status_code == 200:
+        try:
+            return True, r.json()
+        except ValueError:
+            return False, "bad_response"
+    if r.status_code in (401, 403):
+        return False, "rejected"
+    if r.status_code == 429:
+        return False, "rate_limited"
+    return False, f"http_{r.status_code}"
 TARGETS_CACHE_TTL = 300  # 5 minutes; Refresh button forces a re-fetch
 TAGS_CACHE_TTL = 600  # 10 minutes
 CONNECTIONS_CACHE_TTL = 24 * 3600  # 24 hours; SQLite-persisted connections
@@ -1232,8 +1302,11 @@ _migrate_slack_channel_name_strip_hash()
 
 
 def _auth_headers():
+    # Route through _current_api_key() so a /setup paste is picked up live
+    # without restarting the server. The 5-second cache keeps disk I/O off
+    # the hot path of every request.
     return {
-        "Authorization": f"Bearer {API_KEY}",
+        "Authorization": f"Bearer {_current_api_key()}",
         "Content-Type": "application/json",
     }
 
@@ -2180,6 +2253,12 @@ def _enrich_target(t):
 
 @app.route("/", methods=["GET"])
 def targets_view():
+    # First-run nudge: brand-new install with no API key gets bounced to
+    # /setup so they have a paste field instead of an empty Targets page.
+    # The "Continue" / "Skip onboarding" actions on /setup write
+    # setup_dismissed=1 in app_state so this redirect doesn't fire again.
+    if not _current_api_key() and not db_app_state_get("setup_dismissed"):
+        return redirect(url_for("setup_view"))
     force_refresh = request.args.get("refresh") == "1"
     targets, error = fetch_all_targets(force=force_refresh)
 
@@ -3647,6 +3726,180 @@ def start_google_sync(creds):
 
 
 # --- Routes --------------------------------------------------------------
+
+# ---- Onboarding wizard ------------------------------------------------------
+# Single-page menu of the four integrations, each with a status pill +
+# "Set up" button that links to the existing per-feature wizard. The only
+# new UI is the Draftboard-API-key paste form (everything else is already
+# in /settings/slack, /settings/google, /settings/linkedin-resolver).
+
+def _onboarding_status():
+    """Status snapshot driving the four cards on /setup. Read-only —
+    composes existing helpers (slack_is_configured, _resolver_status,
+    google_status, db_get_app_state). Cheap to call on every render."""
+    api_key = _current_api_key()
+    api_key_me = None
+    if api_key:
+        # Use the cached /me result (populated whenever fetch_me() runs).
+        # This is a display-only value — the "you're connected as X" line.
+        # If the cache is empty we just show the key without the name.
+        raw = db_app_state_get("me_data")
+        if raw:
+            try:
+                api_key_me = json.loads(raw)
+            except (ValueError, TypeError):
+                api_key_me = None
+
+    google_email = (db_app_state_get("google_account_email") or "").strip()
+
+    resolver_keys = _load_resolver_keys()
+    rstatus = _resolver_status(resolver_keys)
+    # Detect "partial" — at least one key pasted but no method actually ready.
+    # E.g., user added google_cse_api_key but not google_cse_id, or added
+    # openai_api_key without the CSE pair.
+    any_key = any(
+        bool(resolver_keys.get(k)) for k in (
+            "apollo_api_key", "google_cse_api_key", "google_cse_id", "openai_api_key"
+        )
+    )
+    resolver_partial = any_key and not rstatus["any_ready"]
+
+    slack_done = slack_is_configured()
+    slack_channel = (db_get_slack_config("channel_name") or "").strip() if slack_done else ""
+
+    return {
+        "api_key": {
+            "done": bool(api_key),
+            "source": _api_key_source if api_key else "",
+            "me": api_key_me,  # dict with user_first/user_last/customer_name
+            "auto_sync_off": (not AUTO_SYNC_ENABLED) and bool(api_key),
+        },
+        "google": {
+            "done": bool(google_email),
+            "email": google_email,
+            "skipped": bool(db_app_state_get("setup_skipped_google")),
+        },
+        "resolver": {
+            "done": rstatus["any_ready"],
+            "partial": resolver_partial,
+            "apollo_ready": rstatus["apollo_ready"],
+            "cse_ready": rstatus["cse_ready"],
+            # For partial-state copy, we need to know which side is "almost done".
+            "has_apollo_key": bool(resolver_keys.get("apollo_api_key")),
+            "has_cse_key": bool(resolver_keys.get("google_cse_api_key")),
+            "has_cse_id": bool(resolver_keys.get("google_cse_id")),
+            "has_openai_key": bool(resolver_keys.get("openai_api_key")),
+            "skipped": bool(db_app_state_get("setup_skipped_resolver")),
+        },
+        "slack": {
+            "done": slack_done,
+            "channel": slack_channel,
+            "skipped": bool(db_app_state_get("setup_skipped_slack")),
+        },
+    }
+
+
+@app.route("/setup", methods=["GET"])
+def setup_view():
+    """First-run / onboarding menu. Lists the four integrations with their
+    current status and a 'Set up' button per row. Auto-redirected to from
+    `/` when no API key is configured (unless `setup_dismissed` is set)."""
+    return render_template(
+        "setup_wizard.html",
+        status=_onboarding_status(),
+        # Pass through any flash-style query param so the API-key form can
+        # show inline validation errors after a paste.
+        api_key_error=request.args.get("api_key_error", ""),
+        api_key_unverified=request.args.get("api_key_unverified") == "1",
+        active="setup",
+    )
+
+
+@app.route("/setup/api-key", methods=["POST"])
+def setup_save_api_key():
+    """Validate a pasted Draftboard API key and write it to
+    ~/.draftboard-secrets/draftboard-api-starter.
+
+    Validation: GET /me with the new key. Persist only on 200, except if the
+    user opted into 'save without verifying' (network/timeout escape hatch
+    for corporate-proxy / offline cases).
+
+    Replace flow: if a key is already configured, the form sends `replace=1`
+    along with the new value. We re-validate before swapping; on rejection
+    the existing key is preserved unchanged."""
+    pasted = (request.form.get("api_key") or "").strip()
+    save_unverified = request.form.get("save_unverified") == "1"
+
+    if not pasted:
+        return redirect(url_for("setup_view", api_key_error="empty"))
+    if not pasted.startswith("db-api_"):
+        # Cheap shape check — Draftboard keys all start with this prefix.
+        # Saves a round-trip when the user pastes something obviously wrong.
+        return redirect(url_for("setup_view", api_key_error="bad_shape"))
+    if len(pasted) > 256:
+        return redirect(url_for("setup_view", api_key_error="too_long"))
+
+    if save_unverified:
+        # Network failed earlier; user explicitly chose to save anyway.
+        _save_api_key_to_secrets(pasted)
+        _current_api_key(force=True)
+        return redirect(url_for("setup_view", api_key_unverified="1"))
+
+    ok, payload = _validate_api_key(pasted)
+    if not ok:
+        if payload == "network":
+            # Don't persist — bounce back with a flag that lets the form show
+            # a "save without verifying" follow-up button.
+            return redirect(url_for("setup_view", api_key_error="network"))
+        return redirect(url_for("setup_view", api_key_error=payload))
+
+    # 200 OK — persist and refresh the in-process cache.
+    _save_api_key_to_secrets(pasted)
+    _current_api_key(force=True)
+    # Cache the /me payload so the success card can render
+    # "Connected as X · Org" without an extra round-trip.
+    try:
+        db_app_state_set("me_data", json.dumps(payload))
+    except (TypeError, ValueError):
+        pass
+    return redirect(url_for("setup_view"))
+
+
+@app.route("/setup/skip", methods=["POST"])
+def setup_skip():
+    """Mark one optional integration as skipped so it doesn't nag the user.
+    Reversible: clicking 'Set up anyway' on the skipped card just navigates
+    to the integration's setup page. Configured-state always trumps skip."""
+    which = (request.form.get("which") or "").strip()
+    if which not in ("google", "resolver", "slack"):
+        return redirect(url_for("setup_view"))
+    db_app_state_set(f"setup_skipped_{which}", str(int(time.time())))
+    return redirect(url_for("setup_view"))
+
+
+@app.route("/setup/unskip", methods=["POST"])
+def setup_unskip():
+    """Clear the skip flag on an integration so it re-renders as Not set up.
+    Doesn't navigate the user to the integration page — the card will offer
+    the 'Set up' button again on next render."""
+    which = (request.form.get("which") or "").strip()
+    if which not in ("google", "resolver", "slack"):
+        return redirect(url_for("setup_view"))
+    with _db_lock, _db_connect() as conn:
+        conn.execute("DELETE FROM app_state WHERE key = ?", (f"setup_skipped_{which}",))
+        conn.commit()
+    return redirect(url_for("setup_view"))
+
+
+@app.route("/setup/dismiss", methods=["POST"])
+def setup_dismiss():
+    """Permanent dismiss — used by the 'Continue' button at the bottom of
+    /setup. Sets app_state.setup_dismissed=1 so the auto-redirect from `/`
+    stops firing on subsequent visits. The user can return to /setup any
+    time via the nav link to manage integrations."""
+    db_app_state_set("setup_dismissed", str(int(time.time())))
+    return redirect(url_for("targets_view"))
+
 
 @app.route("/settings/google", methods=["GET"])
 def settings_google_view():
