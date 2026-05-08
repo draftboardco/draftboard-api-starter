@@ -4220,10 +4220,16 @@ def candidates_set_status():
 
 @app.route("/candidates/unresolved", methods=["GET"])
 def candidates_unresolved_list():
-    """Return up to 500 (name, email) pairs the bulk-resolve button can feed
+    """Return up to 50 (name, email) pairs the bulk-resolve button can feed
     into /candidates/resolve/batch. The JS pulls a chunk, posts it, then
-    pulls the next chunk until the count drops to 0."""
-    rows = db_unresolved_candidate_emails(limit=500)
+    pulls the next chunk until the count drops to 0.
+
+    Chunk size sized so the user sees progress every ~30-60 seconds even on
+    free-tier resolver keys (where the throttle keeps each batch around 1
+    req/sec). Larger chunks mean the browser sees no UI update for minutes
+    at a time and the customer assumes the page is broken — which is worse
+    than the rate-limit problem the throttle solved."""
+    rows = db_unresolved_candidate_emails(limit=50)
     return jsonify({
         "count": len(rows),
         "remaining": db_count_unresolved_candidates(),
@@ -4930,14 +4936,56 @@ def _looks_like_email(value: str) -> bool:
 
 
 RESOLVE_BATCH_MAX = 500
-RESOLVE_BATCH_WORKERS = 5
+
+
+def _safe_int_env(name: str, default: int, floor: int = 1) -> int:
+    """Read an int env var with a try/except so a fat-fingered value
+    (e.g. RESOLVE_BATCH_WORKERS=foo) doesn't crash app boot. Floors at
+    `floor` to guard against ThreadPoolExecutor(max_workers=0) raising
+    at first request — silent foot-gun otherwise."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(floor, int(raw))
+    except ValueError:
+        print(f"[draftboard-starter] {name}={raw!r} isn't an int — using default {default}.")
+        return default
+
+
+def _safe_float_env(name: str, default: float, floor: float = 0.0) -> float:
+    """Same as _safe_int_env but for floats. Floors at `floor` so a
+    negative value can't make time.sleep raise."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(floor, float(raw))
+    except ValueError:
+        print(f"[draftboard-starter] {name}={raw!r} isn't a float — using default {default}.")
+        return default
+
+
+# Default to a politer pace than the original 5-workers-no-delay: 2 workers,
+# 0.5s delay between calls per worker. Cache hits skip the delay (no network
+# call → no need to throttle). The original could blow Google CSE's free
+# 100/day quota in seconds and trip Apollo's per-minute throttle on free
+# tiers. Tunable via env if your keys can take more — both clamp to safe
+# values on malformed input.
+RESOLVE_BATCH_WORKERS = _safe_int_env("RESOLVE_BATCH_WORKERS", 2, floor=1)
+RESOLVE_BATCH_DELAY_SEC = _safe_float_env("RESOLVE_BATCH_DELAY_SEC", 0.5, floor=0.0)
 
 
 def _resolve_one_for_batch(name: str, email: str, keys: dict, force: bool) -> dict:
     """Single-row resolver used by the batch worker pool. Mirrors the
     cache-first logic of /candidates/resolve. Always returns the same shape
     so the caller can build a uniform response regardless of which branch
-    fired (cache hit, malformed input, fresh resolution)."""
+    fired (cache hit, malformed input, fresh resolution).
+
+    After a fresh network call, sleeps RESOLVE_BATCH_DELAY_SEC so the worker
+    paces itself — this is the rate-limit guard for Apollo + Google CSE +
+    OpenAI. Cache hits and input-validation early-returns skip the sleep
+    (no network call happened, no need to throttle)."""
     out_email = email.strip().lower()
     base_err = {
         "email": out_email, "name": name,
@@ -4954,7 +5002,7 @@ def _resolve_one_for_batch(name: str, email: str, keys: dict, force: bool) -> di
     if not force:
         cached = db_get_resolution(email)
         if cached is not None:
-            return cached  # already shape-matched
+            return cached  # already shape-matched — no network, no throttle
 
     result = resolve_linkedin(
         name, email,
@@ -4965,6 +5013,11 @@ def _resolve_one_for_batch(name: str, email: str, keys: dict, force: bool) -> di
     )
     db_put_resolution(email, name, result)
     result.pop("_transient", None)
+    # Per-worker pacing — runs AFTER the network call, so the next call from
+    # this worker has to wait. With 2 workers, peak rate is ~2/(latency+delay)
+    # which for ~1s latency means ~1.3 req/sec — gentle enough for free tiers.
+    if RESOLVE_BATCH_DELAY_SEC > 0:
+        time.sleep(RESOLVE_BATCH_DELAY_SEC)
     return {
         "email": out_email,
         "name": name,

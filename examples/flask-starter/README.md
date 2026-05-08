@@ -35,30 +35,23 @@ python3 -m venv .venv
 
 Get one in the Draftboard web app at **Settings → API Keys → "Generate API key"**.
 
-The app checks for the key in three places (in priority order). Pick whichever fits your workflow:
+**Recommended path: paste in the browser.** Just run the app (next step) — it'll auto-redirect to a `/setup` page where you paste the key into a form. The wizard validates it against `/me` and writes it to `~/.draftboard-secrets/draftboard-api-starter` with file permissions `0600` (owner-only). The key never leaves your machine except for that one validation call back to Draftboard's own API.
 
-**Option A — `.env` file in this folder** (most common):
+If you'd rather drop the key in manually, the app checks for it in these three places (priority order):
 
-```bash
-cp env.example .env
-# then edit .env to paste your real db-api_... key
-```
+1. **`DRAFTBOARD_API_KEY` environment variable** (typical for CI / Docker):
+   ```bash
+   export DRAFTBOARD_API_KEY=db-api_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+   ```
 
-`.env` is gitignored.
+2. **`.env` file in this folder** — `cp env.example .env`, then edit. `.env` is gitignored.
 
-**Option B — `~/.draftboard-secrets/` shared secrets dir** (if you have multiple Draftboard tools that all need the same key):
-
-```bash
-mkdir -p ~/.draftboard-secrets
-echo "db-api_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" > ~/.draftboard-secrets/draftboard-api-starter
-chmod 600 ~/.draftboard-secrets/draftboard-api-starter
-```
-
-**Option C — environment variable** (for CI, Docker, etc.):
-
-```bash
-export DRAFTBOARD_API_KEY=db-api_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-```
+3. **`~/.draftboard-secrets/draftboard-api-starter`** — a single line containing the key. Shared across other Draftboard tools that use the same convention:
+   ```bash
+   mkdir -p ~/.draftboard-secrets
+   echo "db-api_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" > ~/.draftboard-secrets/draftboard-api-starter
+   chmod 600 ~/.draftboard-secrets/draftboard-api-starter
+   ```
 
 The startup log prints which source the key was loaded from so you can verify.
 
