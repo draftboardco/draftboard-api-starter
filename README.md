@@ -1,10 +1,28 @@
 # Draftboard API Starter
 
-Context kit for AI assistants to help you build mini-apps on top of the Draftboard Integration API.
+Context kit for AI assistants + a working reference Flask app on top of the Draftboard Integration API.
+
+## Quick start
+
+If you have a Draftboard API key already and just want to run the reference Flask app:
+
+```bash
+cd examples/flask-starter
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python app.py
+```
+
+Then open http://localhost:5050. The first page walks you through pasting your API key + setting up the optional integrations (Google Workspace, LinkedIn resolver, Slack notifications). Nothing leaves your machine — the kit runs fully on your laptop and persists data to a local SQLite file.
+
+(Need an API key? Generate one at [intros.draftboard.com](https://intros.draftboard.com) → Settings → API Keys.)
 
 ## Who this is for
 
-You have a Draftboard API key (Settings → API Keys → "Generate API key" in the Draftboard web app) and you want your AI assistant to help you build something useful with it — a daily Slack alert, a CRM enrichment script, a custom dashboard, anything.
+Two audiences:
+
+- **Developers building on the Draftboard API.** You have a key and you want your AI assistant to help you build something on top of it — a daily Slack alert, a CRM enrichment script, a custom dashboard, anything. The context files in this repo (`CONTEXT.md`, `cursor-rules/draftboard.mdc`, `claude-skill/`) get your AI tool up to speed on the API surface in one paste.
+- **Sales teams who want a self-hosted network-mapping tool.** The Flask app at `examples/flask-starter/` is a working reference UI — the same Targets / Accounts / Connections views you get on intros.draftboard.com, running on your own laptop, with optional add-ons the web app doesn't have: Slack-channel notifications when teammates assign paths, a Supporters page that ranks contacts you actually engage with via Gmail + Calendar, and a portable scanner so a teammate can contribute their own network without needing a paid Draftboard seat.
 
 ## How to use it
 

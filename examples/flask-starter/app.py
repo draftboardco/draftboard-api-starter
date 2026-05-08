@@ -4930,14 +4930,25 @@ def _looks_like_email(value: str) -> bool:
 
 
 RESOLVE_BATCH_MAX = 500
-RESOLVE_BATCH_WORKERS = 5
+# Default to a politer pace than the original (2 workers, 0.5s delay between
+# calls per worker — peak ~2 net req/sec across Apollo+CSE+OpenAI). The
+# original 5 workers with no delay could easily blow Google CSE's free 100/
+# day quota in seconds and trip Apollo's per-minute throttle on free tiers.
+# Tunable via env if your keys can take more.
+RESOLVE_BATCH_WORKERS = int(os.environ.get("RESOLVE_BATCH_WORKERS", "2"))
+RESOLVE_BATCH_DELAY_SEC = float(os.environ.get("RESOLVE_BATCH_DELAY_SEC", "0.5"))
 
 
 def _resolve_one_for_batch(name: str, email: str, keys: dict, force: bool) -> dict:
     """Single-row resolver used by the batch worker pool. Mirrors the
     cache-first logic of /candidates/resolve. Always returns the same shape
     so the caller can build a uniform response regardless of which branch
-    fired (cache hit, malformed input, fresh resolution)."""
+    fired (cache hit, malformed input, fresh resolution).
+
+    After a fresh network call, sleeps RESOLVE_BATCH_DELAY_SEC so the worker
+    paces itself — this is the rate-limit guard for Apollo + Google CSE +
+    OpenAI. Cache hits and input-validation early-returns skip the sleep
+    (no network call happened, no need to throttle)."""
     out_email = email.strip().lower()
     base_err = {
         "email": out_email, "name": name,
@@ -4954,7 +4965,7 @@ def _resolve_one_for_batch(name: str, email: str, keys: dict, force: bool) -> di
     if not force:
         cached = db_get_resolution(email)
         if cached is not None:
-            return cached  # already shape-matched
+            return cached  # already shape-matched — no network, no throttle
 
     result = resolve_linkedin(
         name, email,
@@ -4965,6 +4976,11 @@ def _resolve_one_for_batch(name: str, email: str, keys: dict, force: bool) -> di
     )
     db_put_resolution(email, name, result)
     result.pop("_transient", None)
+    # Per-worker pacing — runs AFTER the network call, so the next call from
+    # this worker has to wait. With 2 workers, peak rate is ~2/(latency+delay)
+    # which for ~1s latency means ~1.3 req/sec — gentle enough for free tiers.
+    if RESOLVE_BATCH_DELAY_SEC > 0:
+        time.sleep(RESOLVE_BATCH_DELAY_SEC)
     return {
         "email": out_email,
         "name": name,
