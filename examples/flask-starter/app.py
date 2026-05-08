@@ -334,27 +334,34 @@ def _inject_globals():
             me_data = {}
     customer_name = (me_data.get("customer_name") or "").strip()
     full_name = f"{me_data.get('user_first') or ''} {me_data.get('user_last') or ''}".strip()
+    # Customers reporting "I can't paste my API key" by definition have no /me
+    # data yet — the placeholder text in those rows should match that reality
+    # rather than a generic "(not loaded)" that reads like a bug.
+    customer_label = customer_name or "(no Draftboard API key configured yet)"
+    name_label = full_name or "(no Draftboard API key configured yet)"
     body_lines = [
         "Hi Zach,",
         "",
         "[Describe what's working, not working, or what you'd like to see]",
         "",
         "— Auto-filled context —",
-        f"Draftboard customer: {customer_name or '(not loaded)'}",
-        f"My name on the account: {full_name or '(not loaded)'}",
+        f"Draftboard customer: {customer_label}",
+        f"My name on the account: {name_label}",
         f"Kit version: {KIT_VERSION}",
         "",
         "Thanks!",
     ]
     from urllib.parse import quote
+    # quote() the email address so an attacker-controlled KIT_AUTHOR_EMAIL
+    # env value can't inject a second `&body=` param that overrides ours.
+    safe_email = quote(KIT_AUTHOR_EMAIL, safe="@")
     feedback_mailto = (
-        f"mailto:{KIT_AUTHOR_EMAIL}"
+        f"mailto:{safe_email}"
         f"?subject={quote('Draftboard kit feedback / bug report')}"
         f"&body={quote(chr(10).join(body_lines))}"
     )
     return {
         "feedback_mailto": feedback_mailto,
-        "kit_version": KIT_VERSION,
     }
 
 # Per-field input caps for resolve endpoints. Apollo / CSE / OpenAI all reject
@@ -4171,8 +4178,12 @@ def settings_google_view():
         "Thanks!",
     ]
     from urllib.parse import quote
+    # quote() the email address so an attacker-controlled KIT_AUTHOR_EMAIL
+    # env value can't inject a second `&body=` param. Same fix as the
+    # feedback_mailto in the global context_processor.
+    safe_email = quote(KIT_AUTHOR_EMAIL, safe="@")
     mailto = (
-        f"mailto:{KIT_AUTHOR_EMAIL}"
+        f"mailto:{safe_email}"
         f"?subject={quote(subject)}"
         f"&body={quote(chr(10).join(body_lines))}"
     )
