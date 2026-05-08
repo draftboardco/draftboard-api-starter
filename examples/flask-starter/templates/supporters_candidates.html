@@ -500,7 +500,7 @@
                 return;
               }
               bulkProgress.textContent =
-                'Looking up ' + data.contacts.length + ' contacts (' + remaining + ' total remaining). This batch takes ~1-3 min…';
+                'Looking up ' + data.contacts.length + ' contacts (' + remaining + ' to go) — this chunk takes ~30-60s on free-tier keys…';
               return fetch('/candidates/resolve/batch', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },

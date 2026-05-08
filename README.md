@@ -13,7 +13,7 @@ python3 -m venv .venv
 .venv/bin/python app.py
 ```
 
-Then open http://localhost:5050. The first page walks you through pasting your API key + setting up the optional integrations (Google Workspace, LinkedIn resolver, Slack notifications). Nothing leaves your machine — the kit runs fully on your laptop and persists data to a local SQLite file.
+Then open http://localhost:5050. The first page walks you through pasting your API key + setting up the optional integrations (Google Workspace, LinkedIn resolver, Slack notifications). Your data stays on your laptop — the kit persists everything to a local SQLite file and only makes outbound HTTPS calls to the services you've configured (Draftboard, Google, Apollo, OpenAI, Slack). No third-party server in between.
 
 (Need an API key? Generate one at [intros.draftboard.com](https://intros.draftboard.com) → Settings → API Keys.)
 
@@ -22,7 +22,7 @@ Then open http://localhost:5050. The first page walks you through pasting your A
 Two audiences:
 
 - **Developers building on the Draftboard API.** You have a key and you want your AI assistant to help you build something on top of it — a daily Slack alert, a CRM enrichment script, a custom dashboard, anything. The context files in this repo (`CONTEXT.md`, `cursor-rules/draftboard.mdc`, `claude-skill/`) get your AI tool up to speed on the API surface in one paste.
-- **Sales teams who want a self-hosted network-mapping tool.** The Flask app at `examples/flask-starter/` is a working reference UI — the same Targets / Accounts / Connections views you get on intros.draftboard.com, running on your own laptop, with optional add-ons the web app doesn't have: Slack-channel notifications when teammates assign paths, a Supporters page that ranks contacts you actually engage with via Gmail + Calendar, and a portable scanner so a teammate can contribute their own network without needing a paid Draftboard seat.
+- **Sales teams who want a network-mapping tool that runs on their laptop.** The Flask app at `examples/flask-starter/` is a working reference UI — Targets / Accounts / Connections views similar to the ones on intros.draftboard.com, running locally on `localhost:5050`, with optional add-ons the web app doesn't have: Slack-channel notifications when teammates assign paths, a Supporters page that ranks contacts you actually engage with via Gmail + Calendar, and a portable scanner so a teammate can contribute their own network as a JSON export.
 
 ## How to use it
 

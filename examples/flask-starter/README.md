@@ -35,7 +35,7 @@ python3 -m venv .venv
 
 Get one in the Draftboard web app at **Settings → API Keys → "Generate API key"**.
 
-**Fastest path: skip this step now.** Just run the app (next step) — it'll auto-redirect to a `/setup` page where you paste the key in the browser. The wizard validates it against `/me` and persists to `~/.draftboard-secrets/draftboard-api-starter` with file permissions `0600` (owner-only). Nothing leaves your machine.
+**Recommended path: paste in the browser.** Just run the app (next step) — it'll auto-redirect to a `/setup` page where you paste the key into a form. The wizard validates it against `/me` and writes it to `~/.draftboard-secrets/draftboard-api-starter` with file permissions `0600` (owner-only). The key never leaves your machine except for that one validation call back to Draftboard's own API.
 
 If you'd rather drop the key in manually, the app checks for it in these three places (priority order):
 
