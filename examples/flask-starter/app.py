@@ -656,6 +656,39 @@ def init_db():
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_candidate_status_status ON candidate_status(status)")
 
+        # Per-supporter relationship category (customer / investor / vendor /
+        # friend / coworker / unclassified). Populated by the categorizer
+        # which uses, in priority order: manual override > user-uploaded
+        # match rules > built-in heuristics > LLM fallback (gpt-4o-mini if
+        # OpenAI key is configured) > unclassified.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS candidate_categories (
+                email TEXT PRIMARY KEY,
+                category TEXT NOT NULL,
+                confidence TEXT NOT NULL,
+                source TEXT NOT NULL,
+                reasoning TEXT,
+                classified_at INTEGER NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_candidate_categories_category ON candidate_categories(category)")
+
+        # User-uploaded match rules feeding the categorizer. The customer
+        # pastes lists of (names | domains | emails) per category at
+        # /settings/categorization. Each row is one rule. Looked up in
+        # the categorizer with simple case-insensitive matching.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS category_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL,
+                rule_type TEXT NOT NULL,
+                value TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE(category, rule_type, value)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_category_rules_value ON category_rules(value)")
+
         # Migration: drop the older `oauth_tokens` + `google_sync_state` tables
         # from the BYO architecture. Their data was always per-install and
         # ephemeral, so dropping is safe.
@@ -3440,7 +3473,7 @@ def score_contact(emails_sent, replies_received, threads_count, meetings_count, 
     return int(base * recency)
 
 
-def db_query_candidates(limit=200, offset=0, query="", contributor="", source="", status_filter="active"):
+def db_query_candidates(limit=200, offset=0, query="", contributor="", source="", status_filter="active", category_filter=""):
     """Merge gmail + calendar contacts (the local user's own scan) AND any
     imported teammate scans, score each, return top N.
 
@@ -3563,6 +3596,17 @@ def db_query_candidates(limit=200, offset=0, query="", contributor="", source=""
             "SELECT email, linkedin_url FROM linkedin_resolutions WHERE linkedin_url IS NOT NULL AND linkedin_url != ''"
         )
         resolved_map = {r[0]: r[1] for r in resolved_cur.fetchall()}
+        # Cross-teammate signal — for each email, how many DISTINCT teammate
+        # contributors have it in their scanner upload? When >= 2, surface a
+        # "Known by N teammates" badge on the row. Strong signal that the
+        # supporter is well-connected across the org, not just to one person.
+        teammate_count_cur = conn.execute(
+            "SELECT email, COUNT(DISTINCT contributor_email) "
+            "FROM teammate_contacts "
+            "GROUP BY email "
+            "HAVING COUNT(DISTINCT contributor_email) >= 2"
+        )
+        teammate_count_map = {r[0]: r[1] for r in teammate_count_cur.fetchall()}
     candidates = []
     for r in rows:
         contributor_email = r[0]
@@ -3619,10 +3663,305 @@ def db_query_candidates(limit=200, offset=0, query="", contributor="", source=""
             "contributor_label": contributor_label,
             "row_status": row_status,
             "is_first_degree": is_first_degree,
+            "teammate_count": teammate_count_map.get(email, 0),
+            # Category populated lazily after the loop (avoids per-row DB hit).
+            "category": "unclassified",
+            "category_source": "default",
         })
+    # Hydrate categories from the cache in one pass (single DB query, not
+    # per-row). Misses stay 'unclassified' until the bulk categorize-now
+    # button runs OR the user manually overrides one.
+    if candidates:
+        emails_in_page = [c["email"] for c in candidates]
+        with _db_lock, _db_connect() as conn:
+            placeholders = ",".join("?" * len(emails_in_page))
+            cat_cur = conn.execute(
+                f"SELECT email, category, source FROM candidate_categories "
+                f"WHERE email IN ({placeholders})",
+                emails_in_page,
+            )
+            cat_map = {r[0]: (r[1], r[2]) for r in cat_cur.fetchall()}
+        for c in candidates:
+            cat = cat_map.get(c["email"])
+            if cat:
+                c["category"] = cat[0]
+                c["category_source"] = cat[1]
+
+    # Category filter applied AFTER hydration so 'unclassified' actually
+    # filters everything that hasn't been categorized.
+    cat_filter = (category_filter or "").strip().lower()
+    if cat_filter and cat_filter in CATEGORY_VALUES:
+        candidates = [c for c in candidates if c["category"] == cat_filter]
+
     candidates.sort(key=lambda c: (-c["score"], -c["threads_count"], c["email"]))
     total = len(candidates)
     return candidates[offset:offset + limit], total
+
+
+# ---- Categorization (customer / investor / vendor / friend / coworker) ----
+
+CATEGORY_VALUES = ("customer", "investor", "vendor", "friend", "coworker", "unclassified")
+CATEGORY_DISPLAY = {
+    "customer":     ("🏢", "Customer",      "bg-emerald-100 text-emerald-800"),
+    "investor":     ("💰", "Investor",      "bg-amber-100 text-amber-800"),
+    "vendor":       ("🤝", "Vendor",        "bg-sky-100 text-sky-800"),
+    "friend":       ("👋", "Friend",        "bg-pink-100 text-pink-800"),
+    "coworker":     ("💼", "Coworker",      "bg-indigo-100 text-indigo-800"),
+    "unclassified": ("•",  "Unclassified",  "bg-slate-100 text-slate-600"),
+}
+
+# Personal email TLDs — used by the heuristic to default to "friend" when
+# no rule matches. Conservative list; covers ~95% of personal mailboxes.
+_PERSONAL_EMAIL_DOMAINS = frozenset((
+    "gmail.com", "googlemail.com", "icloud.com", "me.com", "mac.com",
+    "yahoo.com", "ymail.com", "hotmail.com", "outlook.com", "live.com",
+    "aol.com", "msn.com", "protonmail.com", "proton.me", "pm.me",
+    "fastmail.com", "fastmail.fm", "duck.com", "tutanota.com",
+))
+
+
+def db_save_category_rules(category: str, rule_type: str, values: list[str]):
+    """REPLACE all rules of (category, rule_type) with the new value list.
+    Empty strings are skipped. Case is preserved for display but matching
+    is case-insensitive everywhere downstream."""
+    if category not in CATEGORY_VALUES or rule_type not in ("name", "domain", "email"):
+        return
+    cleaned = [v.strip() for v in (values or []) if v and v.strip()]
+    now = int(time.time())
+    with _db_lock, _db_connect() as conn:
+        conn.execute(
+            "DELETE FROM category_rules WHERE category = ? AND rule_type = ?",
+            (category, rule_type),
+        )
+        for v in cleaned:
+            conn.execute(
+                "INSERT OR IGNORE INTO category_rules (category, rule_type, value, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (category, rule_type, v, now),
+            )
+        conn.commit()
+
+
+def db_get_category_rules() -> dict:
+    """Returns nested dict {category: {rule_type: [values]}}. Used by both
+    the settings page (to render the textareas with current values) and
+    the categorizer (to match against)."""
+    out = {c: {"name": [], "domain": [], "email": []} for c in CATEGORY_VALUES}
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT category, rule_type, value FROM category_rules ORDER BY category, rule_type, value"
+        )
+        for cat, rt, val in cur.fetchall():
+            if cat in out and rt in out[cat]:
+                out[cat][rt].append(val)
+    return out
+
+
+def db_get_candidate_category(email: str) -> dict | None:
+    """Return the cached category dict for an email or None. Shape matches
+    what _categorize_candidate produces (category, confidence, source,
+    reasoning, classified_at)."""
+    if not email:
+        return None
+    key = email.strip().lower()
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT category, confidence, source, reasoning, classified_at "
+            "FROM candidate_categories WHERE email = ?",
+            (key,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "category": row[0],
+        "confidence": row[1],
+        "source": row[2],
+        "reasoning": row[3] or "",
+        "classified_at": row[4],
+    }
+
+
+def db_save_candidate_category(email: str, category: str, source: str,
+                                confidence: str = "medium", reasoning: str = ""):
+    """Upsert a categorization. Called by the bulk categorizer AND by the
+    manual-override route. Source semantics: 'manual' > 'rule' > 'heuristic'
+    > 'llm' (priority for re-classification — manual is sticky and never
+    overwritten by automated runs)."""
+    if not email or category not in CATEGORY_VALUES:
+        return
+    key = email.strip().lower()
+    with _db_lock, _db_connect() as conn:
+        conn.execute(
+            "INSERT INTO candidate_categories (email, category, confidence, source, reasoning, classified_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(email) DO UPDATE SET "
+            "  category = excluded.category, confidence = excluded.confidence, "
+            "  source = excluded.source, reasoning = excluded.reasoning, "
+            "  classified_at = excluded.classified_at",
+            (key, category, confidence, source, reasoning, int(time.time())),
+        )
+        conn.commit()
+
+
+def _categorize_by_rules(email: str, name: str, rules: dict) -> tuple[str, str] | None:
+    """Match a contact against the user-uploaded category rules.
+    Returns (category, reasoning) on match, None if nothing matched.
+
+    Match precedence within a category:
+      1. exact email match (highest)
+      2. domain match
+      3. case-insensitive substring name match (lowest)
+    Across categories, the first matching category wins (in CATEGORY_VALUES order).
+    """
+    em = (email or "").strip().lower()
+    nm = (name or "").strip().lower()
+    domain = em.rsplit("@", 1)[-1] if "@" in em else ""
+    for category in CATEGORY_VALUES[:-1]:  # skip 'unclassified'
+        cat_rules = rules.get(category, {})
+        # Exact email match
+        for rule_email in cat_rules.get("email", []):
+            if rule_email.strip().lower() == em:
+                return category, f"email matches '{rule_email}'"
+        # Domain match
+        for rule_domain in cat_rules.get("domain", []):
+            rd = rule_domain.strip().lower().lstrip("@")
+            if rd and domain == rd:
+                return category, f"domain matches '{rd}'"
+        # Name substring match (case-insensitive)
+        for rule_name in cat_rules.get("name", []):
+            rn = rule_name.strip().lower()
+            if rn and (rn in nm or rn in em):
+                return category, f"name contains '{rule_name}'"
+    return None
+
+
+def _categorize_by_heuristic(email: str) -> tuple[str, str] | None:
+    """Fallback heuristic. Currently just: personal-email domain → friend.
+    Returns (category, reasoning) or None.
+
+    Conservative on purpose — heuristics that guess wrong are worse than
+    leaving things 'unclassified' (which the user can manually override
+    or feed via category rules)."""
+    em = (email or "").strip().lower()
+    if "@" not in em:
+        return None
+    domain = em.rsplit("@", 1)[-1]
+    if domain in _PERSONAL_EMAIL_DOMAINS:
+        return "friend", f"{domain} is a personal-email provider"
+    return None
+
+
+def _categorize_by_llm(email: str, name: str, linkedin_url: str = "") -> tuple[str, str, str] | None:
+    """Optional LLM fallback. Calls gpt-4o-mini if OPENAI_API_KEY is
+    configured (via the resolver-keys file). Returns (category, confidence,
+    reasoning) or None when no key / no answer.
+
+    Prompt asks the model to pick from the 5 categories or 'unclassified'.
+    Cheap (~$0.0001 per call) but only worth running once per email — the
+    result is cached in candidate_categories with source='llm'."""
+    keys = _load_resolver_keys()
+    openai_key = keys.get("openai_api_key", "").strip()
+    if not openai_key:
+        return None
+    try:
+        from openai import OpenAI
+    except ImportError:
+        return None
+    em = (email or "").strip()
+    nm = (name or "").strip()
+    if not em:
+        return None
+    user_prompt = (
+        f"Classify this contact's likely relationship to the person who has them in their address book.\n\n"
+        f"Name: {nm or '(unknown)'}\n"
+        f"Email: {em}\n"
+        f"LinkedIn: {linkedin_url or '(not resolved)'}\n\n"
+        "Pick exactly one category:\n"
+        "  customer     - they pay (or work for a company that pays) the address-book owner\n"
+        "  investor     - they're a VC, angel, or board member\n"
+        "  vendor       - they sell something to the address-book owner, or are a partner/agency\n"
+        "  friend       - personal connection, not a work relationship\n"
+        "  coworker     - they work or worked at the same company as the address-book owner\n"
+        "  unclassified - genuinely can't tell\n\n"
+        "Respond with ONLY the category word on the first line, then a one-sentence reason on the second line."
+    )
+    try:
+        client = OpenAI(api_key=openai_key)
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You classify B2B contacts. Be conservative — pick 'unclassified' over guessing wrong."},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0,
+            max_tokens=80,
+            timeout=15,
+        )
+        text = (resp.choices[0].message.content or "").strip()
+    except Exception:
+        return None
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return None
+    cat_word = lines[0].lower().strip().rstrip(".,:;")
+    if cat_word not in CATEGORY_VALUES:
+        return None
+    reasoning = (lines[1] if len(lines) > 1 else "").strip()
+    return cat_word, "low", f"LLM ({cat_word}): {reasoning}"
+
+
+def _categorize_candidate(email: str, name: str = "", linkedin_url: str = "",
+                           rules: dict | None = None,
+                           use_llm: bool = False) -> dict:
+    """The full categorization pipeline. Priority:
+      1. Manual override in candidate_categories (source='manual') — sticky
+      2. User-uploaded category rules
+      3. Built-in heuristics (personal email domains)
+      4. LLM fallback (only when use_llm=True AND OpenAI key configured)
+      5. Default: unclassified
+
+    Persists the result (except for source='manual', which is preserved as-is)
+    and returns the dict. `rules` is passed in by the bulk-categorize path
+    so a single rule load covers many candidates.
+    """
+    em = (email or "").strip().lower()
+    if not em:
+        return {"category": "unclassified", "confidence": "low", "source": "default", "reasoning": ""}
+
+    existing = db_get_candidate_category(em)
+    if existing and existing.get("source") == "manual":
+        # Sticky — never overwrite a manual override.
+        return existing
+
+    if rules is None:
+        rules = db_get_category_rules()
+
+    # 2. User-uploaded rules
+    matched = _categorize_by_rules(em, name, rules)
+    if matched:
+        cat, why = matched
+        db_save_candidate_category(em, cat, "rule", "high", why)
+        return {"category": cat, "confidence": "high", "source": "rule", "reasoning": why}
+
+    # 3. Built-in heuristics
+    matched = _categorize_by_heuristic(em)
+    if matched:
+        cat, why = matched
+        db_save_candidate_category(em, cat, "heuristic", "medium", why)
+        return {"category": cat, "confidence": "medium", "source": "heuristic", "reasoning": why}
+
+    # 4. LLM fallback (opt-in, gated on OpenAI key)
+    if use_llm:
+        llm_match = _categorize_by_llm(em, name, linkedin_url)
+        if llm_match:
+            cat, conf, why = llm_match
+            db_save_candidate_category(em, cat, "llm", conf, why)
+            return {"category": cat, "confidence": conf, "source": "llm", "reasoning": why}
+
+    # 5. Default
+    db_save_candidate_category(em, "unclassified", "default", "low", "no rule, heuristic, or LLM match")
+    return {"category": "unclassified", "confidence": "low", "source": "default", "reasoning": ""}
 
 
 def db_set_candidate_status(email, status):
@@ -4341,9 +4680,11 @@ def supporters_candidates_view():
     contributor = (request.args.get("contributor") or "").strip()
     source = (request.args.get("source") or "").strip()
     status_filter = (request.args.get("status_filter") or "active").strip()
+    category_filter = (request.args.get("category") or "").strip().lower()
     candidates, total = db_query_candidates(
         limit=per_page, offset=(page - 1) * per_page,
-        query=query, contributor=contributor, source=source, status_filter=status_filter,
+        query=query, contributor=contributor, source=source,
+        status_filter=status_filter, category_filter=category_filter,
     )
     # Hydrate each candidate with its cached LinkedIn-resolution result (if any)
     # so already-resolved rows render with the URL inline. Fresh candidates
@@ -4387,6 +4728,8 @@ def supporters_candidates_view():
             "  AND resolved_at >= ?",
             (cutoff,),
         ).fetchone()[0]
+    # Category filter dropdown options for the template.
+    category_options = [(c, CATEGORY_DISPLAY[c][1]) for c in CATEGORY_VALUES]
     return render_template(
         "supporters_candidates.html",
         candidates=candidates,
@@ -4399,6 +4742,9 @@ def supporters_candidates_view():
         contributors=contributors,
         source=source,
         status_filter=status_filter,
+        category_filter=category_filter,
+        category_options=category_options,
+        category_display=CATEGORY_DISPLAY,
         unresolved_count=unresolved_count,
         resolved_count=resolved_count,
         status=status,
@@ -4461,6 +4807,103 @@ def supporters_linkedin_urls():
         "total_filtered": total,
         "scanned": scanned,
         "truncated": total > scanned,
+    })
+
+
+# ---- Categorization routes -------------------------------------------------
+
+@app.route("/settings/categorization", methods=["GET"])
+def settings_categorization_view():
+    """Render the rules editor — three textareas per category (names,
+    domains, emails) so the kit user can tell the categorizer who counts
+    as a customer / investor / vendor / friend / coworker."""
+    rules = db_get_category_rules()
+    return render_template(
+        "settings_categorization.html",
+        rules=rules,
+        category_display=CATEGORY_DISPLAY,
+        # Skip 'unclassified' on the editor — no rules needed for the
+        # default state.
+        editable_categories=[c for c in CATEGORY_VALUES if c != "unclassified"],
+        saved=request.args.get("saved") == "1",
+        active="settings",
+    )
+
+
+@app.route("/settings/categorization", methods=["POST"])
+def settings_categorization_save():
+    """Save category rules. Form field names: `<category>__<rule_type>`
+    e.g. `customer__domain`. Each value is a textarea — newlines split
+    the values."""
+    sec_site = request.headers.get("Sec-Fetch-Site")
+    if sec_site and sec_site not in ("same-origin", "none"):
+        return jsonify({"error": "cross-site form submission blocked"}), 403
+    for category in CATEGORY_VALUES:
+        if category == "unclassified":
+            continue
+        for rule_type in ("name", "domain", "email"):
+            field = f"{category}__{rule_type}"
+            raw = request.form.get(field, "")
+            values = [line.strip() for line in raw.splitlines() if line.strip()]
+            db_save_category_rules(category, rule_type, values)
+    return redirect(url_for("settings_categorization_view", saved="1"))
+
+
+@app.route("/supporters/categorize-one", methods=["POST"])
+def supporters_categorize_one():
+    """Manual override — user clicked a category badge to change it.
+    JSON body: {email, category}. Persisted with source='manual' which
+    is sticky (won't be overwritten by future bulk-categorize runs)."""
+    sec_site = request.headers.get("Sec-Fetch-Site")
+    if sec_site and sec_site not in ("same-origin", "none"):
+        return jsonify({"error": "cross-site form submission blocked"}), 403
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    category = (data.get("category") or "").strip().lower()
+    if not email or category not in CATEGORY_VALUES:
+        return jsonify({"error": "email and valid category required"}), 400
+    db_save_candidate_category(email, category, "manual", "high", "manually overridden by user")
+    return jsonify({"ok": True, "email": email, "category": category})
+
+
+@app.route("/supporters/categorize-all", methods=["POST"])
+def supporters_categorize_all():
+    """Run the categorizer over every candidate that doesn't have a manual
+    override yet. Manual overrides are preserved (the categorizer skips
+    rows where source='manual'). Heuristics + user rules first; LLM
+    fallback gated on use_llm=1 query param (off by default — costs API
+    credits per call)."""
+    sec_site = request.headers.get("Sec-Fetch-Site")
+    if sec_site and sec_site not in ("same-origin", "none"):
+        return jsonify({"error": "cross-site form submission blocked"}), 403
+    use_llm = request.args.get("use_llm") == "1"
+    rules = db_get_category_rules()
+    # Pull all candidates from the union view, no filter — so re-categorize
+    # is comprehensive. Cap at 5000 for safety; should cover any realistic
+    # workspace size.
+    candidates, _total = db_query_candidates(
+        limit=5000, offset=0, status_filter="all",
+    )
+    n_classified = 0
+    n_changed = 0
+    by_category = {c: 0 for c in CATEGORY_VALUES}
+    for c in candidates:
+        prev = c.get("category", "unclassified")
+        result = _categorize_candidate(
+            c["email"], c.get("name", ""),
+            "",  # linkedin_url — we'd need to look it up separately; leave empty for v1
+            rules=rules, use_llm=use_llm,
+        )
+        n_classified += 1
+        if result["category"] != prev:
+            n_changed += 1
+        by_category[result["category"]] = by_category.get(result["category"], 0) + 1
+    return jsonify({
+        "ok": True,
+        "classified": n_classified,
+        "changed": n_changed,
+        "by_category": by_category,
+        "use_llm": use_llm,
     })
 
 
