@@ -3868,6 +3868,13 @@ def _onboarding_status():
     slack_done = slack_is_configured()
     slack_channel = (db_get_slack_config("channel_name") or "").strip() if slack_done else ""
 
+    # Signup-status nudge: when the customer has no API key yet AND hasn't
+    # answered "are you already a Draftboard customer?", the wizard shows a
+    # banner asking. Persisted in app_state so the question only fires once.
+    # Values: "" (unset), "customer" (skip nudge, show normal API-key paste),
+    # "new" (show signup CTA instead of paste form).
+    signup_status = (db_app_state_get("setup_signup_status") or "").strip().lower()
+
     return {
         "api_key": {
             "done": bool(api_key),
@@ -3875,6 +3882,8 @@ def _onboarding_status():
             "me": api_key_me,  # dict with user_first/user_last/customer_name
             "auto_sync_off": (not AUTO_SYNC_ENABLED) and bool(api_key),
         },
+        "signup_status": signup_status,
+        "draftboard_signup_url": "https://intros.draftboard.com",
         "google": {
             "done": bool(google_email),
             "email": google_email,
@@ -4027,6 +4036,35 @@ def setup_unskip():
     return redirect(url_for("setup_view"))
 
 
+@app.route("/setup/signup-status", methods=["POST"])
+def setup_signup_status():
+    """First-question step zero on /setup: 'are you already a Draftboard
+    customer?' Persists the answer in app_state.setup_signup_status so the
+    wizard doesn't re-ask. Reversible via the signup-CTA banner.
+
+    Values:
+      - 'customer'  → user has a key (or will paste one); render normal flow
+      - 'new'       → user is new; render signup CTA + link to draftboard.com
+      - ''          → unset; render the question
+    """
+    sec_site = request.headers.get("Sec-Fetch-Site")
+    if sec_site and sec_site not in ("same-origin", "none"):
+        return jsonify({"error": "cross-site form submission blocked"}), 403
+    status = (request.form.get("status") or "").strip().lower()
+    if status not in ("customer", "new", ""):
+        return redirect(url_for("setup_view"))
+    if status == "":
+        with _db_lock, _db_connect() as conn:
+            conn.execute(
+                "DELETE FROM app_state WHERE key = ?",
+                ("setup_signup_status",),
+            )
+            conn.commit()
+    else:
+        db_app_state_set("setup_signup_status", status)
+    return redirect(url_for("setup_view"))
+
+
 @app.route("/setup/dismiss", methods=["POST"])
 def setup_dismiss():
     """Permanent dismiss — used by the 'Continue' button at the bottom of
@@ -4065,10 +4103,11 @@ def settings_google_view():
         "",
         "I'm setting up the Draftboard API starter kit and need the Google OAuth credentials so the Connect Google flow works.",
         "",
-        f"Draftboard customer: {customer_name or '(not loaded yet)'}",
+        f"Draftboard customer: {customer_name or '(not loaded yet — paste your API key on the /setup page first if you want this prefilled)'}",
         f"My name on the account: {full_name or '(not loaded yet)'}",
+        "My email (paste here so I have a canonical address even if my From: differs):",
         "",
-        "Please add my email (the From: address of this email) to the test-users allowlist, and reply with the client_id + client_secret JSON.",
+        "Please add my email to the test-users allowlist on your Google Cloud consent screen, then reply with the client_id + client_secret values (they'll go into two paste fields on my end).",
         "",
         "Thanks!",
     ]
@@ -4114,9 +4153,15 @@ def settings_google_configure_client():
     cs = (request.form.get("client_secret") or "").strip()
     if not cid or not cs:
         return redirect(url_for("settings_google_view", configure_error="empty"))
-    if not cid.endswith(".apps.googleusercontent.com"):
+    # Real Google client_ids are typically 70+ chars and have a numeric+hex
+    # prefix before the .apps.googleusercontent.com suffix. Reject the bare
+    # suffix or anything obviously short — `.endswith` alone would accept
+    # ".apps.googleusercontent.com" by itself and write it to disk.
+    if not cid.endswith(".apps.googleusercontent.com") or len(cid) < 40:
         return redirect(url_for("settings_google_view", configure_error="bad_client_id"))
-    if not cs.startswith("GOCSPX-"):
+    # Real Google client_secrets after the GOCSPX- prefix are ~28 chars.
+    # Reject the bare prefix.
+    if not cs.startswith("GOCSPX-") or len(cs) < 20:
         return redirect(url_for("settings_google_view", configure_error="bad_client_secret"))
     if len(cid) > 256 or len(cs) > 128:
         return redirect(url_for("settings_google_view", configure_error="too_long"))

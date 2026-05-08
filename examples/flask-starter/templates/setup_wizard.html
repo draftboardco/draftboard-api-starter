@@ -35,6 +35,66 @@
     </header>
 
     {# ============================================================
+       Step zero — "Are you already a Draftboard customer?"
+       Renders ONLY when no API key is configured AND signup_status is
+       unset. Once the user answers (or pastes a valid key), this is
+       hidden permanently. Lets non-customers find their way to signup
+       without bouncing off a paste form they can't fill in.
+       ============================================================ #}
+    {% if not status.api_key.done and not status.signup_status %}
+      <section class="mb-4 bg-indigo-50 border border-indigo-200 rounded-lg p-5">
+        <h2 class="text-base font-semibold text-indigo-900">First — are you already a Draftboard customer?</h2>
+        <p class="mt-1 text-sm text-indigo-800">
+          Draftboard is a B2B network-mapping platform that helps you reach prospects via warm intros from people you already know. This kit needs an API key from a Draftboard account to work.
+        </p>
+        <div class="mt-4 flex items-center gap-2 flex-wrap">
+          <form method="POST" action="/setup/signup-status" class="inline">
+            <input type="hidden" name="status" value="customer" />
+            <button type="submit"
+                    class="text-sm px-3 py-1.5 rounded-md bg-indigo-600 text-white font-medium hover:bg-indigo-700">
+              Yes, I have an account →
+            </button>
+          </form>
+          <form method="POST" action="/setup/signup-status" class="inline">
+            <input type="hidden" name="status" value="new" />
+            <button type="submit"
+                    class="text-sm px-3 py-1.5 rounded-md border border-indigo-300 bg-white text-indigo-700 font-medium hover:bg-indigo-100">
+              I'm new — show me how to sign up
+            </button>
+          </form>
+        </div>
+      </section>
+    {% endif %}
+
+    {# Signup CTA — shows when the user said they're new. Persists until they
+       paste a key (which makes status.api_key.done true and hides this). #}
+    {% if not status.api_key.done and status.signup_status == 'new' %}
+      <section class="mb-4 bg-white border border-indigo-200 rounded-lg p-5 shadow-sm">
+        <h2 class="text-base font-semibold text-slate-900">Sign up for Draftboard, then come back</h2>
+        <p class="mt-1.5 text-sm text-slate-600">
+          Draftboard maps your existing professional network so you can reach prospects via warm intros from people who already know them. The kit you just cloned is the open-source reference implementation — once you have an account, paste your API key below and the rest of the setup wizard works as-is.
+        </p>
+        <ol class="mt-4 space-y-2 text-sm text-slate-700 list-decimal list-inside">
+          <li>
+            <a href="{{ status.draftboard_signup_url }}" target="_blank" rel="noopener"
+               class="text-indigo-600 font-medium hover:underline">Sign up at intros.draftboard.com →</a>
+          </li>
+          <li>Once your account is set up: open <strong>Settings → API Keys</strong> and click <strong>Generate API key</strong>.</li>
+          <li>Come back here and paste it into the field below.</li>
+        </ol>
+        <div class="mt-4 flex items-center gap-2 text-xs text-slate-500">
+          <form method="POST" action="/setup/signup-status" class="inline">
+            <input type="hidden" name="status" value="customer" />
+            <button type="submit"
+                    class="text-xs text-slate-500 hover:text-slate-700 underline">
+              Wait — I do have an account
+            </button>
+          </form>
+        </div>
+      </section>
+    {% endif %}
+
+    {# ============================================================
        Card 1 — Draftboard API key  (REQUIRED, the only NEW UI here)
        ============================================================ #}
     <section class="mb-4 bg-white border border-slate-200 rounded-lg shadow-sm overflow-hidden">
@@ -128,7 +188,7 @@
             {% endif %}
           </div>
           <p class="text-sm text-slate-600 mt-1">
-            Populates the <strong>Supporters</strong> page from your Gmail + Calendar engagement, ranked by who you actually talk to. One-click OAuth, ~5 minute background sync.
+            Populates the <strong>Supporters</strong> page from your Gmail + Calendar engagement, ranked by who you actually talk to. ~5 minute background sync. (First-time setup needs OAuth credentials from Draftboard — the page walks you through requesting them.)
           </p>
           {% if status.google.done %}
             <p class="mt-2 text-xs text-slate-500">

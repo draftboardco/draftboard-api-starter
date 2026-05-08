@@ -83,6 +83,15 @@
       {% endif %}
     {% endif %}
 
+    {# Save-success banner (rendered when the save flipped status.client_configured
+       from False to True — must live OUTSIDE the per-state branches below since
+       the post-save state is "configured" and would otherwise hide the banner). #}
+    {% if configure_saved and status.client_configured %}
+      <div class="mb-4 rounded-md border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
+        ✓ OAuth credentials saved. Click <strong>Connect Google</strong> below to start the consent flow.
+      </div>
+    {% endif %}
+
     {% if not status.libs_ready %}
       <div class="mb-6 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">
         <strong>Python dependencies missing.</strong>
@@ -113,7 +122,7 @@
                 </a>
               </div>
               <p class="mt-1 text-xs text-slate-500">
-                Opens your email client with a pre-filled message identifying your Draftboard account. Send it as-is — Zach replies within a business day with the credentials JSON.
+                Opens your email client with a pre-filled message identifying your Draftboard account. Send it as-is — Zach usually replies within a day with the two values. (No mail client? The address is just <code class="font-mono">{{ kit_author_email }}</code>.)
               </p>
             </div>
           </li>
@@ -146,7 +155,7 @@
                 </div>
               {% elif configure_error and configure_error.startswith("write_failed_") %}
                 <div class="mt-2 text-xs text-rose-900 bg-rose-50 border border-rose-200 rounded px-3 py-2">
-                  Couldn't write to <code>oauth_client.json</code>: {{ configure_error[len('write_failed_'):] }}. Check file permissions on <code>examples/flask-starter/</code>.
+                  Couldn't write to <code>oauth_client.json</code>: {{ configure_error[13:] }}. Check file permissions on <code>examples/flask-starter/</code>.
                 </div>
               {% endif %}
 
@@ -168,14 +177,13 @@
                          class="mt-0.5 w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500" />
                 </label>
                 <button type="submit"
-                        onclick="this.disabled=true; this.textContent='Saving…'; this.form.submit();"
                         class="rounded-md bg-indigo-600 text-white px-3 py-1.5 text-sm font-medium hover:bg-indigo-700 disabled:opacity-60 disabled:cursor-not-allowed">
                   Save credentials
                 </button>
               </form>
 
               <p class="mt-2 text-[11px] text-slate-400">
-                Saved to <code>examples/flask-starter/oauth_client.json</code>. The values stay on your machine.
+                Saved locally to <code>examples/flask-starter/oauth_client.json</code> (gitignored, so it stays on your machine even if you fork the repo).
               </p>
             </div>
           </li>

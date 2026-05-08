@@ -17,4 +17,8 @@ server.log
 # Built supporter_scan.py distributables — these have OAuth client_secret
 # baked in for shipping to teammates. See scanner/README.md for the build step.
 examples/flask-starter/scanner/dist/
+# Customer-populated Google OAuth credentials. Written by the paste form on
+# /settings/google. Never commit — GitHub's secret scanner blocks it AND it'd
+# expose the kit author's Desktop client to the world.
+examples/flask-starter/oauth_client.json
 .gstack/
