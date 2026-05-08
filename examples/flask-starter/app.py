@@ -1051,6 +1051,8 @@ def db_put_resolution(email: str, name: str, result: dict):
             ),
         )
         conn.commit()
+    # New resolution may unlock a supporter→connector match — drop the cache.
+    invalidate_supporter_attribution_cache()
 
 
 def db_unique_owners():
@@ -1078,11 +1080,35 @@ def db_unique_owners():
 
 
 def _normalize_linkedin(url):
-    """Lowercase + strip trailing slash + strip query/anchor — for fuzzy URL match."""
+    """Canonicalize a LinkedIn URL for fuzzy match.
+
+    Strips: scheme (http/https), `www.` prefix, query string, anchor, trailing
+    slash. Lowercases everything. So all of these compare equal:
+        https://www.linkedin.com/in/orencharnoff/
+        https://linkedin.com/in/orencharnoff
+        http://www.linkedin.com/in/orencharnoff?utm_source=email
+        linkedin.com/in/orencharnoff#anchor
+    Result: "linkedin.com/in/orencharnoff".
+
+    The `www.`-stripping matters because Apollo, Google CSE, and LinkedIn
+    itself emit URLs with and without the prefix interchangeably. Without
+    this, the supporter-badge cross-reference silently misses ~half its
+    real matches when one side has `www.` and the other doesn't.
+    """
     if not url:
         return ""
     u = url.strip().lower()
     u = u.split("?", 1)[0].split("#", 1)[0]
+    # Strip scheme (handles http://, https://, schema-relative //)
+    if u.startswith("https://"):
+        u = u[8:]
+    elif u.startswith("http://"):
+        u = u[7:]
+    elif u.startswith("//"):
+        u = u[2:]
+    # Strip leading www.
+    if u.startswith("www."):
+        u = u[4:]
     return u.rstrip("/")
 
 
@@ -1927,6 +1953,73 @@ def _build_assign_to_teammate_draft(target, connection, teammate):
     }
 
 
+# Cache of {normalized_linkedin_url: [contributor_display, ...]} drawn from
+# scanner-imported supporters that have been LinkedIn-resolved. Refreshed at
+# most every _SUPPORTER_ATTRIBUTION_TTL seconds, so a drawer with hundreds of
+# connections doesn't fire hundreds of identical JOIN queries.
+_SUPPORTER_ATTRIBUTION_TTL = 60
+_supporter_attribution_cache = {"data": None, "fetched_at": 0}
+
+
+def db_supporter_attribution_map():
+    """Returns dict {normalized_linkedin_url: [contributor_display, ...]}.
+
+    For every (teammate-uploaded supporter, resolved LinkedIn URL) pair, lists
+    the contributing teammates. Drives the "⭐ Supporter (Sarah's list)" badge
+    on connector cards — when path data shows a connector who's also someone a
+    teammate flagged via the scanner, we surface the overlap inline.
+
+    Empty when no scanner imports have happened OR no resolutions have run.
+    The data hard-depends on:
+      1. Teammate ran the portable scanner → rows in `teammate_contacts`
+      2. Those rows were LinkedIn-resolved (manual or batch on Supporters page)
+         → matching rows in `linkedin_resolutions` with linkedin_url set
+
+    Without (2), we can't match — the scanner gives us emails, the path API
+    gives us LinkedIn URLs, and the resolver is the only bridge.
+    """
+    cache = _supporter_attribution_cache
+    now = time.time()
+    if cache["data"] is not None and (now - cache["fetched_at"]) < _SUPPORTER_ATTRIBUTION_TTL:
+        return cache["data"]
+    # Match the resolution-cache TTL applied by db_get_resolution so the
+    # connector-card badge and the /supporters/linkedin-urls endpoint agree
+    # on what's "current". Without this, a stale resolution shows the badge
+    # but is silently dropped from the copy-URL list.
+    cutoff = int(now) - RESOLUTION_CACHE_TTL
+    out = {}
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT lr.linkedin_url, tc.contributor_name, tc.contributor_email "
+            "FROM teammate_contacts tc "
+            "JOIN linkedin_resolutions lr ON lr.email = tc.email "
+            "WHERE lr.linkedin_url IS NOT NULL AND lr.linkedin_url != '' "
+            "  AND lr.resolved_at >= ?",
+            (cutoff,),
+        )
+        for url, contrib_name, contrib_email in cur.fetchall():
+            key = _normalize_linkedin(url)
+            if not key:
+                continue
+            display = (contrib_name or "").strip() or (contrib_email or "").strip()
+            if not display:
+                continue
+            bucket = out.setdefault(key, [])
+            if display not in bucket:
+                bucket.append(display)
+    cache["data"] = out
+    cache["fetched_at"] = now
+    return out
+
+
+def invalidate_supporter_attribution_cache():
+    """Drop the in-memory map so the next read rebuilds. Call this after any
+    write that could change the result: a scanner import, or a successful
+    LinkedIn resolution. Cheap; the rebuild is one indexed JOIN."""
+    _supporter_attribution_cache["data"] = None
+    _supporter_attribution_cache["fetched_at"] = 0
+
+
 def _enrich_connection(target, connection, requested_set=None, my_user_id=None):
     """Format a Connection for the drawer template.
 
@@ -1989,6 +2082,14 @@ def _enrich_connection(target, connection, requested_set=None, my_user_id=None):
     slack_on = slack_is_configured()
     slack_channel = (db_get_slack_config("channel_name") or "").strip() if slack_on else ""
 
+    # Supporter cross-reference: is this connector someone a teammate has
+    # flagged via the scanner? Match is on normalized LinkedIn URL, so it
+    # only fires for resolved supporters (the scanner exports email-only).
+    norm_li = _normalize_linkedin(connection.get("linkedinUrl") or "")
+    supporter_attributions = (
+        db_supporter_attribution_map().get(norm_li, []) if norm_li else []
+    )
+
     return {
         "id": cid,
         "name": f"{first} {last}".strip() or "(no name)",
@@ -2005,6 +2106,7 @@ def _enrich_connection(target, connection, requested_set=None, my_user_id=None):
         "assign_drafts": assign_drafts,
         "slack_configured": slack_on,
         "slack_channel_name": slack_channel,
+        "supporter_attributions": supporter_attributions,
         "draft_message": messages["plain"],
         "draft_html": messages["html"],
         "draft_plain_fallback": messages["plain_fallback"],
@@ -3437,6 +3539,8 @@ def db_import_teammate_scan(payload):
             )
             count += 1
         conn.commit()
+    # Scanner import changed which supporters exist — drop the badge cache.
+    invalidate_supporter_attribution_cache()
     return count, contributor_email, None
 
 
@@ -3448,7 +3552,9 @@ def db_remove_teammate_contributor(contributor_email):
             (contributor_email.strip().lower(),),
         )
         conn.commit()
-        return cur.rowcount
+    # Removing a contributor changes the badge map.
+    invalidate_supporter_attribution_cache()
+    return cur.rowcount
 
 
 # --- One-time sync worker ------------------------------------------------
@@ -3686,6 +3792,18 @@ def supporters_candidates_view():
     resolver_keys = _load_resolver_keys()
     resolver_status = _resolver_status(resolver_keys)
     unresolved_count = db_count_unresolved_candidates()
+    # Cheap count of resolutions that have a non-empty linkedin_url, scoped
+    # to the same TTL the JOIN map and /supporters/linkedin-urls use.
+    # Drives the "Copy LinkedIn URLs" bar visibility — we only show it once
+    # there's at least one URL to actually copy. Otherwise the bar dead-ends.
+    with _db_lock, _db_connect() as conn:
+        cutoff = int(time.time()) - RESOLUTION_CACHE_TTL
+        resolved_count = conn.execute(
+            "SELECT COUNT(*) FROM linkedin_resolutions "
+            "WHERE linkedin_url IS NOT NULL AND linkedin_url != '' "
+            "  AND resolved_at >= ?",
+            (cutoff,),
+        ).fetchone()[0]
     return render_template(
         "supporters_candidates.html",
         candidates=candidates,
@@ -3699,12 +3817,68 @@ def supporters_candidates_view():
         source=source,
         status_filter=status_filter,
         unresolved_count=unresolved_count,
+        resolved_count=resolved_count,
         status=status,
         sync_state=sync_state,
         resolver_status=resolver_status,
         active="candidates",
         api_key_set=bool(API_KEY),
     )
+
+
+@app.route("/supporters/linkedin-urls", methods=["GET"])
+def supporters_linkedin_urls():
+    """Return the resolved LinkedIn URLs for ALL rows matching the current
+    Supporters-page filter (across pages, not just the rendered one).
+
+    Drives the "Copy LinkedIn URLs to clipboard" button. The customer
+    pastes the result into Draftboard's production "Add Supporters" form
+    or DMs the list to a teammate.
+
+    Accepts the same query params as /supporters/candidates so the button
+    can pass `window.location.search` straight through and get the same
+    filter set the user is currently looking at.
+
+    Returns: {"urls": [...], "count": N, "total_filtered": M, "scanned": K, "truncated": bool}
+        - urls: only rows that have a resolved linkedin_url (deduped)
+        - count: len(urls)
+        - total_filtered: total filtered candidates (including unresolved),
+          so the UI can say "47 of 120 are resolved — copying 47"
+        - scanned: how many candidates we actually inspected (= min(total_filtered, cap))
+        - truncated: True if total_filtered > scanned (cap was hit)
+    """
+    query = (request.args.get("q") or "").strip()
+    contributor = (request.args.get("contributor") or "").strip()
+    source = (request.args.get("source") or "").strip()
+    status_filter = (request.args.get("status_filter") or "active").strip()
+    cap = 10000  # sane upper bound; surfaced via `truncated` when hit
+    candidates, total = db_query_candidates(
+        limit=cap, offset=0,
+        query=query, contributor=contributor, source=source,
+        status_filter=status_filter,
+    )
+    urls = []
+    seen = set()
+    for c in candidates:
+        cached = db_get_resolution(c["email"])
+        if not cached:
+            continue
+        url = (cached.get("linkedin_url") or "").strip()
+        if not url:
+            continue
+        norm = _normalize_linkedin(url)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        urls.append(url)
+    scanned = len(candidates)
+    return jsonify({
+        "urls": urls,
+        "count": len(urls),
+        "total_filtered": total,
+        "scanned": scanned,
+        "truncated": total > scanned,
+    })
 
 
 @app.route("/candidates/status", methods=["POST"])
