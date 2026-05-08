@@ -2944,6 +2944,10 @@ def _load_google_oauth_client():
       2. .env file in this app's directory
       3. ~/.draftboard-secrets/google.env (DRAFTBOARD_STARTER_GOOGLE_CLIENT_ID +
          _SECRET, or plain GOOGLE_CLIENT_ID/_SECRET as a fallback)
+      4. oauth_client.json next to app.py (committed default — Desktop OAuth
+         client embedded in the public kit, per Google's "Desktop client
+         secret isn't really a secret" doc). This is the "clone and run"
+         path for customers; kit authors override via #1-#3 during dev.
 
     Returns (client_id, client_secret, source_label).
     """
@@ -2987,6 +2991,21 @@ def _load_google_oauth_client():
               or vals.get("GOOGLE_CLIENT_SECRET") or "").strip()
         if cid and cs:
             return cid, cs, secrets_path
+
+    # Lowest priority: the committed oauth_client.json (Desktop client baked
+    # into the kit). When the kit author has populated it, this is the path
+    # that gives customers a "clone and run" experience.
+    embedded_path = os.path.join(app_dir, "oauth_client.json")
+    if os.path.exists(embedded_path):
+        try:
+            with open(embedded_path) as f:
+                data = json.load(f) or {}
+            cid = (data.get("client_id") or "").strip()
+            cs = (data.get("client_secret") or "").strip()
+            if cid and cs:
+                return cid, cs, "oauth_client.json (embedded)"
+        except (OSError, ValueError):
+            pass
 
     return "", "", None
 

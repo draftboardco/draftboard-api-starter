@@ -1,0 +1,5 @@
+{
+  "_comment": "This file is committed to the public repo on purpose. It holds the Draftboard-owned Google Desktop OAuth client (client_id + client_secret). Per Google's docs, the client_secret on a Desktop OAuth client is not really a secret — it's designed to be embedded in distributed software. The real gate on who can OAuth is the test-users allowlist on the Google Cloud consent screen (capped at 100 users while in Testing mode). Kit author: paste your Desktop client's values below, then commit + push so customers can clone and run without any credential setup. If these values are blank, the app falls back to env vars / .env / ~/.draftboard-secrets/google.env (in that order).",
+  "client_id": "",
+  "client_secret": ""
+}

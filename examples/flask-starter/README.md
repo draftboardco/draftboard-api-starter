@@ -131,21 +131,19 @@ The **Supporters** page (`/supporters/candidates`) ranks the people you actually
 
 ### Configuring the OAuth client (one-time, you do this once)
 
-The Flask app uses a single Draftboard-owned Google OAuth client (Testing mode, capped at 100 test-user emails per Google's rules). To run this kit yourself you need a `client_id` + `client_secret` for that client, set in any of:
+The Flask app uses a single Draftboard-owned Google **Desktop** OAuth client (Testing mode, capped at 100 test-user emails per Google's rules). Per Google's docs, the `client_secret` on a Desktop OAuth client isn't really a secret — it's designed to be embedded in distributed software. So the credentials live in `oauth_client.json` (committed to the public repo). The actual gate on who can OAuth is the test-users allowlist.
 
-- `GOOGLE_CLIENT_ID` + `GOOGLE_CLIENT_SECRET` env vars
-- `.env` in this directory (see `env.example`)
-- `~/.draftboard-secrets/google.env` — looks for `DRAFTBOARD_STARTER_GOOGLE_CLIENT_ID` / `_SECRET` first, falls back to plain `GOOGLE_CLIENT_ID` / `_SECRET`
+**Customer experience:** clone the repo, run the app, click Connect Google. Done. No DM, no paste form, no setup. As long as their email is on the allowlist (you add it once in the Google Cloud Console), it just works.
 
-If you haven't already created the OAuth client, here's the one-time setup (~10 min):
+**Kit author setup (you, one-time):**
 
 1. Open https://console.cloud.google.com/projectcreate → name it `Draftboard Supporters`
 2. Enable [Gmail API](https://console.cloud.google.com/apis/library/gmail.googleapis.com) + [Calendar API](https://console.cloud.google.com/apis/library/calendar-json.googleapis.com)
 3. [OAuth consent screen](https://console.cloud.google.com/apis/credentials/consent): External → Testing → app name `Draftboard` → support + dev contact emails → add yourself (and any future customers) under **Test users**
-4. [Credentials](https://console.cloud.google.com/apis/credentials) → **+ Create credentials** → **OAuth client ID** → **Web application** → add `http://localhost:5050/auth/google/callback` to **Authorized redirect URIs** → Create → copy the resulting `client_id` + `client_secret`
-5. Save them under one of the locations above and restart the app.
+4. [Credentials](https://console.cloud.google.com/apis/credentials) → **+ Create credentials** → **OAuth client ID** → **Desktop app** → name it `Draftboard Supporters Desktop` → Create → copy the resulting `client_id` + `client_secret`
+5. Paste into `examples/flask-starter/oauth_client.json` and commit + push.
 
-Once that's in place, customers see a "Connect Google" button at `/settings/google` and `/supporters/candidates`. They never see any of step 1-4.
+Loader priority: `oauth_client.json` is the lowest-priority source — env vars, `.env`, and `~/.draftboard-secrets/google.env` all override it. So during local development you can keep your credentials in `~/.draftboard-secrets/` and ignore the committed file.
 
 ### Adding customer test users
 
