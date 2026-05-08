@@ -17,6 +17,8 @@ Then open http://localhost:5050. The first page walks you through pasting your A
 
 (Need an API key? Generate one at [intros.draftboard.com](https://intros.draftboard.com) → Settings → API Keys.)
 
+See [`CHANGELOG.md`](CHANGELOG.md) for what's shipped recently.
+
 ## Who this is for
 
 Two audiences:

@@ -41,6 +41,24 @@
         Setup
       </a>
     </div>
+
+    {# Feedback link + what's-new link — muted styling so they don't compete
+       with the main nav items but are always one click away. The feedback
+       mailto body is built in app.py and exposed via the global Jinja
+       context (see context_processor). #}
+    <div class="flex items-center gap-2 ml-2">
+      <a href="https://github.com/draftboardco/draftboard-api-starter/blob/main/CHANGELOG.md"
+         target="_blank" rel="noopener"
+         class="px-2 py-1.5 text-xs text-slate-400 hover:text-slate-700"
+         title="See what's changed recently">
+        What's new
+      </a>
+      <a href="{{ feedback_mailto or 'mailto:zach@draftboard.com?subject=Draftboard%20kit%20feedback' }}"
+         class="px-2 py-1.5 text-xs text-slate-400 hover:text-slate-700"
+         title="Send feedback / report a bug to the kit author">
+        💬 Feedback
+      </a>
+    </div>
   </div>
 </nav>
 
