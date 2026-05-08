@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Setup — Draftboard API starter</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    {% include "_nav.html" %}
+
+    {# ---- Header ---- #}
+    {% set total = 4 %}
+    {% set done = (1 if status.api_key.done else 0)
+                 + (1 if status.google.done else 0)
+                 + (1 if status.resolver.done else 0)
+                 + (1 if status.slack.done else 0) %}
+    {% set skipped = (1 if status.google.skipped and not status.google.done else 0)
+                   + (1 if status.resolver.skipped and not status.resolver.done else 0)
+                   + (1 if status.slack.skipped and not status.slack.done else 0) %}
+    <header class="mb-6">
+      <h1 class="text-2xl font-semibold tracking-tight">Welcome to the Draftboard API starter kit</h1>
+      <p class="text-sm text-slate-600 mt-1">
+        ~5 minutes to set up. Only the first item is required — everything else is optional and can be added later from the same page.
+      </p>
+      <div class="mt-3 flex items-center gap-3">
+        <div class="flex-1 bg-slate-200 rounded-full h-2 overflow-hidden">
+          <div class="bg-indigo-500 h-2" style="width: {{ ((done / total) * 100)|round(0, 'floor')|int }}%"></div>
+        </div>
+        <div class="text-xs text-slate-500 tabular-nums">
+          <strong class="text-slate-900">{{ done }}</strong> of {{ total }} set up{% if skipped %} · {{ skipped }} skipped{% endif %}
+        </div>
+      </div>
+    </header>
+
+    {# ============================================================
+       Card 1 — Draftboard API key  (REQUIRED, the only NEW UI here)
+       ============================================================ #}
+    <section class="mb-4 bg-white border border-slate-200 rounded-lg shadow-sm overflow-hidden">
+      <div class="px-5 py-4 flex items-start gap-3">
+        <div class="flex-shrink-0 mt-0.5">
+          {% if status.api_key.done %}
+            <span class="inline-flex items-center justify-center w-6 h-6 rounded-full bg-emerald-100 text-emerald-700 text-sm font-bold">✓</span>
+          {% else %}
+            <span class="inline-flex items-center justify-center w-6 h-6 rounded-full bg-rose-100 text-rose-700 text-xs font-bold">!</span>
+          {% endif %}
+        </div>
+        <div class="flex-1 min-w-0">
+          <div class="flex items-center gap-2 flex-wrap">
+            <h2 class="text-base font-semibold text-slate-900">1. Draftboard API key</h2>
+            <span class="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-rose-50 text-rose-700 border border-rose-200">Required</span>
+            {% if status.api_key.done %}
+              <span class="text-xs px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-800 border border-emerald-200">Set up</span>
+            {% endif %}
+          </div>
+          <p class="text-sm text-slate-600 mt-1">
+            Authenticates calls to your Draftboard workspace. Without it the kit can't load any data.
+          </p>
+
+          {% if status.api_key.done and status.api_key.me %}
+            <div class="mt-2 text-xs text-slate-700 bg-emerald-50 border border-emerald-200 rounded px-3 py-2">
+              Connected as
+              <strong>{{ status.api_key.me.user_first or '' }} {{ status.api_key.me.user_last or '' }}</strong>
+              {% if status.api_key.me.customer_name %}· {{ status.api_key.me.customer_name }}{% endif %}
+              <span class="text-slate-500">— key loaded from {{ status.api_key.source }}</span>
+            </div>
+          {% elif status.api_key.done %}
+            <div class="mt-2 text-xs text-slate-700 bg-emerald-50 border border-emerald-200 rounded px-3 py-2">
+              Key loaded from <code>{{ status.api_key.source }}</code>.
+            </div>
+          {% endif %}
+
+          {% if status.api_key.auto_sync_off %}
+            <div class="mt-2 text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded px-3 py-2">
+              <strong>Auto-sync is off.</strong> The kit found your API key but won't pull data automatically because <code>AUTO_SYNC_ENABLED=false</code> is set in your environment (<code>.env</code> or shell). Either remove it and restart, or trigger a one-time sync now:
+              <form method="POST" action="/sync/start" class="inline ml-1">
+                <button type="submit"
+                        onclick="this.disabled=true; this.textContent='Syncing…'; this.form.submit();"
+                        class="underline text-amber-900 hover:text-amber-700 disabled:opacity-60 bg-transparent border-0 p-0 m-0 cursor-pointer font-inherit">Sync now</button>
+              </form>
+            </div>
+          {% endif %}
+
+          {# ---- Inline paste form (shown when not configured OR replacing) ---- #}
+          {% if not status.api_key.done %}
+            {% include "_setup_apikey_form.html" with context %}
+          {% else %}
+            {# Open the Replace section by default when there's a paste-error
+               or unverified-save flag — otherwise the error banner is hidden
+               behind a collapsed accordion and the user re-clicks Replace
+               wondering why the form looks empty. #}
+            <details class="mt-3 group" {% if api_key_error or api_key_unverified %}open{% endif %}>
+              <summary class="text-xs text-slate-500 cursor-pointer hover:text-slate-700 select-none">
+                Replace API key
+              </summary>
+              <div class="mt-2 border-t border-slate-200 pt-3">
+                {% include "_setup_apikey_form.html" with context %}
+              </div>
+            </details>
+          {% endif %}
+        </div>
+      </div>
+    </section>
+
+    {# ============================================================
+       Card 2 — Google Workspace
+       ============================================================ #}
+    <section class="mb-4 bg-white border border-slate-200 rounded-lg shadow-sm overflow-hidden">
+      <div class="px-5 py-4 flex items-start gap-3">
+        <div class="flex-shrink-0 mt-0.5">
+          {% if status.google.done %}
+            <span class="inline-flex items-center justify-center w-6 h-6 rounded-full bg-emerald-100 text-emerald-700 text-sm font-bold">✓</span>
+          {% elif status.google.skipped %}
+            <span class="inline-flex items-center justify-center w-6 h-6 rounded-full bg-slate-100 text-slate-500 text-sm font-bold">⊘</span>
+          {% else %}
+            <span class="inline-flex items-center justify-center w-6 h-6 rounded-full border border-slate-300 bg-white text-slate-400 text-xs">○</span>
+          {% endif %}
+        </div>
+        <div class="flex-1 min-w-0">
+          <div class="flex items-center gap-2 flex-wrap">
+            <h2 class="text-base font-semibold text-slate-900">2. Google Workspace</h2>
+            <span class="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-slate-50 text-slate-600 border border-slate-200">Optional</span>
+            {% if status.google.done %}
+              <span class="text-xs px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-800 border border-emerald-200">Set up</span>
+            {% elif status.google.skipped %}
+              <span class="text-xs px-2 py-0.5 rounded-full bg-slate-50 text-slate-600 border border-slate-200">Skipped</span>
+            {% endif %}
+          </div>
+          <p class="text-sm text-slate-600 mt-1">
+            Populates the <strong>Supporters</strong> page from your Gmail + Calendar engagement, ranked by who you actually talk to. One-click OAuth, ~5 minute background sync.
+          </p>
+          {% if status.google.done %}
+            <p class="mt-2 text-xs text-slate-500">
+              Connected as <code>{{ status.google.email }}</code>.
+            </p>
+          {% endif %}
+
+          <div class="mt-3 flex items-center gap-2 flex-wrap">
+            {% if status.google.done %}
+              <a href="/settings/google" class="text-xs px-3 py-1.5 rounded-md border border-slate-300 bg-white hover:bg-slate-50 text-slate-700">Manage</a>
+            {% elif status.google.skipped %}
+              <form method="POST" action="/setup/unskip" class="inline">
+                <input type="hidden" name="which" value="google" />
+                <button type="submit" class="text-xs px-3 py-1.5 rounded-md bg-indigo-600 text-white font-medium hover:bg-indigo-700">Set up anyway →</button>
+              </form>
+            {% else %}
+              <a href="/settings/google" class="text-xs px-3 py-1.5 rounded-md bg-indigo-600 text-white font-medium hover:bg-indigo-700">Connect Google →</a>
+              <form method="POST" action="/setup/skip" class="inline">
+                <input type="hidden" name="which" value="google" />
+                <button type="submit" class="text-xs px-3 py-1.5 rounded-md text-slate-500 hover:text-slate-700">Skip</button>
+              </form>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+    </section>
+
+    {# ============================================================
+       Card 3 — LinkedIn resolver
+       ============================================================ #}
+    <section class="mb-4 bg-white border border-slate-200 rounded-lg shadow-sm overflow-hidden">
+      <div class="px-5 py-4 flex items-start gap-3">
+        <div class="flex-shrink-0 mt-0.5">
+          {% if status.resolver.done %}
+            <span class="inline-flex items-center justify-center w-6 h-6 rounded-full bg-emerald-100 text-emerald-700 text-sm font-bold">✓</span>
+          {% elif status.resolver.partial %}
+            <span class="inline-flex items-center justify-center w-6 h-6 rounded-full bg-amber-100 text-amber-700 text-sm font-bold">!</span>
+          {% elif status.resolver.skipped %}
+            <span class="inline-flex items-center justify-center w-6 h-6 rounded-full bg-slate-100 text-slate-500 text-sm font-bold">⊘</span>
+          {% else %}
+            <span class="inline-flex items-center justify-center w-6 h-6 rounded-full border border-slate-300 bg-white text-slate-400 text-xs">○</span>
+          {% endif %}
+        </div>
+        <div class="flex-1 min-w-0">
+          <div class="flex items-center gap-2 flex-wrap">
+            <h2 class="text-base font-semibold text-slate-900">3. LinkedIn resolver</h2>
+            <span class="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-slate-50 text-slate-600 border border-slate-200">Optional</span>
+            {% if status.resolver.done %}
+              <span class="text-xs px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-800 border border-emerald-200">
+                {% if status.resolver.apollo_ready and status.resolver.cse_ready %}Both methods ready
+                {% elif status.resolver.apollo_ready %}Apollo ready
+                {% else %}Google search ready{% endif %}
+              </span>
+            {% elif status.resolver.partial %}
+              <span class="text-xs px-2 py-0.5 rounded-full bg-amber-50 text-amber-800 border border-amber-200">Partial — needs more keys</span>
+            {% elif status.resolver.skipped %}
+              <span class="text-xs px-2 py-0.5 rounded-full bg-slate-50 text-slate-600 border border-slate-200">Skipped</span>
+            {% endif %}
+          </div>
+          <p class="text-sm text-slate-600 mt-1">
+            Resolves names + emails into LinkedIn URLs. Required for the <strong>Supporters</strong> page to cross-reference your teammates' contacts with your Draftboard paths.
+          </p>
+          <p class="text-xs text-slate-500 mt-1">
+            Needs <strong>Apollo</strong> OR <strong>Google CSE + OpenAI</strong> (both is best — Apollo first, CSE as fallback).
+          </p>
+
+          {% if status.resolver.partial %}
+            <p class="mt-2 text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded px-3 py-2">
+              <strong>Almost set up:</strong>
+              {% if status.resolver.has_cse_key and not status.resolver.has_cse_id %}
+                you've added a Google CSE API key but no CSE Engine ID. Add the engine ID on the resolver page.
+              {% elif status.resolver.has_cse_id and not status.resolver.has_cse_key %}
+                you've added a Google CSE Engine ID but no API key. Add the API key on the resolver page.
+              {% elif status.resolver.has_cse_key and status.resolver.has_cse_id and not status.resolver.has_openai_key %}
+                you've configured Google CSE but not OpenAI. The CSE method ranks results with gpt-4o-mini — add an OpenAI key, or paste an Apollo key as an alternative.
+              {% elif status.resolver.has_openai_key and not (status.resolver.has_cse_key and status.resolver.has_cse_id) %}
+                you've added an OpenAI key but the CSE pair is missing. Either complete CSE setup or paste an Apollo key (which doesn't need OpenAI).
+              {% else %}
+                no method is fully configured yet. Add Apollo, or complete the Google CSE + OpenAI pair.
+              {% endif %}
+            </p>
+          {% endif %}
+
+          <div class="mt-3 flex items-center gap-2 flex-wrap">
+            {% if status.resolver.done %}
+              <a href="/settings/linkedin-resolver" class="text-xs px-3 py-1.5 rounded-md border border-slate-300 bg-white hover:bg-slate-50 text-slate-700">Manage keys</a>
+            {% elif status.resolver.partial %}
+              <a href="/settings/linkedin-resolver" class="text-xs px-3 py-1.5 rounded-md bg-amber-600 text-white font-medium hover:bg-amber-700">Finish setup →</a>
+            {% elif status.resolver.skipped %}
+              <form method="POST" action="/setup/unskip" class="inline">
+                <input type="hidden" name="which" value="resolver" />
+                <button type="submit" class="text-xs px-3 py-1.5 rounded-md bg-indigo-600 text-white font-medium hover:bg-indigo-700">Set up anyway →</button>
+              </form>
+            {% else %}
+              <a href="/settings/linkedin-resolver" class="text-xs px-3 py-1.5 rounded-md bg-indigo-600 text-white font-medium hover:bg-indigo-700">Add keys →</a>
+              <form method="POST" action="/setup/skip" class="inline">
+                <input type="hidden" name="which" value="resolver" />
+                <button type="submit" class="text-xs px-3 py-1.5 rounded-md text-slate-500 hover:text-slate-700">Skip</button>
+              </form>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+    </section>
+
+    {# ============================================================
+       Card 4 — Slack assignments
+       ============================================================ #}
+    <section class="mb-6 bg-white border border-slate-200 rounded-lg shadow-sm overflow-hidden">
+      <div class="px-5 py-4 flex items-start gap-3">
+        <div class="flex-shrink-0 mt-0.5">
+          {% if status.slack.done %}
+            <span class="inline-flex items-center justify-center w-6 h-6 rounded-full bg-emerald-100 text-emerald-700 text-sm font-bold">✓</span>
+          {% elif status.slack.skipped %}
+            <span class="inline-flex items-center justify-center w-6 h-6 rounded-full bg-slate-100 text-slate-500 text-sm font-bold">⊘</span>
+          {% else %}
+            <span class="inline-flex items-center justify-center w-6 h-6 rounded-full border border-slate-300 bg-white text-slate-400 text-xs">○</span>
+          {% endif %}
+        </div>
+        <div class="flex-1 min-w-0">
+          <div class="flex items-center gap-2 flex-wrap">
+            <h2 class="text-base font-semibold text-slate-900">4. Slack assignments</h2>
+            <span class="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-slate-50 text-slate-600 border border-slate-200">Optional</span>
+            {% if status.slack.done %}
+              <span class="text-xs px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-800 border border-emerald-200">Set up · #{{ status.slack.channel }}</span>
+            {% elif status.slack.skipped %}
+              <span class="text-xs px-2 py-0.5 rounded-full bg-slate-50 text-slate-600 border border-slate-200">Skipped</span>
+            {% endif %}
+          </div>
+          <p class="text-sm text-slate-600 mt-1">
+            Tag teammates in a Slack channel when assigning paths. Replaces the default Gmail-compose action with a one-click @-mention. 7-step wizard with click-by-click instructions.
+          </p>
+
+          <div class="mt-3 flex items-center gap-2 flex-wrap">
+            {% if status.slack.done %}
+              <a href="/settings/slack" class="text-xs px-3 py-1.5 rounded-md border border-slate-300 bg-white hover:bg-slate-50 text-slate-700">Manage</a>
+            {% elif status.slack.skipped %}
+              <form method="POST" action="/setup/unskip" class="inline">
+                <input type="hidden" name="which" value="slack" />
+                <button type="submit" class="text-xs px-3 py-1.5 rounded-md bg-indigo-600 text-white font-medium hover:bg-indigo-700">Set up anyway →</button>
+              </form>
+            {% else %}
+              <a href="/settings/slack" class="text-xs px-3 py-1.5 rounded-md bg-indigo-600 text-white font-medium hover:bg-indigo-700">Set up Slack →</a>
+              <form method="POST" action="/setup/skip" class="inline">
+                <input type="hidden" name="which" value="slack" />
+                <button type="submit" class="text-xs px-3 py-1.5 rounded-md text-slate-500 hover:text-slate-700">Skip</button>
+              </form>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+    </section>
+
+    {# ============================================================
+       Continue (exit the wizard)
+       ============================================================ #}
+    <div class="flex items-center justify-between gap-3 mt-6 pt-4 border-t border-slate-200">
+      <p class="text-xs text-slate-500">
+        You can always come back to this page from <strong>Setup</strong> in the nav above.
+      </p>
+      {% if status.api_key.done %}
+        <form method="POST" action="/setup/dismiss" class="inline">
+          <button type="submit"
+                  class="rounded-md bg-indigo-600 text-white px-4 py-2 text-sm font-medium hover:bg-indigo-700">
+            Continue →
+          </button>
+        </form>
+      {% else %}
+        <button disabled
+                title="Paste a Draftboard API key first."
+                class="rounded-md bg-slate-300 text-slate-500 px-4 py-2 text-sm font-medium cursor-not-allowed">
+          Continue (need API key first)
+        </button>
+      {% endif %}
+    </div>
+
+    <footer class="mt-10 text-xs text-slate-400 text-center">
+      Draftboard API starter · Setup
+    </footer>
+  </div>
+</body>
+</html>
