@@ -298,6 +298,65 @@ app = Flask(__name__)
 # (form posts, small JSON), so 2 MiB is generous.
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
 
+
+# Kit version string — used in feedback emails so Zach knows which commit
+# the customer is running. Read once at boot from the running git repo;
+# falls back to "unknown" if git isn't available (e.g., the kit was
+# downloaded as a zip).
+def _read_kit_version():
+    try:
+        import subprocess
+        app_dir = os.path.dirname(os.path.abspath(__file__))
+        out = subprocess.check_output(
+            ["git", "-C", app_dir, "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL, timeout=2,
+        )
+        return out.decode().strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+KIT_VERSION = _read_kit_version()
+
+
+@app.context_processor
+def _inject_globals():
+    """Make feedback_mailto + kit_version available in every rendered
+    template without each route passing them through. Reads the cached /me
+    payload to prefill identity in the feedback email body so Zach knows
+    which customer the report came from."""
+    me_data = {}
+    raw = db_app_state_get("me_data")
+    if raw:
+        try:
+            me_data = json.loads(raw) or {}
+        except (ValueError, TypeError):
+            me_data = {}
+    customer_name = (me_data.get("customer_name") or "").strip()
+    full_name = f"{me_data.get('user_first') or ''} {me_data.get('user_last') or ''}".strip()
+    body_lines = [
+        "Hi Zach,",
+        "",
+        "[Describe what's working, not working, or what you'd like to see]",
+        "",
+        "— Auto-filled context —",
+        f"Draftboard customer: {customer_name or '(not loaded)'}",
+        f"My name on the account: {full_name or '(not loaded)'}",
+        f"Kit version: {KIT_VERSION}",
+        "",
+        "Thanks!",
+    ]
+    from urllib.parse import quote
+    feedback_mailto = (
+        f"mailto:{KIT_AUTHOR_EMAIL}"
+        f"?subject={quote('Draftboard kit feedback / bug report')}"
+        f"&body={quote(chr(10).join(body_lines))}"
+    )
+    return {
+        "feedback_mailto": feedback_mailto,
+        "kit_version": KIT_VERSION,
+    }
+
 # Per-field input caps for resolve endpoints. Apollo / CSE / OpenAI all reject
 # huge values, but we cap before the network call so the customer's process
 # can't be DOS'd by a payload full of multi-MB strings.
