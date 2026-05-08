@@ -73,7 +73,12 @@
 
           {% if status.api_key.auto_sync_off %}
             <div class="mt-2 text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded px-3 py-2">
-              <strong>Auto-sync is off.</strong> The kit found your API key but won't pull data automatically because <code>AUTO_SYNC_ENABLED=false</code> is set. Either remove that from your <code>.env</code> and restart, or click <a href="/sync/start" class="underline" onclick="fetch('/sync/start', {method:'POST'}); event.preventDefault(); this.textContent='Syncing…'; setTimeout(()=>location.reload(), 1500); return false;">Sync now</a> to do a one-time pull.
+              <strong>Auto-sync is off.</strong> The kit found your API key but won't pull data automatically because <code>AUTO_SYNC_ENABLED=false</code> is set in your environment (<code>.env</code> or shell). Either remove it and restart, or trigger a one-time sync now:
+              <form method="POST" action="/sync/start" class="inline ml-1">
+                <button type="submit"
+                        onclick="this.disabled=true; this.textContent='Syncing…'; this.form.submit();"
+                        class="underline text-amber-900 hover:text-amber-700 disabled:opacity-60 bg-transparent border-0 p-0 m-0 cursor-pointer font-inherit">Sync now</button>
+              </form>
             </div>
           {% endif %}
 
@@ -81,7 +86,11 @@
           {% if not status.api_key.done %}
             {% include "_setup_apikey_form.html" with context %}
           {% else %}
-            <details class="mt-3 group">
+            {# Open the Replace section by default when there's a paste-error
+               or unverified-save flag — otherwise the error banner is hidden
+               behind a collapsed accordion and the user re-clicks Replace
+               wondering why the form looks empty. #}
+            <details class="mt-3 group" {% if api_key_error or api_key_unverified %}open{% endif %}>
               <summary class="text-xs text-slate-500 cursor-pointer hover:text-slate-700 select-none">
                 Replace API key
               </summary>
@@ -278,7 +287,7 @@
        ============================================================ #}
     <div class="flex items-center justify-between gap-3 mt-6 pt-4 border-t border-slate-200">
       <p class="text-xs text-slate-500">
-        You can always come back to this page from <strong>Settings</strong> in the nav above.
+        You can always come back to this page from <strong>Setup</strong> in the nav above.
       </p>
       {% if status.api_key.done %}
         <form method="POST" action="/setup/dismiss" class="inline">

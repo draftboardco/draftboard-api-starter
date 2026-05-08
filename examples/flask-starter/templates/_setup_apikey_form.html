@@ -35,6 +35,16 @@
   <div class="mt-2 text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded px-3 py-2">
     <strong>Couldn't reach Draftboard.</strong> Could be your internet, a corporate proxy, or DNS. You can save the key without verifying — the next real request will tell us if it's good.
   </div>
+{% elif api_key_error == "bad_response" %}
+  <div class="mt-2 text-xs text-rose-900 bg-rose-50 border border-rose-200 rounded px-3 py-2">
+    Draftboard returned a 200 but the body wasn't readable JSON. Try again, or save without verifying.
+  </div>
+{% elif api_key_error == "env_override" %}
+  <div class="mt-2 text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded px-3 py-2">
+    <strong>Saved — but the kit is using a different key.</strong>
+    Your <code>{{ api_key_override_source or 'environment' }}</code> is overriding the secrets file we just wrote.
+    To use this pasted key, remove the override (unset <code>DRAFTBOARD_API_KEY</code>, or delete the line from your <code>.env</code>) and restart the server.
+  </div>
 {% elif api_key_error and api_key_error.startswith("http_") %}
   <div class="mt-2 text-xs text-rose-900 bg-rose-50 border border-rose-200 rounded px-3 py-2">
     Unexpected response from Draftboard (HTTP {{ api_key_error[5:] }}). Try again, or save without verifying.

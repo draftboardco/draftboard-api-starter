@@ -185,8 +185,13 @@ else:
 
 # Cache of the current API key so a paste in /setup is picked up live (next
 # request, no server restart). 5-second TTL means a manual edit to the secrets
-# file is also seen quickly. The module-global API_KEY is kept in sync as a
-# side-effect so existing `if not API_KEY:` guards still work.
+# file is also seen quickly.
+#
+# All in-app code that needs the current key MUST call _current_api_key()
+# (which goes through this cache). Reading the module-global API_KEY directly
+# bypasses the cache and can return a stale value just after a paste —
+# fetch_me / fetch_all_targets / fetch_target_connections / fetch_tags all
+# call _current_api_key() now, after an adversarial review caught the gap.
 _API_KEY_CACHE_TTL = 5
 _api_key_cache = {"fetched_at": 0}
 
@@ -220,6 +225,26 @@ def _save_api_key_to_secrets(key: str) -> None:
     with os.fdopen(fd, "w") as f:
         f.write((key or "").strip() + "\n")
     os.replace(tmp, secrets_path)
+
+
+def _flatten_me_payload(raw: dict) -> dict:
+    """Reduce the nested /me API response to the six flat fields every
+    consumer of `app_state.me_data` expects (`customer_id`, `customer_name`,
+    `user_id`, `user_first`, `user_last`, `user_linkedin`). Persisting the
+    raw response would break `get_my_owner_id`, the owner filter, the Slack
+    test message identity line, and the Setup card's "Connected as X" line —
+    they all read the flat keys.
+    """
+    customer = (raw or {}).get("customer") or {}
+    user = customer.get("user") or {}
+    return {
+        "customer_id": customer.get("id"),
+        "customer_name": customer.get("name") or "",
+        "user_id": user.get("id"),
+        "user_first": user.get("firstName") or "",
+        "user_last": user.get("lastName") or "",
+        "user_linkedin": user.get("linkedinUrl") or "",
+    }
 
 
 def _validate_api_key(key: str, timeout: int = 10):
@@ -1334,12 +1359,12 @@ def fetch_me(force=False):
         except Exception:
             return None, None
 
-    if not AUTO_SYNC_ENABLED or not API_KEY:
+    if not AUTO_SYNC_ENABLED or not _current_api_key():
         cached, _err = _from_sqlite()
         if cached:
             _me_cache.update({"data": cached, "error": None, "fetched_at": now})
             return cached, None
-        if not API_KEY:
+        if not _current_api_key():
             return None, "DRAFTBOARD_API_KEY not set and no cached /me data."
         return None, "AUTO_SYNC_ENABLED=false and /me not yet cached."
 
@@ -1353,17 +1378,7 @@ def fetch_me(force=False):
             err = f"GET /me returned {r.status_code}."
             _me_cache.update({"data": None, "error": err, "fetched_at": now})
             return None, err
-        data = r.json() or {}
-        customer = data.get("customer") or {}
-        user = customer.get("user") or {}
-        result = {
-            "customer_id": customer.get("id"),
-            "customer_name": customer.get("name"),
-            "user_id": user.get("id"),
-            "user_first": user.get("firstName") or "",
-            "user_last": user.get("lastName") or "",
-            "user_linkedin": user.get("linkedinUrl") or "",
-        }
+        result = _flatten_me_payload(r.json() or {})
         db_app_state_set("me_data", json.dumps(result))
         _me_cache.update({"data": result, "error": None, "fetched_at": now})
         return result, None
@@ -1432,7 +1447,7 @@ def fetch_tags(force=False):
         except Exception:
             return None
 
-    if not AUTO_SYNC_ENABLED or not API_KEY:
+    if not AUTO_SYNC_ENABLED or not _current_api_key():
         cached = _from_sqlite()
         if cached is not None:
             _tags_cache.update({"data": cached, "error": None, "fetched_at": now})
@@ -1484,12 +1499,12 @@ def fetch_all_targets(force=False):
         return _targets_cache["data"], _targets_cache["error"]
 
     # Offline mode (or no key): read from SQLite, no API call.
-    if not AUTO_SYNC_ENABLED or not API_KEY:
+    if not AUTO_SYNC_ENABLED or not _current_api_key():
         sqlite_targets, sqlite_err = db_load_targets_cache()
         if sqlite_targets:
             _targets_cache.update({"data": sqlite_targets, "error": None, "fetched_at": now})
             return sqlite_targets, None
-        if not API_KEY:
+        if not _current_api_key():
             return [], "No API key set and no cached target list in SQLite. Add a key OR populate targets_cache."
         # AUTO_SYNC_ENABLED is false but SQLite is empty.
         return [], (
@@ -1564,7 +1579,7 @@ def fetch_target_connections(target_id, force=False):
         return cached_data, None
 
     # Offline mode — never call the API. Return whatever we have, even stale.
-    if not AUTO_SYNC_ENABLED or not API_KEY:
+    if not AUTO_SYNC_ENABLED or not _current_api_key():
         if cached_data is not None:
             return cached_data, None
         return [], "Connections not cached for this target (offline mode)."
@@ -2255,9 +2270,20 @@ def _enrich_target(t):
 def targets_view():
     # First-run nudge: brand-new install with no API key gets bounced to
     # /setup so they have a paste field instead of an empty Targets page.
-    # The "Continue" / "Skip onboarding" actions on /setup write
-    # setup_dismissed=1 in app_state so this redirect doesn't fire again.
-    if not _current_api_key() and not db_app_state_get("setup_dismissed"):
+    # The "Continue" action on /setup writes setup_dismissed in app_state.
+    #
+    # If the user later loses their API key (revoked, .env deleted, env var
+    # unset), the dismiss flag would otherwise leave them stranded on a
+    # broken Targets page with no nudge back to /setup. So: when the key
+    # disappears, clear the dismiss flag and re-fire the redirect.
+    if not _current_api_key():
+        if db_app_state_get("setup_dismissed"):
+            with _db_lock, _db_connect() as conn:
+                conn.execute(
+                    "DELETE FROM app_state WHERE key = ?",
+                    ("setup_dismissed",),
+                )
+                conn.commit()
         return redirect(url_for("setup_view"))
     force_refresh = request.args.get("refresh") == "1"
     targets, error = fetch_all_targets(force=force_refresh)
@@ -2446,7 +2472,7 @@ def do_import():
 
     if not urls:
         result["errors"] = ["No valid LinkedIn URLs found in input."]
-    elif not API_KEY:
+    elif not _current_api_key():
         result["errors"] = [
             "DRAFTBOARD_API_KEY not set. Set it in your shell and restart the server."
         ]
@@ -3810,6 +3836,7 @@ def setup_view():
         # Pass through any flash-style query param so the API-key form can
         # show inline validation errors after a paste.
         api_key_error=request.args.get("api_key_error", ""),
+        api_key_override_source=request.args.get("api_key_override_source", ""),
         api_key_unverified=request.args.get("api_key_unverified") == "1",
         active="setup",
     )
@@ -3817,16 +3844,31 @@ def setup_view():
 
 @app.route("/setup/api-key", methods=["POST"])
 def setup_save_api_key():
-    """Validate a pasted Draftboard API key and write it to
-    ~/.draftboard-secrets/draftboard-api-starter.
+    """Validate a pasted Draftboard API key, write it to
+    ~/.draftboard-secrets/draftboard-api-starter, and refresh the in-process
+    cache so the next request uses it without a server restart.
 
     Validation: GET /me with the new key. Persist only on 200, except if the
-    user opted into 'save without verifying' (network/timeout escape hatch
-    for corporate-proxy / offline cases).
+    user opted into `save_unverified=1` (escape hatch for network/rate-limit
+    failures — typically corporate-proxy or offline development cases).
 
-    Replace flow: if a key is already configured, the form sends `replace=1`
-    along with the new value. We re-validate before swapping; on rejection
-    the existing key is preserved unchanged."""
+    Replace flow: this same handler powers both first-set and replace.
+    A "Replace API key" expandable on /setup re-renders this same form;
+    the route doesn't care which one submitted it.
+
+    Cross-origin defense: refuse requests where the browser's Sec-Fetch-Site
+    header indicates a cross-origin form submission. Localhost dev tools
+    have low realistic exposure but the API key is high-value, and the
+    existing /settings/linkedin-resolver endpoint already defends similarly.
+    """
+    # Reject cross-site form submissions — a malicious page the user visits
+    # in another tab could otherwise overwrite their key via a hidden <form>
+    # POST. Allow `same-origin` (real form submits) and `none` (direct
+    # navigation / curl) and absent header (older browsers).
+    sec_site = request.headers.get("Sec-Fetch-Site")
+    if sec_site and sec_site not in ("same-origin", "none"):
+        return jsonify({"error": "cross-site form submission blocked"}), 403
+
     pasted = (request.form.get("api_key") or "").strip()
     save_unverified = request.form.get("save_unverified") == "1"
 
@@ -3839,10 +3881,25 @@ def setup_save_api_key():
     if len(pasted) > 256:
         return redirect(url_for("setup_view", api_key_error="too_long"))
 
+    def _persist_and_check_override(persist_key):
+        """Write the key, refresh cache, then verify _load_api_key would
+        actually return what we just wrote. If env / .env wins over the
+        secrets file, the paste is silently a no-op — flag it loudly."""
+        _save_api_key_to_secrets(persist_key)
+        _current_api_key(force=True)
+        loaded_key, loaded_source = _load_api_key()
+        if loaded_key != persist_key:
+            return loaded_source  # the source that's overriding us
+        return None
+
     if save_unverified:
         # Network failed earlier; user explicitly chose to save anyway.
-        _save_api_key_to_secrets(pasted)
-        _current_api_key(force=True)
+        override = _persist_and_check_override(pasted)
+        if override:
+            return redirect(url_for(
+                "setup_view", api_key_error="env_override",
+                api_key_override_source=override,
+            ))
         return redirect(url_for("setup_view", api_key_unverified="1"))
 
     ok, payload = _validate_api_key(pasted)
@@ -3854,12 +3911,16 @@ def setup_save_api_key():
         return redirect(url_for("setup_view", api_key_error=payload))
 
     # 200 OK — persist and refresh the in-process cache.
-    _save_api_key_to_secrets(pasted)
-    _current_api_key(force=True)
-    # Cache the /me payload so the success card can render
-    # "Connected as X · Org" without an extra round-trip.
+    override = _persist_and_check_override(pasted)
+    if override:
+        return redirect(url_for(
+            "setup_view", api_key_error="env_override",
+            api_key_override_source=override,
+        ))
+    # Cache the /me payload (FLATTENED to the same shape fetch_me writes —
+    # owner-filter / greeting / slack-test-message all read flat keys).
     try:
-        db_app_state_set("me_data", json.dumps(payload))
+        db_app_state_set("me_data", json.dumps(_flatten_me_payload(payload)))
     except (TypeError, ValueError):
         pass
     return redirect(url_for("setup_view"))
