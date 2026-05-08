@@ -3017,6 +3017,62 @@ else:
     print("[draftboard-starter] No Google OAuth client configured. The Candidates feature will show a 'not connected' state until one is set.")
 
 
+def _reload_google_oauth_client():
+    """Re-run the priority-chain loader and update the module globals so a
+    just-pasted credential pair is picked up live by the next request. Called
+    by the POST handler that writes oauth_client.json."""
+    global GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, _google_creds_source
+    cid, cs, src = _load_google_oauth_client()
+    GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, _google_creds_source = cid, cs, src
+    return cid, cs, src
+
+
+def _save_google_oauth_client_to_embedded_file(client_id: str, client_secret: str) -> None:
+    """Write a Desktop OAuth client_id + client_secret into oauth_client.json
+    next to app.py. Atomic temp-file + rename so a crash mid-write can't
+    truncate the file. Reuses the pattern from _save_resolver_keys.
+
+    Called by the /settings/google/configure-client paste handler. NOT a
+    secret store — this file is committed to the public repo when the kit
+    author distributes a populated copy. Per Google's own docs, the
+    client_secret on a Desktop OAuth client is not really a secret."""
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    target = os.path.join(app_dir, "oauth_client.json")
+    # Preserve the explanatory _comment if the existing file has one.
+    existing_comment = ""
+    if os.path.exists(target):
+        try:
+            with open(target) as f:
+                existing = json.load(f) or {}
+            existing_comment = existing.get("_comment", "") or ""
+        except (OSError, ValueError):
+            existing_comment = ""
+    payload = {
+        "_comment": existing_comment or (
+            "Desktop OAuth client for the Draftboard API starter kit. Per "
+            "Google's docs, the client_secret on a Desktop OAuth client is "
+            "not really a secret — it's designed to be embedded in distributed "
+            "software. The 100-user test-users allowlist on the consent screen "
+            "is the actual gate."
+        ),
+        "client_id": (client_id or "").strip(),
+        "client_secret": (client_secret or "").strip(),
+    }
+    tmp = target + ".tmp"
+    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+    with os.fdopen(fd, "w") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, target)
+
+
+# Customer-facing destination for "I need credentials" requests from the
+# /settings/google paste form. Used to build a mailto: link with prefilled
+# subject + body. Override via env if you fork this kit and want the
+# requests to land somewhere else.
+KIT_AUTHOR_EMAIL = os.environ.get("KIT_AUTHOR_EMAIL", "zach@draftboard.com").strip()
+
+
 def _google_flow():
     if not _google_libs_ready():
         raise RuntimeError(_google_libs_error)
@@ -3983,16 +4039,95 @@ def setup_dismiss():
 
 @app.route("/settings/google", methods=["GET"])
 def settings_google_view():
-    """Status page: 'Connect Google' button OR last-synced banner + Re-sync."""
+    """Status page: 'Connect Google' button OR last-synced banner + Re-sync.
+    When no OAuth client is configured, also renders a paste form + a
+    mailto link to the kit author for requesting credentials."""
     status = google_status()
     sync_state = google_sync_progress_snapshot()
+    # Build a prefilled mailto: link the customer can click to request
+    # credentials. Fills in the body with their /me identity (customer
+    # name + first/last) so the kit author has enough context to add them
+    # to the GCP test-users allowlist before replying with credentials.
+    me_data = {}
+    raw = db_app_state_get("me_data")
+    if raw:
+        try:
+            me_data = json.loads(raw) or {}
+        except (ValueError, TypeError):
+            me_data = {}
+    customer_name = (me_data.get("customer_name") or "").strip()
+    user_first = (me_data.get("user_first") or "").strip()
+    user_last = (me_data.get("user_last") or "").strip()
+    full_name = (f"{user_first} {user_last}").strip()
+    subject = "Draftboard API starter — OAuth credentials request"
+    body_lines = [
+        "Hi Zach,",
+        "",
+        "I'm setting up the Draftboard API starter kit and need the Google OAuth credentials so the Connect Google flow works.",
+        "",
+        f"Draftboard customer: {customer_name or '(not loaded yet)'}",
+        f"My name on the account: {full_name or '(not loaded yet)'}",
+        "",
+        "Please add my email (the From: address of this email) to the test-users allowlist, and reply with the client_id + client_secret JSON.",
+        "",
+        "Thanks!",
+    ]
+    from urllib.parse import quote
+    mailto = (
+        f"mailto:{KIT_AUTHOR_EMAIL}"
+        f"?subject={quote(subject)}"
+        f"&body={quote(chr(10).join(body_lines))}"
+    )
     return render_template(
         "settings_google.html",
         status=status,
         sync_state=sync_state,
+        request_credentials_mailto=mailto,
+        kit_author_email=KIT_AUTHOR_EMAIL,
+        configure_error=request.args.get("configure_error", ""),
+        configure_saved=request.args.get("configure_saved") == "1",
         active="settings_google",
         api_key_set=bool(API_KEY),
     )
+
+
+@app.route("/settings/google/configure-client", methods=["POST"])
+def settings_google_configure_client():
+    """Accept a pasted Desktop OAuth client_id + client_secret, validate
+    shape, persist to oauth_client.json, refresh the in-process globals.
+
+    No /me-style external validation — there's no Google API to "check if
+    these credentials are valid" that doesn't require an OAuth flow. So we
+    just shape-check (client_id ends with .apps.googleusercontent.com,
+    client_secret starts with GOCSPX-) and trust the kit author sent good
+    values. If they're wrong, the next "Connect Google" click will fail
+    with Google's own error UI (which we already render at /settings/google).
+
+    Cross-origin defense: refuse Sec-Fetch-Site=cross-site, mirroring the
+    /setup/api-key handler.
+    """
+    sec_site = request.headers.get("Sec-Fetch-Site")
+    if sec_site and sec_site not in ("same-origin", "none"):
+        return jsonify({"error": "cross-site form submission blocked"}), 403
+
+    cid = (request.form.get("client_id") or "").strip()
+    cs = (request.form.get("client_secret") or "").strip()
+    if not cid or not cs:
+        return redirect(url_for("settings_google_view", configure_error="empty"))
+    if not cid.endswith(".apps.googleusercontent.com"):
+        return redirect(url_for("settings_google_view", configure_error="bad_client_id"))
+    if not cs.startswith("GOCSPX-"):
+        return redirect(url_for("settings_google_view", configure_error="bad_client_secret"))
+    if len(cid) > 256 or len(cs) > 128:
+        return redirect(url_for("settings_google_view", configure_error="too_long"))
+
+    try:
+        _save_google_oauth_client_to_embedded_file(cid, cs)
+    except OSError as e:
+        return redirect(url_for("settings_google_view",
+                                configure_error=f"write_failed_{type(e).__name__}"))
+    _reload_google_oauth_client()
+    return redirect(url_for("settings_google_view", configure_saved="1"))
 
 
 @app.route("/settings/google/clear-data", methods=["POST"])

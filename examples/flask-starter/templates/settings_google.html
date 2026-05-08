@@ -92,12 +92,94 @@
 # then restart the server</pre>
       </div>
     {% elif not status.client_configured %}
-      <div class="mb-6 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">
-        <strong>Google OAuth client not configured.</strong> Either set
-        <code class="font-mono text-xs">GOOGLE_CLIENT_ID</code> + <code class="font-mono text-xs">GOOGLE_CLIENT_SECRET</code>
-        as env vars, or add them to
-        <code class="font-mono text-xs">~/.draftboard-secrets/google.env</code> (or this app's
-        <code class="font-mono text-xs">.env</code>) and restart.
+      {# Two-step setup: (1) email Zach for the credentials with a prefilled
+         mailto link, (2) paste them back into the form below. The kit author
+         adds the customer's email to the Google Cloud test-users allowlist
+         off-line. #}
+      <div class="mb-6 rounded-lg border border-indigo-200 bg-white p-5 shadow-sm">
+        <h2 class="text-base font-semibold text-slate-900">Get OAuth credentials from Draftboard</h2>
+        <p class="mt-1.5 text-sm text-slate-600">
+          The Google integration uses a Draftboard-owned OAuth client (capped at 100 test users on Google's free tier). To get connected, request the credentials from the kit author — it's a quick reply with two values.
+        </p>
+
+        <ol class="mt-4 space-y-3 text-sm text-slate-700">
+          <li class="flex gap-3">
+            <span class="flex-shrink-0 inline-flex items-center justify-center w-6 h-6 rounded-full bg-indigo-100 text-indigo-700 text-xs font-bold">1</span>
+            <div class="flex-1">
+              <div>
+                <a href="{{ request_credentials_mailto }}"
+                   class="inline-flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-md bg-indigo-600 text-white font-medium hover:bg-indigo-700">
+                  📧 Email {{ kit_author_email }} →
+                </a>
+              </div>
+              <p class="mt-1 text-xs text-slate-500">
+                Opens your email client with a pre-filled message identifying your Draftboard account. Send it as-is — Zach replies within a business day with the credentials JSON.
+              </p>
+            </div>
+          </li>
+          <li class="flex gap-3">
+            <span class="flex-shrink-0 inline-flex items-center justify-center w-6 h-6 rounded-full bg-indigo-100 text-indigo-700 text-xs font-bold">2</span>
+            <div class="flex-1">
+              <div class="text-slate-900">Paste the values you got back:</div>
+
+              {% if configure_saved %}
+                <div class="mt-2 text-xs text-emerald-900 bg-emerald-50 border border-emerald-200 rounded px-3 py-2">
+                  ✓ Saved. Click <strong>Connect Google</strong> below to start the OAuth flow.
+                </div>
+              {% endif %}
+
+              {% if configure_error == "empty" %}
+                <div class="mt-2 text-xs text-rose-900 bg-rose-50 border border-rose-200 rounded px-3 py-2">
+                  Both fields are required.
+                </div>
+              {% elif configure_error == "bad_client_id" %}
+                <div class="mt-2 text-xs text-rose-900 bg-rose-50 border border-rose-200 rounded px-3 py-2">
+                  That doesn't look like a Google OAuth <code>client_id</code> — they end with <code>.apps.googleusercontent.com</code>. Double-check what you pasted.
+                </div>
+              {% elif configure_error == "bad_client_secret" %}
+                <div class="mt-2 text-xs text-rose-900 bg-rose-50 border border-rose-200 rounded px-3 py-2">
+                  That doesn't look like a Google OAuth <code>client_secret</code> — they start with <code>GOCSPX-</code>. Double-check what you pasted.
+                </div>
+              {% elif configure_error == "too_long" %}
+                <div class="mt-2 text-xs text-rose-900 bg-rose-50 border border-rose-200 rounded px-3 py-2">
+                  One of those values is suspiciously long. Make sure you're not including extra whitespace or quotes.
+                </div>
+              {% elif configure_error and configure_error.startswith("write_failed_") %}
+                <div class="mt-2 text-xs text-rose-900 bg-rose-50 border border-rose-200 rounded px-3 py-2">
+                  Couldn't write to <code>oauth_client.json</code>: {{ configure_error[len('write_failed_'):] }}. Check file permissions on <code>examples/flask-starter/</code>.
+                </div>
+              {% endif %}
+
+              <form method="POST" action="/settings/google/configure-client" class="mt-2 space-y-2" autocomplete="off">
+                <label class="block">
+                  <span class="text-[10px] uppercase tracking-wider text-slate-500">Client ID</span>
+                  <input type="text" name="client_id"
+                         placeholder="xxxxxxxxxxxx-xxxxxxxxxxxx.apps.googleusercontent.com"
+                         required pattern=".+\.apps\.googleusercontent\.com" maxlength="256"
+                         spellcheck="false" autocomplete="off"
+                         class="mt-0.5 w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+                </label>
+                <label class="block">
+                  <span class="text-[10px] uppercase tracking-wider text-slate-500">Client secret</span>
+                  <input type="text" name="client_secret"
+                         placeholder="GOCSPX-xxxxxxxxxxxxxxxxxxxxxxxx"
+                         required pattern="GOCSPX-.+" maxlength="128"
+                         spellcheck="false" autocomplete="off"
+                         class="mt-0.5 w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+                </label>
+                <button type="submit"
+                        onclick="this.disabled=true; this.textContent='Saving…'; this.form.submit();"
+                        class="rounded-md bg-indigo-600 text-white px-3 py-1.5 text-sm font-medium hover:bg-indigo-700 disabled:opacity-60 disabled:cursor-not-allowed">
+                  Save credentials
+                </button>
+              </form>
+
+              <p class="mt-2 text-[11px] text-slate-400">
+                Saved to <code>examples/flask-starter/oauth_client.json</code>. The values stay on your machine.
+              </p>
+            </div>
+          </li>
+        </ol>
       </div>
     {% endif %}
 
