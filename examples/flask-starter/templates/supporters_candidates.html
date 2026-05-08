@@ -291,6 +291,9 @@
                       <select onchange="updateCategory('{{ c.email }}', this.value, this)"
                               class="absolute inset-0 opacity-0 cursor-pointer w-full"
                               aria-label="Change category for {{ c.name }}">
+                        {% if c.category_source == 'manual' %}
+                          <option value="__auto">↺ Reset to auto</option>
+                        {% endif %}
                         {% for cat_value, _cat_label in category_options %}
                           <option value="{{ cat_value }}" {% if c.category == cat_value %}selected{% endif %}>{{ category_display[cat_value][0] }} {{ category_display[cat_value][1] }}</option>
                         {% endfor %}
@@ -383,7 +386,7 @@
             Showing {{ (page - 1) * per_page + 1 }}–{{ [page * per_page, total] | min }} of {{ total }}
           </div>
           <div class="flex gap-1">
-            {% set qs = ('&q=' ~ query if query else '') ~ ('&contributor=' ~ contributor if contributor else '') ~ ('&source=' ~ source if source else '') ~ ('&status_filter=' ~ status_filter if status_filter and status_filter != 'active' else '') %}
+            {% set qs = ('&q=' ~ query if query else '') ~ ('&contributor=' ~ contributor if contributor else '') ~ ('&source=' ~ source if source else '') ~ ('&status_filter=' ~ status_filter if status_filter and status_filter != 'active' else '') ~ ('&category=' ~ category_filter if category_filter else '') %}
             {% if page > 1 %}
               <a href="?page={{ page - 1 }}{{ qs }}" class="px-2 py-1 rounded-md border border-slate-300 bg-white hover:bg-slate-50">← Prev</a>
             {% endif %}

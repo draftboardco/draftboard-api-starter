@@ -3722,11 +3722,36 @@ _PERSONAL_EMAIL_DOMAINS = frozenset((
 
 def db_save_category_rules(category: str, rule_type: str, values: list[str]):
     """REPLACE all rules of (category, rule_type) with the new value list.
-    Empty strings are skipped. Case is preserved for display but matching
-    is case-insensitive everywhere downstream."""
+    Empty strings are skipped. Domains and emails are normalized to lower-
+    case (and domains have a leading '@' stripped) before insert so the
+    UNIQUE constraint catches duplicates the user typed differently —
+    'ACME.COM' and '@acme.com' and 'acme.com' all become 'acme.com'.
+    Names are NOT lowercased on save (we display them as typed; matching
+    is case-insensitive downstream)."""
     if category not in CATEGORY_VALUES or rule_type not in ("name", "domain", "email"):
         return
-    cleaned = [v.strip() for v in (values or []) if v and v.strip()]
+    cleaned = []
+    seen_norm = set()
+    for v in (values or []):
+        if not v:
+            continue
+        s = v.strip()
+        if not s:
+            continue
+        if rule_type == "domain":
+            s = s.lower().lstrip("@").strip()
+        elif rule_type == "email":
+            s = s.lower()
+        # name: leave as typed
+        if not s:
+            continue
+        # Dedupe within the submitted list itself (in case the user pasted
+        # the same value twice with different casing).
+        norm_key = s.lower() if rule_type != "name" else s
+        if norm_key in seen_norm:
+            continue
+        seen_norm.add(norm_key)
+        cleaned.append(s)
     now = int(time.time())
     with _db_lock, _db_connect() as conn:
         conn.execute(
@@ -3828,10 +3853,15 @@ def _categorize_by_rules(email: str, name: str, rules: dict) -> tuple[str, str] 
             rd = rule_domain.strip().lower().lstrip("@")
             if rd and domain == rd:
                 return category, f"domain matches '{rd}'"
-        # Name substring match (case-insensitive)
+        # Name substring match (case-insensitive). Match ONLY against the
+        # name field — not the email — so a rule "name: acme" doesn't
+        # surprise-match `acme@gmail.com` (where the user really meant the
+        # company "Acme") or `nick.macme@x.com` (where "acme" is a random
+        # substring inside another word). Use the domain rule type for
+        # email/domain matching.
         for rule_name in cat_rules.get("name", []):
             rn = rule_name.strip().lower()
-            if rn and (rn in nm or rn in em):
+            if rn and rn in nm:
                 return category, f"name contains '{rule_name}'"
     return None
 
@@ -4780,11 +4810,12 @@ def supporters_linkedin_urls():
     contributor = (request.args.get("contributor") or "").strip()
     source = (request.args.get("source") or "").strip()
     status_filter = (request.args.get("status_filter") or "active").strip()
+    category_filter = (request.args.get("category") or "").strip().lower()
     cap = 10000  # sane upper bound; surfaced via `truncated` when hit
     candidates, total = db_query_candidates(
         limit=cap, offset=0,
         query=query, contributor=contributor, source=source,
-        status_filter=status_filter,
+        status_filter=status_filter, category_filter=category_filter,
     )
     urls = []
     seen = set()
@@ -4826,7 +4857,7 @@ def settings_categorization_view():
         # default state.
         editable_categories=[c for c in CATEGORY_VALUES if c != "unclassified"],
         saved=request.args.get("saved") == "1",
-        active="settings",
+        active="settings_categorization",
     )
 
 
@@ -4838,11 +4869,18 @@ def settings_categorization_save():
     sec_site = request.headers.get("Sec-Fetch-Site")
     if sec_site and sec_site not in ("same-origin", "none"):
         return jsonify({"error": "cross-site form submission blocked"}), 403
+    # Defensive: only DELETE+REPLACE rule_types whose form field is actually
+    # present in the POST body. A blank-but-present field IS a save intent
+    # (user wants to clear rules); a missing field is NOT (mangled form,
+    # browser extension, manual curl with empty body) and should not blow
+    # away existing rules. Without this guard, an empty POST wipes everything.
     for category in CATEGORY_VALUES:
         if category == "unclassified":
             continue
         for rule_type in ("name", "domain", "email"):
             field = f"{category}__{rule_type}"
+            if field not in request.form:
+                continue  # field absent → don't touch existing rules
             raw = request.form.get(field, "")
             values = [line.strip() for line in raw.splitlines() if line.strip()]
             db_save_category_rules(category, rule_type, values)
@@ -4851,19 +4889,39 @@ def settings_categorization_save():
 
 @app.route("/supporters/categorize-one", methods=["POST"])
 def supporters_categorize_one():
-    """Manual override — user clicked a category badge to change it.
-    JSON body: {email, category}. Persisted with source='manual' which
-    is sticky (won't be overwritten by future bulk-categorize runs)."""
+    """Manual override OR reset-to-auto for a single supporter.
+
+    JSON body shapes:
+      {email, category}            → manual override (sticky)
+      {email, category: "__auto"}  → clear the override; on next render
+                                     /bulk-categorize the row will be
+                                     classified by the normal pipeline
+
+    Manual overrides are stored with source='manual', which the categorizer
+    short-circuits on. Sending category='__auto' DELETEs the row from
+    candidate_categories, releasing it back into automatic classification."""
     sec_site = request.headers.get("Sec-Fetch-Site")
     if sec_site and sec_site not in ("same-origin", "none"):
         return jsonify({"error": "cross-site form submission blocked"}), 403
     data = request.get_json(silent=True) or {}
     email = (data.get("email") or "").strip().lower()
     category = (data.get("category") or "").strip().lower()
-    if not email or category not in CATEGORY_VALUES:
-        return jsonify({"error": "email and valid category required"}), 400
+    if not email:
+        return jsonify({"error": "email required"}), 400
+    if category == "__auto":
+        # Clear the override so the next categorize-all run re-classifies it.
+        with _db_lock, _db_connect() as conn:
+            conn.execute("DELETE FROM candidate_categories WHERE email = ?", (email,))
+            conn.commit()
+        # Re-classify it right now via the normal pipeline so the page
+        # shows something more useful than 'unclassified' on the next render.
+        rules = db_get_category_rules()
+        result = _categorize_candidate(email, "", rules=rules, use_llm=False)
+        return jsonify({"ok": True, "email": email, "category": result["category"], "source": result["source"]})
+    if category not in CATEGORY_VALUES:
+        return jsonify({"error": "valid category or '__auto' required"}), 400
     db_save_candidate_category(email, category, "manual", "high", "manually overridden by user")
-    return jsonify({"ok": True, "email": email, "category": category})
+    return jsonify({"ok": True, "email": email, "category": category, "source": "manual"})
 
 
 @app.route("/supporters/categorize-all", methods=["POST"])
