@@ -127,25 +127,23 @@ The **Supporters** page (`/supporters/candidates`) ranks the people you actually
 
 > **Single-user main app, multi-user via portable scanner.** This Flask kit runs on one laptop. By default the Supporters page shows contacts from **your** Gmail + Calendar only. To pool a teammate's network, send them the portable scanner at `scanner/supporter_scan.py` — they OAuth on their laptop, export a JSON, send it back, you import via `/supporters/import-teammate`. Each contact gets badged with whose network it came from. See **"Pooling teammate networks"** below for the full flow.
 
-**Customer flow is one click:** open `/settings/google` → click **Connect Google** → consent → 5-10 minute sync runs → Supporters list ready. No setup ceremony, no per-customer Google Cloud project. All Gmail + Calendar data stays on your laptop in `data.db` — Draftboard's infrastructure never touches it.
+**Customer flow:** open `/settings/google` → click "Email Zach" (the kit author) to request the OAuth credentials → kit author replies with a `client_id` + `client_secret` → customer pastes into the form on the same page → click **Connect Google** → consent → 5-10 minute sync runs → Supporters list ready. No per-customer Google Cloud project, no shell editing. All Gmail + Calendar data stays on the customer's laptop in `data.db` — Draftboard's infrastructure never touches it.
 
 ### Configuring the OAuth client (one-time, you do this once)
 
-The Flask app uses a single Draftboard-owned Google OAuth client (Testing mode, capped at 100 test-user emails per Google's rules). To run this kit yourself you need a `client_id` + `client_secret` for that client, set in any of:
+The Flask app uses a single Draftboard-owned Google **Desktop** OAuth client (Testing mode, capped at 100 test-user emails per Google's rules). The kit DOES NOT bundle the credentials publicly — GitHub's secret scanner blocks the push, and the broader ecosystem (every CI tool / forked-repo audit) treats them as real secrets even when Google says they aren't. Instead, the kit ships an empty `oauth_client.json` and the customer requests credentials via the in-app paste form on `/settings/google`.
 
-- `GOOGLE_CLIENT_ID` + `GOOGLE_CLIENT_SECRET` env vars
-- `.env` in this directory (see `env.example`)
-- `~/.draftboard-secrets/google.env` — looks for `DRAFTBOARD_STARTER_GOOGLE_CLIENT_ID` / `_SECRET` first, falls back to plain `GOOGLE_CLIENT_ID` / `_SECRET`
-
-If you haven't already created the OAuth client, here's the one-time setup (~10 min):
+**Kit author setup (you, one-time):**
 
 1. Open https://console.cloud.google.com/projectcreate → name it `Draftboard Supporters`
 2. Enable [Gmail API](https://console.cloud.google.com/apis/library/gmail.googleapis.com) + [Calendar API](https://console.cloud.google.com/apis/library/calendar-json.googleapis.com)
 3. [OAuth consent screen](https://console.cloud.google.com/apis/credentials/consent): External → Testing → app name `Draftboard` → support + dev contact emails → add yourself (and any future customers) under **Test users**
-4. [Credentials](https://console.cloud.google.com/apis/credentials) → **+ Create credentials** → **OAuth client ID** → **Web application** → add `http://localhost:5050/auth/google/callback` to **Authorized redirect URIs** → Create → copy the resulting `client_id` + `client_secret`
-5. Save them under one of the locations above and restart the app.
+4. [Credentials](https://console.cloud.google.com/apis/credentials) → **+ Create credentials** → **OAuth client ID** → **Desktop app** → name it `Draftboard Supporters Desktop` → Create → copy the resulting `client_id` + `client_secret`
+5. Save them to `~/.draftboard-secrets/google.env` (same format as the existing `DRAFTBOARD_SCANNER_GOOGLE_CLIENT_ID/_SECRET` pair). **Do not commit them.**
 
-Once that's in place, customers see a "Connect Google" button at `/settings/google` and `/supporters/candidates`. They never see any of step 1-4.
+**Per-customer onboarding (you, ~30 seconds each):** when the customer clicks "Email Zach" from `/settings/google`, you receive an email pre-filled with their Draftboard customer + user identity. Add their email to the test-users allowlist in the Google Cloud consent screen, then reply with the `client_id` + `client_secret` (just paste both values; the customer's wizard accepts them in two separate fields). You can also override `KIT_AUTHOR_EMAIL` env var if you want the requests to land at a different address.
+
+Loader priority for `client_id` / `client_secret`: env vars > `.env` > `~/.draftboard-secrets/google.env` > `oauth_client.json` (populated by the customer via the paste form). During local development you keep your credentials in `~/.draftboard-secrets/` and never touch `oauth_client.json`.
 
 ### Adding customer test users
 
