@@ -127,12 +127,16 @@
     {% endif %}
 
     {# --- Push-to-Draftboard toolbar: copies all filtered+resolved LinkedIn
-         URLs to clipboard for paste into Draftboard's Add Supporters form. --- #}
-    {% if has_any_data %}
+         URLs to clipboard for paste into Draftboard's Add Supporters form.
+         Only shown once at least one resolution exists — otherwise the
+         button always says "no URLs found" and dead-ends. --- #}
+    {% if has_any_data and resolved_count > 0 %}
       <div id="copy-urls-bar" class="mb-3 flex items-center gap-3 flex-wrap rounded-md border border-emerald-200 bg-emerald-50 px-4 py-2 text-sm text-emerald-900">
         <span>
           Ready to add these as Supporters in Draftboard?
-          <span class="text-emerald-700">Copy all filtered LinkedIn URLs, then paste into the Add Supporters form on intros.draftboard.com.</span>
+          <span class="text-emerald-700">Copy all filtered LinkedIn URLs, then paste into the
+          <a href="https://intros.draftboard.com/supporters" target="_blank" rel="noopener"
+             class="underline font-medium hover:text-emerald-900">Add Supporters form on intros.draftboard.com ↗</a>.</span>
         </span>
         <button id="copy-urls-btn" type="button"
                 class="ml-auto inline-flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md bg-emerald-600 text-white font-medium hover:bg-emerald-700 disabled:opacity-60 disabled:cursor-not-allowed">
@@ -615,9 +619,24 @@
             }
             var text = urls.join('\n');
             var doneCopy = function () {
-              showToast('Copied ' + urls.length + ' LinkedIn URL' + (urls.length === 1 ? '' : 's') + ' to clipboard. Paste into Draftboard\'s Add Supporters form.');
+              var n = urls.length;
+              var totalFiltered = data.total_filtered || n;
+              var unresolved = totalFiltered - n;
+              var unresolvedNote = unresolved > 0
+                ? ' ' + unresolved + ' more in this filter still need a LinkedIn URL — resolve them and try again.'
+                : '';
+              var truncatedNote = data.truncated
+                ? ' (Showing first ' + (data.scanned || n) + ' of ' + totalFiltered + ' — narrow your filter to capture the rest.)'
+                : '';
+              showToast(
+                'Copied ' + n + ' LinkedIn URL' + (n === 1 ? '' : 's') +
+                ' to your clipboard. Paste into Draftboard\'s Add Supporters form.' +
+                unresolvedNote + truncatedNote
+              );
               if (statusEl) {
-                statusEl.textContent = '✓ Copied ' + urls.length + ' of ' + (data.total_filtered || urls.length) + ' filtered (resolved only)';
+                statusEl.textContent = '✓ Copied ' + n + ' URL' + (n === 1 ? '' : 's') +
+                  (unresolved > 0 ? ' · ' + unresolved + ' unresolved skipped' : '') +
+                  (data.truncated ? ' · capped at ' + (data.scanned || n) : '');
                 statusEl.classList.remove('hidden');
               }
               copyBtn.disabled = false;

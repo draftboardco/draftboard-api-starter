@@ -1080,11 +1080,35 @@ def db_unique_owners():
 
 
 def _normalize_linkedin(url):
-    """Lowercase + strip trailing slash + strip query/anchor — for fuzzy URL match."""
+    """Canonicalize a LinkedIn URL for fuzzy match.
+
+    Strips: scheme (http/https), `www.` prefix, query string, anchor, trailing
+    slash. Lowercases everything. So all of these compare equal:
+        https://www.linkedin.com/in/orencharnoff/
+        https://linkedin.com/in/orencharnoff
+        http://www.linkedin.com/in/orencharnoff?utm_source=email
+        linkedin.com/in/orencharnoff#anchor
+    Result: "linkedin.com/in/orencharnoff".
+
+    The `www.`-stripping matters because Apollo, Google CSE, and LinkedIn
+    itself emit URLs with and without the prefix interchangeably. Without
+    this, the supporter-badge cross-reference silently misses ~half its
+    real matches when one side has `www.` and the other doesn't.
+    """
     if not url:
         return ""
     u = url.strip().lower()
     u = u.split("?", 1)[0].split("#", 1)[0]
+    # Strip scheme (handles http://, https://, schema-relative //)
+    if u.startswith("https://"):
+        u = u[8:]
+    elif u.startswith("http://"):
+        u = u[7:]
+    elif u.startswith("//"):
+        u = u[2:]
+    # Strip leading www.
+    if u.startswith("www."):
+        u = u[4:]
     return u.rstrip("/")
 
 
@@ -1958,13 +1982,20 @@ def db_supporter_attribution_map():
     now = time.time()
     if cache["data"] is not None and (now - cache["fetched_at"]) < _SUPPORTER_ATTRIBUTION_TTL:
         return cache["data"]
+    # Match the resolution-cache TTL applied by db_get_resolution so the
+    # connector-card badge and the /supporters/linkedin-urls endpoint agree
+    # on what's "current". Without this, a stale resolution shows the badge
+    # but is silently dropped from the copy-URL list.
+    cutoff = int(now) - RESOLUTION_CACHE_TTL
     out = {}
     with _db_lock, _db_connect() as conn:
         cur = conn.execute(
             "SELECT lr.linkedin_url, tc.contributor_name, tc.contributor_email "
             "FROM teammate_contacts tc "
             "JOIN linkedin_resolutions lr ON lr.email = tc.email "
-            "WHERE lr.linkedin_url IS NOT NULL AND lr.linkedin_url != ''"
+            "WHERE lr.linkedin_url IS NOT NULL AND lr.linkedin_url != '' "
+            "  AND lr.resolved_at >= ?",
+            (cutoff,),
         )
         for url, contrib_name, contrib_email in cur.fetchall():
             key = _normalize_linkedin(url)
@@ -3761,6 +3792,18 @@ def supporters_candidates_view():
     resolver_keys = _load_resolver_keys()
     resolver_status = _resolver_status(resolver_keys)
     unresolved_count = db_count_unresolved_candidates()
+    # Cheap count of resolutions that have a non-empty linkedin_url, scoped
+    # to the same TTL the JOIN map and /supporters/linkedin-urls use.
+    # Drives the "Copy LinkedIn URLs" bar visibility — we only show it once
+    # there's at least one URL to actually copy. Otherwise the bar dead-ends.
+    with _db_lock, _db_connect() as conn:
+        cutoff = int(time.time()) - RESOLUTION_CACHE_TTL
+        resolved_count = conn.execute(
+            "SELECT COUNT(*) FROM linkedin_resolutions "
+            "WHERE linkedin_url IS NOT NULL AND linkedin_url != '' "
+            "  AND resolved_at >= ?",
+            (cutoff,),
+        ).fetchone()[0]
     return render_template(
         "supporters_candidates.html",
         candidates=candidates,
@@ -3774,6 +3817,7 @@ def supporters_candidates_view():
         source=source,
         status_filter=status_filter,
         unresolved_count=unresolved_count,
+        resolved_count=resolved_count,
         status=status,
         sync_state=sync_state,
         resolver_status=resolver_status,
@@ -3795,20 +3839,21 @@ def supporters_linkedin_urls():
     can pass `window.location.search` straight through and get the same
     filter set the user is currently looking at.
 
-    Returns: {"urls": [...], "count": N, "total_filtered": M}
+    Returns: {"urls": [...], "count": N, "total_filtered": M, "scanned": K, "truncated": bool}
         - urls: only rows that have a resolved linkedin_url (deduped)
         - count: len(urls)
         - total_filtered: total filtered candidates (including unresolved),
           so the UI can say "47 of 120 are resolved — copying 47"
+        - scanned: how many candidates we actually inspected (= min(total_filtered, cap))
+        - truncated: True if total_filtered > scanned (cap was hit)
     """
     query = (request.args.get("q") or "").strip()
     contributor = (request.args.get("contributor") or "").strip()
     source = (request.args.get("source") or "").strip()
     status_filter = (request.args.get("status_filter") or "active").strip()
-    # Cap to 10k — sane upper bound; a workspace with more supporters has
-    # bigger problems than a slow click.
+    cap = 10000  # sane upper bound; surfaced via `truncated` when hit
     candidates, total = db_query_candidates(
-        limit=10000, offset=0,
+        limit=cap, offset=0,
         query=query, contributor=contributor, source=source,
         status_filter=status_filter,
     )
@@ -3826,7 +3871,14 @@ def supporters_linkedin_urls():
             continue
         seen.add(norm)
         urls.append(url)
-    return jsonify({"urls": urls, "count": len(urls), "total_filtered": total})
+    scanned = len(candidates)
+    return jsonify({
+        "urls": urls,
+        "count": len(urls),
+        "total_filtered": total,
+        "scanned": scanned,
+        "truncated": total > scanned,
+    })
 
 
 @app.route("/candidates/status", methods=["POST"])

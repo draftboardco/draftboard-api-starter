@@ -54,15 +54,22 @@
       </span>
     {% endif %}
 
-    {# Supporter overlap badge: this connector ALSO appears in a teammate's
-       scanner-imported supporter list (matched on resolved LinkedIn URL).
-       Strong signal that the teammate knows them well. #}
+    {# Scanner-list overlap badge: this connector ALSO appears in a teammate's
+       portable-scanner export. Strong signal that the teammate knows them
+       well. Wording avoids the word "Supporter" because Draftboard already
+       uses that term for an explicit user-flagged status. #}
     {% if c.supporter_attributions %}
       <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-purple-50 text-purple-800 border border-purple-200"
-            title="This person is on a teammate's supporter list — uploaded via the portable scanner.">
-        <span>⭐</span>
-        Supporter
-        <span class="text-purple-600 font-normal">— {{ c.supporter_attributions|join(', ') }}'s list{{ '' if c.supporter_attributions|length == 1 else 's' }}</span>
+            title="This person is on {{ c.supporter_attributions|join(' and ') }}'s contact list (uploaded via the portable scanner).">
+        <span>📇</span>
+        On
+        {% if c.supporter_attributions|length == 1 %}
+          {{ c.supporter_attributions[0] }}'s list
+        {% elif c.supporter_attributions|length == 2 %}
+          {{ c.supporter_attributions[0] }} & {{ c.supporter_attributions[1] }}'s lists
+        {% else %}
+          {{ c.supporter_attributions|length }} teammates' lists
+        {% endif %}
       </span>
     {% endif %}
   </div>
