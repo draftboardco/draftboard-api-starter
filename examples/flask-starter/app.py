@@ -3782,6 +3782,53 @@ def supporters_candidates_view():
     )
 
 
+@app.route("/supporters/linkedin-urls", methods=["GET"])
+def supporters_linkedin_urls():
+    """Return the resolved LinkedIn URLs for ALL rows matching the current
+    Supporters-page filter (across pages, not just the rendered one).
+
+    Drives the "Copy LinkedIn URLs to clipboard" button. The customer
+    pastes the result into Draftboard's production "Add Supporters" form
+    or DMs the list to a teammate.
+
+    Accepts the same query params as /supporters/candidates so the button
+    can pass `window.location.search` straight through and get the same
+    filter set the user is currently looking at.
+
+    Returns: {"urls": [...], "count": N, "total_filtered": M}
+        - urls: only rows that have a resolved linkedin_url (deduped)
+        - count: len(urls)
+        - total_filtered: total filtered candidates (including unresolved),
+          so the UI can say "47 of 120 are resolved — copying 47"
+    """
+    query = (request.args.get("q") or "").strip()
+    contributor = (request.args.get("contributor") or "").strip()
+    source = (request.args.get("source") or "").strip()
+    status_filter = (request.args.get("status_filter") or "active").strip()
+    # Cap to 10k — sane upper bound; a workspace with more supporters has
+    # bigger problems than a slow click.
+    candidates, total = db_query_candidates(
+        limit=10000, offset=0,
+        query=query, contributor=contributor, source=source,
+        status_filter=status_filter,
+    )
+    urls = []
+    seen = set()
+    for c in candidates:
+        cached = db_get_resolution(c["email"])
+        if not cached:
+            continue
+        url = (cached.get("linkedin_url") or "").strip()
+        if not url:
+            continue
+        norm = _normalize_linkedin(url)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        urls.append(url)
+    return jsonify({"urls": urls, "count": len(urls), "total_filtered": total})
+
+
 @app.route("/candidates/status", methods=["POST"])
 def candidates_set_status():
     """Set or toggle a candidate's triage status. JSON body:

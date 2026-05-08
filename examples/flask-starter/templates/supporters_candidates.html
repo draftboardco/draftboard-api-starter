@@ -126,6 +126,23 @@
       </div>
     {% endif %}
 
+    {# --- Push-to-Draftboard toolbar: copies all filtered+resolved LinkedIn
+         URLs to clipboard for paste into Draftboard's Add Supporters form. --- #}
+    {% if has_any_data %}
+      <div id="copy-urls-bar" class="mb-3 flex items-center gap-3 flex-wrap rounded-md border border-emerald-200 bg-emerald-50 px-4 py-2 text-sm text-emerald-900">
+        <span>
+          Ready to add these as Supporters in Draftboard?
+          <span class="text-emerald-700">Copy all filtered LinkedIn URLs, then paste into the Add Supporters form on intros.draftboard.com.</span>
+        </span>
+        <button id="copy-urls-btn" type="button"
+                class="ml-auto inline-flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md bg-emerald-600 text-white font-medium hover:bg-emerald-700 disabled:opacity-60 disabled:cursor-not-allowed">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-3.5 h-3.5"><path d="M16 1H4a2 2 0 0 0-2 2v14h2V3h12V1zm3 4H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm0 16H8V7h11v14z"/></svg>
+          Copy LinkedIn URLs
+        </button>
+        <span id="copy-urls-status" class="text-xs text-emerald-800 hidden"></span>
+      </div>
+    {% endif %}
+
     {# --- Filter / search bar --- #}
     {% if has_any_data %}
       <form method="GET" action="/supporters/candidates"
@@ -574,6 +591,69 @@
       poll();
       if (!pollTimer) pollTimer = setInterval(poll, 2500);
     }, 800);
+
+    // ---- Copy LinkedIn URLs to clipboard ---------------------------------
+    var copyBtn = document.getElementById('copy-urls-btn');
+    if (copyBtn) {
+      copyBtn.addEventListener('click', function () {
+        var statusEl = document.getElementById('copy-urls-status');
+        copyBtn.disabled = true;
+        var origLabel = copyBtn.innerHTML;
+        copyBtn.innerHTML = 'Fetching…';
+        if (statusEl) { statusEl.classList.add('hidden'); }
+        // Pass through whatever filter the user is currently viewing.
+        var qs = window.location.search || '';
+        fetch('/supporters/linkedin-urls' + qs)
+          .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+          .then(function (data) {
+            var urls = (data && data.urls) || [];
+            if (urls.length === 0) {
+              showToast('No resolved LinkedIn URLs in the current filter. Resolve some first, or change the filter.');
+              copyBtn.disabled = false;
+              copyBtn.innerHTML = origLabel;
+              return;
+            }
+            var text = urls.join('\n');
+            var doneCopy = function () {
+              showToast('Copied ' + urls.length + ' LinkedIn URL' + (urls.length === 1 ? '' : 's') + ' to clipboard. Paste into Draftboard\'s Add Supporters form.');
+              if (statusEl) {
+                statusEl.textContent = '✓ Copied ' + urls.length + ' of ' + (data.total_filtered || urls.length) + ' filtered (resolved only)';
+                statusEl.classList.remove('hidden');
+              }
+              copyBtn.disabled = false;
+              copyBtn.innerHTML = origLabel;
+            };
+            // navigator.clipboard.writeText is the modern path; fall through to
+            // a textarea-based fallback if the page is on http (some browsers
+            // require https for the Async Clipboard API).
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(text).then(doneCopy).catch(function () {
+                fallbackCopy(text);
+                doneCopy();
+              });
+            } else {
+              fallbackCopy(text);
+              doneCopy();
+            }
+          })
+          .catch(function (err) {
+            showToast('Couldn\'t fetch URLs: HTTP ' + err);
+            copyBtn.disabled = false;
+            copyBtn.innerHTML = origLabel;
+          });
+      });
+    }
+
+    function fallbackCopy(text) {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); } catch (e) { /* swallow */ }
+      document.body.removeChild(ta);
+    }
   })();
   </script>
 </body>
