@@ -2331,7 +2331,12 @@ def _enrich_connection(target, connection, requested_set=None, my_user_id=None):
         "linkedinUrl": connection.get("linkedinUrl") or "",
         "title": pos.get("title") or "",
         "company": pos.get("companyName") or "",
-        "score": connection.get("score") or 0,
+        # Preserve None for manual paths (no enrichment data) so the
+        # `c.score is not none` template guard hides the score pill.
+        # Use direct .get() — falsy 0 from real Draftboard data is kept
+        # as 0 (renders the "0" pill); None from manual paths stays None
+        # (hides the pill). The previous `or 0` coalesce defeated this.
+        "score": connection.get("score"),
         "score_details": connection.get("scoreDetails") or [],
         "humanized_details": humanized,
         "owners": raw_owners,
@@ -2442,6 +2447,14 @@ def targets_view():
         owner_target_ids = db_target_ids_for_owner(resolved_owner_id)
         targets = [t for t in targets if t.get("id") in owner_target_ids]
 
+    # "Has manual list match" filter — narrow to only targets where at least
+    # one uploaded list has a connection with this target's LinkedIn URL.
+    manual_only = request.args.get("manual_only") == "1"
+    if manual_only:
+        manual_summary = manual_path_match_summary()
+        matched_ids = manual_summary["matched_target_ids"]
+        targets = [t for t in targets if t.get("id") in matched_ids]
+
     # Search filter (case-insensitive substring across name/title/company/tags)
     q = (request.args.get("q") or "").strip()
     q_lower = q.lower()
@@ -2488,6 +2501,8 @@ def targets_view():
         cache_age=cache_age_seconds(),
         owners_list=owners_list,
         owner_filter=owner_filter,
+        manual_only=manual_only,
+        manual_match_total=len(manual_path_match_summary()["matched_target_ids"]),
         me=me_for_template,
     )
 
@@ -2798,11 +2813,56 @@ def connections_view():
     except ValueError:
         page = 1
     PAGE_SIZE = 100
-    total = db_count_connectors(query=q or None)
+    # Build manual-list-derived "connectors" first so we can include them in
+    # the total count + interleave them with Draftboard connectors. Each
+    # uploaded list with >=1 target match becomes one row, with the list
+    # owner as the connector. Cheap: cached for the request via Flask's g.
+    summary = manual_path_match_summary()
+    manual_connectors = []
+    q_lower = (q or "").lower()
+    for lid, data in summary["by_list"].items():
+        if not data.get("count"):
+            continue
+        first = data.get("owner_first", "")
+        last = data.get("owner_last", "")
+        title = data.get("owner_title", "")
+        company = data.get("owner_company", "")
+        # Apply same case-insensitive substring search as Draftboard connectors
+        if q_lower and q_lower not in (
+            f"{first} {last} {title} {company}".lower()
+        ):
+            continue
+        manual_connectors.append({
+            "connector_key": f"manual:{lid}",
+            "first": first, "last": last,
+            "name": (f"{first} {last}").strip() or data.get("label", "(unnamed list)"),
+            "linkedin": data.get("owner_linkedin", ""),
+            "title": title, "company": company,
+            "intro_count": data["count"],
+            "top_score": None,        # template hides the score pill on None
+            "is_manual": True,        # template adds a small "from list" subtitle
+            "list_label": data.get("label", ""),
+        })
+
+    db_total = db_count_connectors(query=q or None)
+    total = db_total + len(manual_connectors)
     total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
     page = min(page, total_pages)
     offset = (page - 1) * PAGE_SIZE
-    connectors = db_list_connectors(query=q or None, limit=PAGE_SIZE, offset=offset)
+
+    # Manual connectors render at the BOTTOM of the list (after Draftboard
+    # connectors, sorted by intro_count). With ~5 manual lists max in a
+    # realistic workspace, they fit on the last page or two without
+    # disrupting the existing pagination math.
+    db_connectors = db_list_connectors(query=q or None, limit=PAGE_SIZE, offset=offset)
+    db_to_show = max(0, PAGE_SIZE - len(db_connectors))  # how many slots left
+    if len(db_connectors) < PAGE_SIZE and len(manual_connectors) > 0:
+        # Page is partially filled by Draftboard rows; pad with manual rows.
+        manual_offset = max(0, offset - db_total)
+        manual_slice = manual_connectors[manual_offset:manual_offset + db_to_show]
+        connectors = db_connectors + manual_slice
+    else:
+        connectors = db_connectors
 
     me_for_template, _ = fetch_me()
     if me_for_template:
@@ -2827,7 +2887,14 @@ def connections_view():
 def connector_drawer(connector_key):
     """Drawer for a single connector PERSON — lists every target they can intro
     to (across all the per-pair connection_ids the API mints), grouped by
-    company. Re-uses the connector-card UI but each card is one TARGET."""
+    company. Re-uses the connector-card UI but each card is one TARGET.
+
+    Manual-list connector_keys have the prefix 'manual:<list_id>' and route
+    to a different code path that builds paths from manual_path_connections
+    + targets_cache instead of connector_paths. The output shape is
+    identical so the same template handles both."""
+    if connector_key.startswith("manual:"):
+        return _connector_drawer_manual(connector_key)
     paths = db_targets_for_connector(connector_key)
     if not paths:
         return ("<div class='p-6 text-rose-700'>No paths found for this connector. "
@@ -2890,19 +2957,99 @@ def connector_drawer(connector_key):
     # by score desc.
     sorted_groups = []
     for company, items in grouped.items():
-        items.sort(key=lambda x: x["card"]["score"], reverse=True)
+        # `or 0` keeps None scores (manual paths, null-scored API rows) from
+        # tripping the sort with a TypeError.
+        items.sort(key=lambda x: x["card"]["score"] or 0, reverse=True)
         sorted_groups.append({
             "company": company,
             "items": items,
-            "best_score": items[0]["card"]["score"] if items else 0,
+            "best_score": (items[0]["card"]["score"] or 0) if items else 0,
         })
-    sorted_groups.sort(key=lambda g: g["best_score"], reverse=True)
+    sorted_groups.sort(key=lambda g: g["best_score"] or 0, reverse=True)
 
     return render_template(
         "_drawer_connector.html",
         connector=connector_info,
         groups=sorted_groups,
         total_targets=len(paths),
+    )
+
+
+def _connector_drawer_manual(connector_key: str):
+    """Drawer for a `manual:<list_id>` connector — the list owner. Lists every
+    target the list-owner's CSV had a match against, grouped by company.
+    Same template + output shape as the regular connector_drawer so they
+    render identically."""
+    try:
+        list_id = int(connector_key.split(":", 1)[1])
+    except (IndexError, ValueError):
+        return ("<div class='p-6 text-rose-700'>Invalid manual list reference.</div>"), 404
+
+    summary = manual_path_match_summary()
+    list_data = summary["by_list"].get(list_id)
+    if not list_data or not list_data.get("count"):
+        return ("<div class='p-6 text-rose-700'>This list either was deleted "
+                "or has no matches against your current targets.</div>"), 404
+
+    targets_all, _ = fetch_all_targets()
+    target_map = {t.get("id"): t for t in targets_all}
+    me_id = get_my_owner_id()
+
+    of = list_data.get("owner_first", "")
+    ol = list_data.get("owner_last", "")
+    connector_info = {
+        "key": connector_key,
+        "first": of,
+        "last": ol,
+        "name": (f"{of} {ol}").strip() or list_data.get("label", "(unnamed list)"),
+        "initials": _initials(of, ol),
+        "linkedin": list_data.get("owner_linkedin", ""),
+        "title": list_data.get("owner_title", ""),
+        "company": list_data.get("owner_company", ""),
+    }
+
+    grouped = {}
+    paths_count = 0
+    for tid in list_data["target_ids"]:
+        target = target_map.get(tid)
+        if not target:
+            continue
+        # Build a Connection-shaped dict — same path manual_paths_for_target
+        # uses, so _enrich_connection produces the same connector card shape
+        # as the target-drawer renders.
+        manual_conn_list = manual_paths_for_target(target)
+        # Multiple lists could match this target; pick the one for THIS list.
+        manual_conn = next(
+            (m for m in manual_conn_list if m.get("_manual_list_id") == list_id),
+            None,
+        )
+        if manual_conn is None:
+            continue
+        paths_count += 1
+        company = ((target.get("position") or {}).get("companyName") or "").strip() or "(unknown company)"
+        grouped.setdefault(company, []).append({
+            "target": _enrich_target(target),
+            "target_id": tid,
+            "card": _enrich_connection(target, manual_conn, my_user_id=me_id),
+        })
+
+    # Manual paths have score=None — sort companies by upload recency / name
+    # since there's no score to sort by. Within company, also alphabetical.
+    sorted_groups = []
+    for company, items in grouped.items():
+        items.sort(key=lambda x: x["card"].get("name") or "")
+        sorted_groups.append({
+            "company": company,
+            "items": items,
+            "best_score": 0,  # template only uses this for sorting
+        })
+    sorted_groups.sort(key=lambda g: g["company"].lower())
+
+    return render_template(
+        "_drawer_connector.html",
+        connector=connector_info,
+        groups=sorted_groups,
+        total_targets=paths_count,
     )
 
 
@@ -2952,7 +3099,6 @@ def new_paths_view():
     targets_all, _ = fetch_all_targets()
     target_map = {t.get("id"): t for t in targets_all}
     enriched_paths = []
-    seen_targets = set()
     for r in rows:
         target = target_map.get(r["target_id"])
         if not target:
@@ -2970,7 +3116,46 @@ def new_paths_view():
             "first_seen_at": r["first_seen_at"],
             "last_seen_at": r["last_seen_at"],
         })
-        seen_targets.add(r["target_id"])
+
+    # Append manual-path matches to the new-paths feed. Each list's upload
+    # timestamp acts as first_seen_at — a list uploaded today shows ALL its
+    # matches under "Last 24h" / "Last 7d". Manual paths bypass the
+    # min_score filter entirely (they're user-curated; the customer
+    # uploaded them on purpose, no score gate makes sense). Owner filter
+    # also bypassed — manual paths have only the customer as owner, so a
+    # specific-teammate filter would always exclude them, which would feel
+    # broken when toggling owner filters.
+    summary = manual_path_match_summary()
+    for list_id, ldata in summary["by_list"].items():
+        list_uploaded = ldata.get("uploaded_at") or 0
+        if list_uploaded < since_ts:
+            continue
+        for tid in ldata["target_ids"]:
+            target = target_map.get(tid)
+            if not target:
+                continue
+            manual_conn_list = manual_paths_for_target(target)
+            manual_conn = next(
+                (m for m in manual_conn_list if m.get("_manual_list_id") == list_id),
+                None,
+            )
+            if manual_conn is None:
+                continue
+            enriched_conn = _enrich_connection(target, manual_conn, my_user_id=me_id)
+            enriched_paths.append({
+                "target": _enrich_target(target),
+                "target_id": tid,
+                "connection": enriched_conn,
+                "first_seen_at": list_uploaded,
+                "last_seen_at": list_uploaded,
+            })
+    # Re-sort the combined list: score desc, then first_seen_at desc. Manual
+    # paths (score=None) sort to the bottom — same convention as connector
+    # cards. Within the manual block, more recent uploads come first.
+    enriched_paths.sort(
+        key=lambda p: (p["connection"].get("score") or 0, p["first_seen_at"]),
+        reverse=True,
+    )
 
     me_for_template, _ = fetch_me()
     if me_for_template:
@@ -4276,6 +4461,95 @@ def db_delete_manual_path_list(list_id: int) -> int:
         return cur.rowcount
 
 
+def manual_path_match_summary() -> dict:
+    """Compute manual-path matches across the customer's full target set.
+    Returns a dict the integration views can read without re-running this:
+        {
+          "by_list":           {list_id: {label, owner_first/last/email/title/company/linkedin,
+                                           uploaded_at, target_ids: set, count}, ...},
+          "by_target":         {target_id: [list_id, ...]},
+          "matched_target_ids": set of target_ids with >=1 manual match,
+          "lists":             [list_meta, ...],  # all uploaded lists, even no-match
+        }
+
+    Single full-table scan + Python set intersection. For a customer with
+    4k targets and 5 lists × 500 contacts each, this is sub-50ms.
+    Cached in the request via Flask's `g`-object pattern so multi-render
+    pages (e.g. /connections renders + paginates) don't recompute."""
+    from flask import g
+    cached = getattr(g, "_manual_path_match_summary", None)
+    if cached is not None:
+        return cached
+
+    targets, _ = fetch_all_targets()
+    target_url_to_id = {}
+    for t in targets:
+        url = (t.get("linkedinUrl") or "").strip()
+        if url:
+            norm = _normalize_linkedin(url)
+            if norm:
+                target_url_to_id[norm] = t.get("id")
+
+    by_list = {}
+    by_target = {}
+    matched_target_ids = set()
+    lists_all = []
+
+    if not target_url_to_id:
+        out = {
+            "by_list": {}, "by_target": {}, "matched_target_ids": set(),
+            "lists": [],
+        }
+        g._manual_path_match_summary = out
+        return out
+
+    with _db_lock, _db_connect() as conn:
+        # Pull all list metadata once
+        list_cur = conn.execute(
+            "SELECT id, label, owner_first, owner_last, owner_email, "
+            "       owner_title, owner_company, owner_linkedin, uploaded_at "
+            "FROM manual_path_lists"
+        )
+        for row in list_cur.fetchall():
+            (lid, label, of, ol, oe, ot, oc, olu, ua) = row
+            lists_all.append({
+                "id": lid, "label": label,
+                "owner_first": of or "", "owner_last": ol or "",
+                "owner_email": oe or "", "owner_title": ot or "",
+                "owner_company": oc or "", "owner_linkedin": olu or "",
+                "uploaded_at": ua,
+            })
+        # Pull all manual connections in one go; intersect against target URLs.
+        conn_cur = conn.execute(
+            "SELECT list_id, linkedin_url_normalized "
+            "FROM manual_path_connections WHERE linkedin_url_normalized != ''"
+        )
+        for list_id, norm_url in conn_cur.fetchall():
+            tid = target_url_to_id.get(norm_url)
+            if not tid:
+                continue
+            matched_target_ids.add(tid)
+            by_target.setdefault(tid, []).append(list_id)
+            bucket = by_list.setdefault(list_id, {"target_ids": set()})
+            bucket["target_ids"].add(tid)
+
+    # Hydrate each by_list entry with the list metadata
+    list_by_id = {l["id"]: l for l in lists_all}
+    for lid, data in by_list.items():
+        meta = list_by_id.get(lid, {})
+        data.update(meta)
+        data["count"] = len(data["target_ids"])
+
+    out = {
+        "by_list": by_list,
+        "by_target": by_target,
+        "matched_target_ids": matched_target_ids,
+        "lists": lists_all,
+    }
+    g._manual_path_match_summary = out
+    return out
+
+
 def manual_paths_for_target(target: dict) -> list[dict]:
     """Find manual-list connections that match this target's LinkedIn URL.
     Returns a list of Connection-shaped dicts (same shape as
@@ -5220,14 +5494,23 @@ def manual_paths_view():
             time.strftime("%Y-%m-%d %H:%M", time.localtime(l["uploaded_at"]))
             if l["uploaded_at"] else ""
         )
+    # Defensive int parse — query strings come from the user's URL bar and
+    # could be anything. A non-numeric value would throw a 500 on the upload-
+    # success redirect view, which is a user-hostile place to surface the bug.
+    def _qs_int(name: str) -> int:
+        try:
+            return int(request.args.get(name) or 0)
+        except (TypeError, ValueError):
+            return 0
     return render_template(
         "manual_paths.html",
         lists=lists,
         upload_error=request.args.get("upload_error", ""),
         upload_warning=request.args.get("upload_warning", ""),
         upload_success=request.args.get("upload_success", ""),
-        upload_imported=int(request.args.get("imported") or 0),
-        upload_skipped=int(request.args.get("skipped") or 0),
+        upload_imported=_qs_int("imported"),
+        upload_skipped=_qs_int("skipped"),
+        upload_match_count=_qs_int("match_count"),
         # Round-trip form values on validation error so the user doesn't
         # have to re-type 6 fields after a typo / missing file.
         upload_label=request.args.get("label", ""),
@@ -5321,11 +5604,27 @@ def manual_paths_upload():
         detected_cols=detected_cols,
         skipped=skipped,
     )
+    # Match-preview: count how many of the JUST-IMPORTED rows match a
+    # current target. Cheap inline lookup, no need to round-trip through
+    # manual_path_match_summary (which is per-request-cached anyway).
+    targets, _ = fetch_all_targets()
+    target_url_set = set()
+    for t in targets:
+        url = (t.get("linkedinUrl") or "").strip()
+        if url:
+            n = _normalize_linkedin(url)
+            if n:
+                target_url_set.add(n)
+    match_count = sum(
+        1 for r in rows if r["linkedin_url_normalized"] in target_url_set
+    )
     return redirect(url_for(
         "manual_paths_view",
         upload_success="1",
         imported=len(rows),
         skipped=skipped,
+        match_count=match_count,
+        list_id=list_id,
     ))
 
 
