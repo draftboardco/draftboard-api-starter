@@ -2331,7 +2331,12 @@ def _enrich_connection(target, connection, requested_set=None, my_user_id=None):
         "linkedinUrl": connection.get("linkedinUrl") or "",
         "title": pos.get("title") or "",
         "company": pos.get("companyName") or "",
-        "score": connection.get("score") or 0,
+        # Preserve None for manual paths (no enrichment data) so the
+        # `c.score is not none` template guard hides the score pill.
+        # Use direct .get() — falsy 0 from real Draftboard data is kept
+        # as 0 (renders the "0" pill); None from manual paths stays None
+        # (hides the pill). The previous `or 0` coalesce defeated this.
+        "score": connection.get("score"),
         "score_details": connection.get("scoreDetails") or [],
         "humanized_details": humanized,
         "owners": raw_owners,
@@ -2952,13 +2957,15 @@ def connector_drawer(connector_key):
     # by score desc.
     sorted_groups = []
     for company, items in grouped.items():
-        items.sort(key=lambda x: x["card"]["score"], reverse=True)
+        # `or 0` keeps None scores (manual paths, null-scored API rows) from
+        # tripping the sort with a TypeError.
+        items.sort(key=lambda x: x["card"]["score"] or 0, reverse=True)
         sorted_groups.append({
             "company": company,
             "items": items,
-            "best_score": items[0]["card"]["score"] if items else 0,
+            "best_score": (items[0]["card"]["score"] or 0) if items else 0,
         })
-    sorted_groups.sort(key=lambda g: g["best_score"], reverse=True)
+    sorted_groups.sort(key=lambda g: g["best_score"] or 0, reverse=True)
 
     return render_template(
         "_drawer_connector.html",
@@ -3092,7 +3099,6 @@ def new_paths_view():
     targets_all, _ = fetch_all_targets()
     target_map = {t.get("id"): t for t in targets_all}
     enriched_paths = []
-    seen_targets = set()
     for r in rows:
         target = target_map.get(r["target_id"])
         if not target:
@@ -3110,7 +3116,6 @@ def new_paths_view():
             "first_seen_at": r["first_seen_at"],
             "last_seen_at": r["last_seen_at"],
         })
-        seen_targets.add(r["target_id"])
 
     # Append manual-path matches to the new-paths feed. Each list's upload
     # timestamp acts as first_seen_at — a list uploaded today shows ALL its
@@ -3144,7 +3149,6 @@ def new_paths_view():
                 "first_seen_at": list_uploaded,
                 "last_seen_at": list_uploaded,
             })
-            seen_targets.add(tid)
     # Re-sort the combined list: score desc, then first_seen_at desc. Manual
     # paths (score=None) sort to the bottom — same convention as connector
     # cards. Within the manual block, more recent uploads come first.
@@ -5490,15 +5494,23 @@ def manual_paths_view():
             time.strftime("%Y-%m-%d %H:%M", time.localtime(l["uploaded_at"]))
             if l["uploaded_at"] else ""
         )
+    # Defensive int parse — query strings come from the user's URL bar and
+    # could be anything. A non-numeric value would throw a 500 on the upload-
+    # success redirect view, which is a user-hostile place to surface the bug.
+    def _qs_int(name: str) -> int:
+        try:
+            return int(request.args.get(name) or 0)
+        except (TypeError, ValueError):
+            return 0
     return render_template(
         "manual_paths.html",
         lists=lists,
         upload_error=request.args.get("upload_error", ""),
         upload_warning=request.args.get("upload_warning", ""),
         upload_success=request.args.get("upload_success", ""),
-        upload_imported=int(request.args.get("imported") or 0),
-        upload_skipped=int(request.args.get("skipped") or 0),
-        upload_match_count=int(request.args.get("match_count") or 0),
+        upload_imported=_qs_int("imported"),
+        upload_skipped=_qs_int("skipped"),
+        upload_match_count=_qs_int("match_count"),
         # Round-trip form values on validation error so the user doesn't
         # have to re-type 6 fields after a typo / missing file.
         upload_label=request.args.get("label", ""),

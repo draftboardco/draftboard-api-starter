@@ -91,10 +91,12 @@
                     </div>
                   </div>
                 </div>
-                <div class="flex-shrink-0 text-right">
-                  <div class="font-semibold text-slate-900">{{ item.card.score }}</div>
-                  <div class="text-[10px] text-slate-500 uppercase">score</div>
-                </div>
+                {% if item.card.score is not none %}
+                  <div class="flex-shrink-0 text-right">
+                    <div class="font-semibold text-slate-900">{{ item.card.score }}</div>
+                    <div class="text-[10px] text-slate-500 uppercase">score</div>
+                  </div>
+                {% endif %}
               </header>
 
               {# Owner badge — same component as in connector cards #}
