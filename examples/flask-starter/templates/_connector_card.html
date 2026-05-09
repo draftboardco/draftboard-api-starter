@@ -23,10 +23,17 @@
         </div>
       </div>
     </div>
-    <div class="flex-shrink-0 text-right">
-      <div class="font-semibold text-slate-900">{{ c.score }}</div>
-      <div class="text-[10px] text-slate-500 uppercase">score</div>
-    </div>
+    {# Hide the score block ONLY when score is explicitly None (manual-list
+       paths set score=None because we don't have enrichment data).
+       Draftboard's API legitimately returns score=0 for ~54% of cached
+       connections — those should still render the "0" pill so the user
+       sees the real value, not a hidden card that looks broken. #}
+    {% if c.score is not none %}
+      <div class="flex-shrink-0 text-right">
+        <div class="font-semibold text-slate-900">{{ c.score }}</div>
+        <div class="text-[10px] text-slate-500 uppercase">score</div>
+      </div>
+    {% endif %}
   </header>
 
   {# Owner badge: who in your team can intro through this connection #}

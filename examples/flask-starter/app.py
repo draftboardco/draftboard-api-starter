@@ -689,6 +689,49 @@ def init_db():
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_category_rules_value ON category_rules(value)")
 
+        # Manual path lists — uploaded CSVs from external network owners
+        # (typically the customer's investors). Each list is one upload;
+        # owner_* columns describe the person whose connections are in the
+        # CSV and double as the "connector" identity on the target drawer
+        # when one of their connections matches a target by LinkedIn URL.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS manual_path_lists (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                label TEXT NOT NULL,
+                owner_first TEXT NOT NULL DEFAULT '',
+                owner_last TEXT NOT NULL DEFAULT '',
+                owner_email TEXT NOT NULL DEFAULT '',
+                owner_title TEXT NOT NULL DEFAULT '',
+                owner_company TEXT NOT NULL DEFAULT '',
+                owner_linkedin TEXT NOT NULL DEFAULT '',
+                detected_columns TEXT NOT NULL DEFAULT '{}',
+                row_count INTEGER NOT NULL DEFAULT 0,
+                skipped_count INTEGER NOT NULL DEFAULT 0,
+                uploaded_at INTEGER NOT NULL
+            )
+        """)
+
+        # One row per (list, contact) pair. linkedin_url_normalized is the
+        # match key against targets_cache. Original raw URL is preserved for
+        # display + auditing.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS manual_path_connections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                list_id INTEGER NOT NULL,
+                first_name TEXT NOT NULL DEFAULT '',
+                last_name TEXT NOT NULL DEFAULT '',
+                email TEXT NOT NULL DEFAULT '',
+                company TEXT NOT NULL DEFAULT '',
+                position TEXT NOT NULL DEFAULT '',
+                connected_on TEXT NOT NULL DEFAULT '',
+                linkedin_url TEXT NOT NULL DEFAULT '',
+                linkedin_url_normalized TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY (list_id) REFERENCES manual_path_lists(id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_manual_path_connections_url ON manual_path_connections(linkedin_url_normalized)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_manual_path_connections_list ON manual_path_connections(list_id)")
+
         # Migration: drop the older `oauth_tokens` + `google_sync_state` tables
         # from the BYO architecture. Their data was always per-install and
         # ephemeral, so dropping is safe.
@@ -2245,7 +2288,11 @@ def _enrich_connection(target, connection, requested_set=None, my_user_id=None):
 
     # Plain + HTML message variants for the drawer + Compose-email button.
     messages = _build_messages(target, connection)
-    gmail_url = _gmail_compose_url(messages["subject"], messages["plain_fallback"])
+    # For manual-list paths, the list owner's email travels on the
+    # connection dict as `_manual_list_email`. Pre-fill it as the To: so
+    # the compose-email button is one click instead of one click + paste.
+    manual_to = (connection.get("_manual_list_email") or "").strip()
+    gmail_url = _gmail_compose_url(messages["subject"], messages["plain_fallback"], to=manual_to or None)
 
     # Owner classification: which owners are me vs teammates.
     raw_owners = connection.get("owners") or []
@@ -2638,6 +2685,10 @@ def target_drawer(target_id):
                 "Try clicking Refresh on the Targets page.</div>"), 404
 
     connections, error = fetch_target_connections(target_id)
+    # Augment with manual-list paths (from CSV uploads). They have the same
+    # shape as Draftboard-API connections and flow through the same enricher
+    # + template, so they're indistinguishable in the UI except for score=0.
+    connections = list(connections) + manual_paths_for_target(target)
     connections.sort(key=lambda c: c.get("score") or 0, reverse=True)
     requested_set = db_intro_requests_for_target(target_id)
     enriched_conns = [_enrich_connection(target, c, requested_set) for c in connections]
@@ -2655,6 +2706,7 @@ def _connectors_panel_for_target(target):
     """Build the data structure for the right-column connectors panel for one target."""
     target_id = target.get("id")
     connections, error = fetch_target_connections(target_id)
+    connections = list(connections) + manual_paths_for_target(target)
     connections.sort(key=lambda c: c.get("score") or 0, reverse=True)
     requested_set = db_intro_requests_for_target(target_id)
     enriched = [_enrich_connection(target, c, requested_set) for c in connections]
@@ -3994,6 +4046,319 @@ def _categorize_candidate(email: str, name: str = "", linkedin_url: str = "",
     return {"category": "unclassified", "confidence": "low", "source": "default", "reasoning": ""}
 
 
+# ---- Manual path uploads (CSV → connector cards on target drawer) ---------
+#
+# A customer's investor exports their LinkedIn connections (or any tool's
+# equivalent). Customer drops the CSV here. Each row that has a LinkedIn URL
+# matching one of the customer's targets surfaces as an additional path on
+# that target's drawer — same connector card as Draftboard-derived paths,
+# just with score=0 (we don't have enrichment data) and bullets describing
+# the list source.
+
+# Header aliases for column detection. Values are searched as case-
+# insensitive substrings; first match wins. The order within each list
+# matters when two aliases could both match (e.g., "URL" beats "Profile URL").
+MANUAL_PATH_COLUMN_ALIASES = {
+    "linkedin_url": ["linkedin url", "profile url", "linkedin profile", "linkedin", "url", "profile"],
+    "first_name":   ["first name", "firstname", "first", "given name", "given"],
+    "last_name":    ["last name", "lastname", "last", "surname", "family name", "family"],
+    "full_name":    ["full name", "name"],
+    "email":        ["email address", "e-mail", "email"],
+    "company":      ["current company", "company", "organization", "organisation", "employer"],
+    "position":     ["current position", "job title", "position", "title", "role", "job"],
+    "connected_on": ["connected on", "connection date", "date connected", "date added", "since", "connected"],
+}
+
+
+def _detect_csv_columns(header_row):
+    """Map field-of-interest to column index by header text. Returns dict
+    {field_name: column_index}. Fields that don't map are absent from the
+    output — caller should handle missing fields gracefully.
+
+    Designed to handle: LinkedIn export, Apollo export, any tool with
+    reasonably-named columns, hand-rolled CSVs."""
+    if not header_row:
+        return {}
+    header_lower = [(h or "").strip().lower() for h in header_row]
+    out = {}
+    for field, aliases in MANUAL_PATH_COLUMN_ALIASES.items():
+        for alias in aliases:
+            for i, h in enumerate(header_lower):
+                if h == alias or alias in h:
+                    if field not in out:
+                        out[field] = i
+                        break
+            if field in out:
+                break
+    return out
+
+
+def _split_full_name(full):
+    """Split 'John Smith' into ('John', 'Smith'). Single-word names go to
+    first_name. Empty input → ('', '')."""
+    parts = (full or "").strip().split(None, 1)
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    if len(parts) == 1:
+        return parts[0], ""
+    return "", ""
+
+
+def parse_manual_path_csv(file_obj) -> tuple[list[dict], dict, int]:
+    """Read a CSV from `file_obj` (Flask's request.files['file']) and
+    extract contact rows. Returns (rows, detected_columns, skipped_count).
+
+    Each row is a dict with keys matching MANUAL_PATH_COLUMN_ALIASES. Rows
+    without a LinkedIn URL are skipped (we can't match them against
+    targets without one). Rows with a URL but no name are kept — we'll
+    show the URL as a fallback identity.
+
+    Encoding: utf-8-sig (handles LinkedIn's BOM-prefixed exports cleanly,
+    matches the kit's csv convention)."""
+    import csv, io
+    raw = file_obj.read()
+    if isinstance(raw, bytes):
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            try:
+                text = raw.decode("latin-1")
+            except UnicodeDecodeError:
+                return [], {}, 0
+    else:
+        text = raw
+    # LinkedIn's exports occasionally have notes/disclaimer rows above the
+    # actual header. Skip leading lines that don't have at least one comma.
+    lines = text.splitlines()
+    while lines and "," not in lines[0]:
+        lines.pop(0)
+    if not lines:
+        return [], {}, 0
+    cleaned = "\n".join(lines)
+    reader = csv.reader(io.StringIO(cleaned))
+    try:
+        header = next(reader)
+    except StopIteration:
+        return [], {}, 0
+    cols = _detect_csv_columns(header)
+    if "linkedin_url" not in cols:
+        # Without a URL column we can't match anything against targets.
+        # Caller surfaces this to the user.
+        return [], cols, 0
+
+    def _g(row, field):
+        idx = cols.get(field)
+        if idx is None or idx >= len(row):
+            return ""
+        return (row[idx] or "").strip()
+
+    # Strict-ish LinkedIn person-profile pattern. Catches:
+    #   - non-LinkedIn URLs that just happen to contain "linkedin.com" in a
+    #     query string (e.g. github.com/?ref=linkedin.com)
+    #   - LinkedIn company / school / showcase URLs that can never match a
+    #     person target (e.g. linkedin.com/company/draftboard)
+    # Accepts any host on the linkedin.com domain (www, region subdomains
+    # like uk.linkedin.com) followed by /in/<slug>.
+    li_person_re = re.compile(
+        r"^https?://([a-z0-9-]+\.)?linkedin\.com/in/[^\s/?#]+",
+        re.IGNORECASE,
+    )
+    rows = []
+    skipped = 0
+    seen_norm = set()  # within-CSV dedup — same URL twice → import once
+    for raw_row in reader:
+        if not raw_row or all(not (c or "").strip() for c in raw_row):
+            continue  # blank line
+        url = _g(raw_row, "linkedin_url")
+        if not url or not li_person_re.match(url.strip()):
+            skipped += 1
+            continue
+        norm = _normalize_linkedin(url)
+        if not norm:
+            skipped += 1
+            continue
+        if norm in seen_norm:
+            skipped += 1
+            continue
+        seen_norm.add(norm)
+        first = _g(raw_row, "first_name")
+        last = _g(raw_row, "last_name")
+        if not first and not last and "full_name" in cols:
+            first, last = _split_full_name(_g(raw_row, "full_name"))
+        # Per-cell length cap — cosmetic for the connector card and a
+        # defense-in-depth against pathological CSVs with massive cells.
+        def _cap(s, n=240):
+            return (s or "")[:n]
+        rows.append({
+            "linkedin_url": _cap(url),
+            "linkedin_url_normalized": norm,
+            "first_name": _cap(first, 80),
+            "last_name": _cap(last, 80),
+            "email": _cap(_g(raw_row, "email"), 200),
+            "company": _cap(_g(raw_row, "company"), 200),
+            "position": _cap(_g(raw_row, "position"), 200),
+            "connected_on": _cap(_g(raw_row, "connected_on"), 40),
+        })
+    return rows, cols, skipped
+
+
+def db_save_manual_path_list(meta: dict, rows: list[dict], detected_cols: dict, skipped: int) -> int:
+    """Persist a parsed CSV. Returns the new list_id. `meta` is the
+    upload-form metadata about the LIST OWNER (the investor / external
+    person whose CSV this is)."""
+    now = int(time.time())
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO manual_path_lists "
+            "(label, owner_first, owner_last, owner_email, owner_title, owner_company, owner_linkedin, "
+            " detected_columns, row_count, skipped_count, uploaded_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                meta.get("label", "").strip(),
+                meta.get("owner_first", "").strip(),
+                meta.get("owner_last", "").strip(),
+                meta.get("owner_email", "").strip(),
+                meta.get("owner_title", "").strip(),
+                meta.get("owner_company", "").strip(),
+                meta.get("owner_linkedin", "").strip(),
+                json.dumps(detected_cols),
+                len(rows),
+                skipped,
+                now,
+            ),
+        )
+        list_id = cur.lastrowid
+        for r in rows:
+            conn.execute(
+                "INSERT INTO manual_path_connections "
+                "(list_id, first_name, last_name, email, company, position, connected_on, "
+                " linkedin_url, linkedin_url_normalized) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    list_id,
+                    r["first_name"], r["last_name"], r["email"],
+                    r["company"], r["position"], r["connected_on"],
+                    r["linkedin_url"], r["linkedin_url_normalized"],
+                ),
+            )
+        conn.commit()
+    return list_id
+
+
+def db_list_manual_path_lists() -> list[dict]:
+    """Return all uploaded lists with their metadata (newest first)."""
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT id, label, owner_first, owner_last, owner_email, owner_title, "
+            "       owner_company, row_count, skipped_count, uploaded_at "
+            "FROM manual_path_lists ORDER BY uploaded_at DESC"
+        )
+        return [
+            {
+                "id": r[0], "label": r[1],
+                "owner_first": r[2], "owner_last": r[3], "owner_email": r[4],
+                "owner_title": r[5], "owner_company": r[6],
+                "row_count": r[7], "skipped_count": r[8],
+                "uploaded_at": r[9],
+            }
+            for r in cur.fetchall()
+        ]
+
+
+def db_delete_manual_path_list(list_id: int) -> int:
+    """Delete one list + cascade its connections. Returns rowcount."""
+    with _db_lock, _db_connect() as conn:
+        # Manual cascade — SQLite FOREIGN KEY isn't enforced unless PRAGMA
+        # foreign_keys=ON is set, which isn't a kit-wide guarantee.
+        conn.execute("DELETE FROM manual_path_connections WHERE list_id = ?", (list_id,))
+        cur = conn.execute("DELETE FROM manual_path_lists WHERE id = ?", (list_id,))
+        conn.commit()
+        return cur.rowcount
+
+
+def manual_paths_for_target(target: dict) -> list[dict]:
+    """Find manual-list connections that match this target's LinkedIn URL.
+    Returns a list of Connection-shaped dicts (same shape as
+    /targets/{id}/connections returns), so they can flow through
+    _enrich_connection alongside Draftboard-derived paths.
+
+    Match: normalize both sides via _normalize_linkedin (handles www/
+    trailing-slash/scheme variations). Only fires when target has a
+    LinkedIn URL — without one, no match is possible."""
+    target_url = (target.get("linkedinUrl") or "").strip()
+    if not target_url:
+        return []
+    norm = _normalize_linkedin(target_url)
+    if not norm:
+        return []
+    target_first = (target.get("firstName") or "").strip()
+    me_id = get_my_owner_id()
+    me_data = {}
+    raw = db_app_state_get("me_data")
+    if raw:
+        try:
+            me_data = json.loads(raw) or {}
+        except (ValueError, TypeError):
+            me_data = {}
+    # me_owner.id MUST equal my_user_id when /me is loaded, AND must equal
+    # None when /me is NOT loaded (so _enrich_connection's `o.get("id") ==
+    # my_user_id` check evaluates True in both cases). Using a sentinel
+    # like "_self" would break the comparison on fresh installs.
+    me_owner = {
+        "id": me_id,  # None when /me hasn't run yet — matches my_user_id=None
+        "firstName": (me_data.get("user_first") or "").strip(),
+        "lastName": (me_data.get("user_last") or "").strip(),
+        "linkedinUrl": (me_data.get("user_linkedin") or "").strip(),
+        "score": 0,
+    }
+    out = []
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT l.id, l.label, l.owner_first, l.owner_last, l.owner_email, "
+            "       l.owner_title, l.owner_company, l.owner_linkedin, l.uploaded_at, "
+            "       c.id, c.first_name, c.last_name, c.email, c.company, c.position, "
+            "       c.connected_on, c.linkedin_url "
+            "FROM manual_path_connections c "
+            "JOIN manual_path_lists l ON c.list_id = l.id "
+            "WHERE c.linkedin_url_normalized = ?",
+            (norm,),
+        )
+        for row in cur.fetchall():
+            (lid, label, of, ol, oe, ot, oc, olu, uploaded_at,
+             cid, _cf, _cl, _ce, c_company, c_position, connected_on, _curl) = row
+            uploaded_str = time.strftime("%Y-%m-%d", time.localtime(uploaded_at)) if uploaded_at else ""
+            details = []
+            label_text = label or f"{of} {ol}".strip() or "your manual list"
+            details.append(
+                f"Has {target_first or 'them'} in their LinkedIn connections "
+                f"(from {label_text}, uploaded {uploaded_str})"
+            )
+            if connected_on:
+                details.append(f"Connected since {connected_on}")
+            if c_position or c_company:
+                listed = " at ".join(p for p in (c_position, c_company) if p)
+                if listed:
+                    details.append(f"Listed as {listed}")
+            out.append({
+                "id": f"manual:{lid}:{cid}",
+                "firstName": of,
+                "lastName": ol,
+                "linkedinUrl": olu or "",
+                "position": {"title": ot or "", "companyName": oc or ""},
+                # score=None (NOT 0) so the template's `score is not none`
+                # guard hides the pill cleanly. Setting to 0 would show "0"
+                # which reads as "weak relationship" — wrong signal.
+                "score": None,
+                "scoreDetails": details,
+                "owners": [me_owner],
+                # Carry-through metadata for the compose-email pre-fill,
+                # not required by Connection schema but read by enricher.
+                "_manual_list_email": oe or "",
+                "_manual_list_id": lid,
+            })
+    return out
+
+
 def db_set_candidate_status(email, status):
     """Set or clear a candidate's triage status. Empty status removes the row."""
     email = (email or "").strip().lower()
@@ -4842,6 +5207,142 @@ def supporters_linkedin_urls():
 
 
 # ---- Categorization routes -------------------------------------------------
+
+# ---- Manual path uploads ---------------------------------------------------
+
+@app.route("/settings/manual-paths", methods=["GET"])
+def manual_paths_view():
+    """Upload page: list existing uploads + form to add a new one."""
+    lists = db_list_manual_path_lists()
+    # Format dates and split detected_columns JSON for display.
+    for l in lists:
+        l["uploaded_display"] = (
+            time.strftime("%Y-%m-%d %H:%M", time.localtime(l["uploaded_at"]))
+            if l["uploaded_at"] else ""
+        )
+    return render_template(
+        "manual_paths.html",
+        lists=lists,
+        upload_error=request.args.get("upload_error", ""),
+        upload_warning=request.args.get("upload_warning", ""),
+        upload_success=request.args.get("upload_success", ""),
+        upload_imported=int(request.args.get("imported") or 0),
+        upload_skipped=int(request.args.get("skipped") or 0),
+        # Round-trip form values on validation error so the user doesn't
+        # have to re-type 6 fields after a typo / missing file.
+        upload_label=request.args.get("label", ""),
+        upload_owner_first=request.args.get("owner_first", ""),
+        upload_owner_last=request.args.get("owner_last", ""),
+        upload_owner_email=request.args.get("owner_email", ""),
+        upload_owner_title=request.args.get("owner_title", ""),
+        upload_owner_company=request.args.get("owner_company", ""),
+        upload_owner_linkedin=request.args.get("owner_linkedin", ""),
+        active="settings_manual_paths",
+    )
+
+
+@app.route("/settings/manual-paths", methods=["POST"])
+def manual_paths_upload():
+    """Accept a CSV upload + the list-owner metadata. Parse, persist, redirect.
+
+    Flexible CSV: the parser auto-detects which columns hold the LinkedIn
+    URL, name, email, etc. via header-text aliases — works with the
+    LinkedIn export format, Apollo exports, or any CSV with reasonably-
+    named columns. Rows without a LinkedIn URL are silently skipped (we
+    can't match them against targets), and the response surfaces the
+    skip count so the user knows."""
+    sec_site = request.headers.get("Sec-Fetch-Site")
+    if sec_site and sec_site not in ("same-origin", "none"):
+        return jsonify({"error": "cross-site form submission blocked"}), 403
+
+    label = (request.form.get("label") or "").strip()
+    owner_first = (request.form.get("owner_first") or "").strip()
+    owner_last = (request.form.get("owner_last") or "").strip()
+    owner_email = (request.form.get("owner_email") or "").strip()
+    owner_title = (request.form.get("owner_title") or "").strip()
+    owner_company = (request.form.get("owner_company") or "").strip()
+    owner_linkedin = (request.form.get("owner_linkedin") or "").strip()
+
+    # Pack the form values into the redirect so a validation bounce
+    # doesn't blank the customer's 6 typed fields.
+    form_passthrough = {
+        "label": label[:200], "owner_first": owner_first[:80],
+        "owner_last": owner_last[:80], "owner_email": owner_email[:200],
+        "owner_title": owner_title[:200], "owner_company": owner_company[:200],
+        "owner_linkedin": owner_linkedin[:400],
+    }
+    if not label or not owner_first or not owner_email:
+        return redirect(url_for(
+            "manual_paths_view", upload_error="missing_required", **form_passthrough,
+        ))
+    # Stricter email shape: rejects junk like "foo@b.co&body=injected" that
+    # the prior cheap "@... in last segment" check let through. Excludes
+    # URL-special chars (& ? = #) since those are the mailto/URL injection
+    # vectors we care about. Standard local-part chars allowed in the local
+    # part; standard domain chars + dots allowed after @.
+    if not re.match(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$", owner_email):
+        return redirect(url_for("manual_paths_view", upload_error="bad_email", **form_passthrough))
+    # Server-side length caps. The form has maxlength but a curl/scripted POST
+    # can submit anything; defense-in-depth.
+    if (len(label) > 200 or len(owner_first) > 80 or len(owner_last) > 80
+            or len(owner_email) > 200 or len(owner_title) > 200
+            or len(owner_company) > 200 or len(owner_linkedin) > 400):
+        return redirect(url_for("manual_paths_view", upload_error="too_long", **form_passthrough))
+
+    file_obj = request.files.get("csv_file")
+    if not file_obj or not file_obj.filename:
+        return redirect(url_for("manual_paths_view", upload_error="no_file", **form_passthrough))
+
+    try:
+        rows, detected_cols, skipped = parse_manual_path_csv(file_obj)
+    except Exception as e:
+        return redirect(url_for(
+            "manual_paths_view",
+            upload_error=f"parse_failed_{type(e).__name__}",
+            **form_passthrough,
+        ))
+
+    if "linkedin_url" not in detected_cols:
+        return redirect(url_for("manual_paths_view", upload_error="no_url_column", **form_passthrough))
+    if not rows:
+        return redirect(url_for("manual_paths_view", upload_error="no_valid_rows", **form_passthrough))
+
+    list_id = db_save_manual_path_list(
+        meta={
+            "label": label,
+            "owner_first": owner_first,
+            "owner_last": owner_last,
+            "owner_email": owner_email,
+            "owner_title": owner_title,
+            "owner_company": owner_company,
+            "owner_linkedin": owner_linkedin,
+        },
+        rows=rows,
+        detected_cols=detected_cols,
+        skipped=skipped,
+    )
+    return redirect(url_for(
+        "manual_paths_view",
+        upload_success="1",
+        imported=len(rows),
+        skipped=skipped,
+    ))
+
+
+@app.route("/settings/manual-paths/delete", methods=["POST"])
+def manual_paths_delete():
+    """Delete one uploaded list (and its rows). Form field: list_id."""
+    sec_site = request.headers.get("Sec-Fetch-Site")
+    if sec_site and sec_site not in ("same-origin", "none"):
+        return jsonify({"error": "cross-site form submission blocked"}), 403
+    try:
+        list_id = int(request.form.get("list_id") or "0")
+    except ValueError:
+        list_id = 0
+    if list_id > 0:
+        db_delete_manual_path_list(list_id)
+    return redirect(url_for("manual_paths_view"))
+
 
 @app.route("/settings/categorization", methods=["GET"])
 def settings_categorization_view():
