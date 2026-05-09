@@ -8,6 +8,13 @@ For the full git history, see [the commit log](https://github.com/draftboardco/d
 
 - (in progress)
 
+## 2026-05-09
+
+- **Added Supporter categorization.** Each row on the Supporters page now gets a colored category badge: 🏢 Customer / 💰 Investor / 🤝 Vendor / 👋 Friend / 💼 Coworker / • Unclassified. Hybrid pipeline: manual override (sticky) > user-uploaded match rules > built-in heuristic (personal-email TLDs → friend) > optional gpt-4o-mini fallback > default. New rules editor at `/settings/categorization` (paste names / domains / emails per category). Click any badge to override. New "Re-categorize all" bulk button. New filter dropdown.
+- **Added cross-teammate signal.** When the same person appears in 2+ teammate scanner uploads, every row showing them gets a purple "N teammates" badge — strong signal that the supporter is well-connected across the org.
+- **Added in-app feedback link.** Muted "💬 Feedback" link in the right side of every page's nav. Click opens an email pre-filled with your Draftboard identity (customer name + user) and the kit's git commit hash, so the kit author has enough context to triage without follow-up.
+- **Added "What's new" link** in nav pointing at this CHANGELOG on GitHub.
+
 ## 2026-05-08
 
 - **Added `/setup` onboarding wizard.** First-run page that asks "are you already a Draftboard customer?", walks new users to signup, and walks existing users through pasting an API key + configuring optional integrations. Auto-redirects from `/` when no API key is configured.
