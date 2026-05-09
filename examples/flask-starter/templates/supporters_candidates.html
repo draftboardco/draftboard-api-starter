@@ -147,6 +147,21 @@
       </div>
     {% endif %}
 
+    {# --- Re-categorize toolbar --- #}
+    {% if has_any_data %}
+      <div id="categorize-bar" class="mb-3 flex items-center gap-3 flex-wrap rounded-md border border-slate-200 bg-white px-4 py-2 text-sm text-slate-700">
+        <span>
+          Tag rows as customer / investor / vendor / friend / coworker.
+          <a href="/settings/categorization" class="text-indigo-600 hover:underline">Edit rules →</a>
+        </span>
+        <button id="categorize-btn" type="button"
+                class="ml-auto inline-flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md border border-slate-300 bg-white hover:bg-slate-50 text-slate-700">
+          Re-categorize all
+        </button>
+        <span id="categorize-status" class="text-xs text-slate-500 hidden"></span>
+      </div>
+    {% endif %}
+
     {# --- Filter / search bar --- #}
     {% if has_any_data %}
       <form method="GET" action="/supporters/candidates"
@@ -190,6 +205,16 @@
             <option value="supporter" {% if status_filter == 'supporter' %}selected{% endif %}>Marked as supporter</option>
             <option value="hidden" {% if status_filter == 'hidden' %}selected{% endif %}>Hidden only</option>
             <option value="unmarked" {% if status_filter == 'unmarked' %}selected{% endif %}>Not yet marked</option>
+          </select>
+        </div>
+        <div>
+          <label for="category" class="block text-[10px] uppercase tracking-wider text-slate-500 mb-1">Category</label>
+          <select name="category" id="category" onchange="this.form.submit()"
+                  class="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-indigo-500">
+            <option value="" {% if not category_filter %}selected{% endif %}>All</option>
+            {% for cat_value, cat_label in category_options %}
+              <option value="{{ cat_value }}" {% if category_filter == cat_value %}selected{% endif %}>{{ cat_label }}</option>
+            {% endfor %}
           </select>
         </div>
         <button type="submit"
@@ -249,11 +274,31 @@
                   data-email="{{ c.email }}" data-status="{{ c.row_status }}">
                 <td class="px-4 py-3 text-xs text-slate-400 align-top">{{ loop.index + (page - 1) * per_page }}</td>
                 <td class="px-4 py-3 align-top">
-                  <div class="font-medium text-slate-900 flex items-center gap-1.5">
+                  <div class="font-medium text-slate-900 flex items-center gap-1.5 flex-wrap">
                     {{ c.name }}
                     {% if c.row_status == 'starred' %}<span class="text-amber-500" title="Starred">★</span>{% endif %}
                     {% if c.row_status == 'supporter' %}<span class="inline-flex items-center rounded-full bg-emerald-100 text-emerald-800 px-1.5 py-0 text-[10px] font-medium" title="Already added as a Draftboard Supporter">supporter ✓</span>{% endif %}
                     {% if c.is_first_degree %}<span class="inline-flex items-center rounded-full bg-indigo-100 text-indigo-800 px-1.5 py-0 text-[10px] font-medium" title="In your existing Draftboard 1st-degree connector network — usable as a Supporter today">1st°</span>{% endif %}
+                    {% if c.teammate_count and c.teammate_count >= 2 %}<span class="inline-flex items-center rounded-full bg-purple-100 text-purple-800 px-1.5 py-0 text-[10px] font-medium" title="This person appears in {{ c.teammate_count }} teammate scanner uploads — strong cross-team signal">{{ c.teammate_count }} teammates</span>{% endif %}
+                    {# Category badge — click to override. The select.onchange POSTs to /supporters/categorize-one. #}
+                    {% set cat_emoji = category_display[c.category][0] %}
+                    {% set cat_label = category_display[c.category][1] %}
+                    {% set cat_classes = category_display[c.category][2] %}
+                    <span class="inline-flex items-center rounded-full {{ cat_classes }} px-1.5 py-0 text-[10px] font-medium relative"
+                          title="Category: {{ cat_label }} ({{ c.category_source }}). Click to change.">
+                      <span>{{ cat_emoji }}</span>
+                      <span class="ml-0.5">{{ cat_label }}</span>
+                      <select onchange="updateCategory('{{ c.email }}', this.value, this)"
+                              class="absolute inset-0 opacity-0 cursor-pointer w-full"
+                              aria-label="Change category for {{ c.name }}">
+                        {% if c.category_source == 'manual' %}
+                          <option value="__auto">↺ Reset to auto</option>
+                        {% endif %}
+                        {% for cat_value, _cat_label in category_options %}
+                          <option value="{{ cat_value }}" {% if c.category == cat_value %}selected{% endif %}>{{ category_display[cat_value][0] }} {{ category_display[cat_value][1] }}</option>
+                        {% endfor %}
+                      </select>
+                    </span>
                   </div>
                   <div class="text-xs text-slate-500 truncate">{{ c.email }}</div>
                 </td>
@@ -341,7 +386,7 @@
             Showing {{ (page - 1) * per_page + 1 }}–{{ [page * per_page, total] | min }} of {{ total }}
           </div>
           <div class="flex gap-1">
-            {% set qs = ('&q=' ~ query if query else '') ~ ('&contributor=' ~ contributor if contributor else '') ~ ('&source=' ~ source if source else '') ~ ('&status_filter=' ~ status_filter if status_filter and status_filter != 'active' else '') %}
+            {% set qs = ('&q=' ~ query if query else '') ~ ('&contributor=' ~ contributor if contributor else '') ~ ('&source=' ~ source if source else '') ~ ('&status_filter=' ~ status_filter if status_filter and status_filter != 'active' else '') ~ ('&category=' ~ category_filter if category_filter else '') %}
             {% if page > 1 %}
               <a href="?page={{ page - 1 }}{{ qs }}" class="px-2 py-1 rounded-md border border-slate-300 bg-white hover:bg-slate-50">← Prev</a>
             {% endif %}
@@ -672,6 +717,59 @@
       ta.select();
       try { document.execCommand('copy'); } catch (e) { /* swallow */ }
       document.body.removeChild(ta);
+    }
+
+    // ---- Manual category override -----------------------------------------
+    // Exposed globally so each badge's <select onchange="updateCategory(...)">
+    // can call it without registering listeners.
+    window.updateCategory = function (email, newCategory, selectEl) {
+      fetch('/supporters/categorize-one', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: email, category: newCategory }),
+      })
+        .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+        .then(function (data) {
+          showToast('Set ' + email + ' as ' + newCategory + '. Reloading…');
+          // Page reload picks up the new badge styling + recategorized
+          // filter counts. Cheap; the page is already paginated.
+          setTimeout(function () { window.location.reload(); }, 600);
+        })
+        .catch(function (err) {
+          showToast('Couldn\'t update category: HTTP ' + err);
+          // Revert the select to whatever it was.
+          if (selectEl && selectEl.dataset.previous) {
+            selectEl.value = selectEl.dataset.previous;
+          }
+        });
+    };
+
+    // ---- Re-categorize all (bulk) -----------------------------------------
+    var catBtn = document.getElementById('categorize-btn');
+    if (catBtn) {
+      catBtn.addEventListener('click', function () {
+        var statusEl = document.getElementById('categorize-status');
+        catBtn.disabled = true;
+        var orig = catBtn.textContent;
+        catBtn.textContent = 'Categorizing…';
+        if (statusEl) statusEl.classList.add('hidden');
+        fetch('/supporters/categorize-all', { method: 'POST' })
+          .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+          .then(function (data) {
+            var summary = data.classified + ' classified · ' + data.changed + ' changed';
+            showToast('Categorization done — ' + summary + '. Reloading…');
+            if (statusEl) {
+              statusEl.textContent = '✓ ' + summary;
+              statusEl.classList.remove('hidden');
+            }
+            setTimeout(function () { window.location.reload(); }, 800);
+          })
+          .catch(function (err) {
+            showToast('Categorization failed: HTTP ' + err);
+            catBtn.disabled = false;
+            catBtn.textContent = orig;
+          });
+      });
     }
   })();
   </script>

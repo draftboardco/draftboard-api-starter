@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Settings — Categorization rules</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+  <div class="max-w-4xl mx-auto px-6 py-10">
+    {% include "_nav.html" %}
+
+    <header class="mb-6">
+      <h1 class="text-2xl font-semibold tracking-tight">Categorization rules</h1>
+      <p class="text-sm text-slate-500 mt-1">
+        Tell the categorizer who counts as a customer / investor / vendor / friend / coworker. Each row on <strong>Supporters</strong> gets a category badge based on these rules. Match priority: <strong>your rules</strong> &gt; built-in heuristics (personal email domains → friend) &gt; LLM fallback (gpt-4o-mini, only if your OpenAI key is set in the resolver) &gt; unclassified.
+      </p>
+      <p class="text-xs text-slate-500 mt-2">
+        Manual overrides on the Supporters page win over everything here. They're sticky — bulk re-categorize won't undo them.
+      </p>
+    </header>
+
+    {% if saved %}
+      <div class="mb-4 rounded-md border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
+        ✓ Rules saved. Click <strong>Re-categorize all</strong> on the Supporters page to apply them to existing rows.
+      </div>
+    {% endif %}
+
+    <form method="POST" action="/settings/categorization" class="space-y-5">
+      {% for category in editable_categories %}
+        {% set emoji = category_display[category][0] %}
+        {% set label = category_display[category][1] %}
+        <section class="bg-white border border-slate-200 rounded-lg shadow-sm p-5">
+          <h2 class="text-base font-semibold text-slate-900 flex items-center gap-2">
+            <span class="text-lg">{{ emoji }}</span>
+            {{ label }}
+          </h2>
+          <p class="text-xs text-slate-500 mt-0.5 mb-3">
+            {% if category == "customer" %}People who pay you (or are at companies that do).
+            {% elif category == "investor" %}VCs, angels, fund managers, board members.
+            {% elif category == "vendor" %}Companies you buy from or partner with.
+            {% elif category == "friend" %}Personal connections — not work-related.
+            {% elif category == "coworker" %}Current or past coworkers.
+            {% endif %}
+          </p>
+
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <label class="block">
+              <span class="text-[10px] uppercase tracking-wider text-slate-500">Match these names (one per line, case-insensitive substring)</span>
+              <textarea name="{{ category }}__name" rows="6"
+                        placeholder="Acme Corp&#10;Big Co"
+                        class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-indigo-500">{{ rules[category]['name']|join('\n') }}</textarea>
+            </label>
+            <label class="block">
+              <span class="text-[10px] uppercase tracking-wider text-slate-500">Match these domains (one per line, exact match)</span>
+              <textarea name="{{ category }}__domain" rows="6"
+                        placeholder="acme.com&#10;bigco.io"
+                        class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-indigo-500">{{ rules[category]['domain']|join('\n') }}</textarea>
+            </label>
+            <label class="block">
+              <span class="text-[10px] uppercase tracking-wider text-slate-500">Match these emails (one per line, exact match)</span>
+              <textarea name="{{ category }}__email" rows="6"
+                        placeholder="alice@acme.com&#10;bob@bigco.io"
+                        class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-indigo-500">{{ rules[category]['email']|join('\n') }}</textarea>
+            </label>
+          </div>
+        </section>
+      {% endfor %}
+
+      <div class="flex items-center gap-3 pt-2">
+        <button type="submit"
+                class="rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-700">
+          Save all rules
+        </button>
+        <a href="/supporters/candidates" class="text-sm text-slate-500 hover:text-slate-700">
+          ← Back to Supporters
+        </a>
+      </div>
+    </form>
+
+    <footer class="mt-10 text-xs text-slate-400 text-center">
+      Draftboard API starter · Categorization rules
+    </footer>
+  </div>
+</body>
+</html>
