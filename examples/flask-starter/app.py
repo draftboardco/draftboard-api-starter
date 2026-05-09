@@ -2442,6 +2442,14 @@ def targets_view():
         owner_target_ids = db_target_ids_for_owner(resolved_owner_id)
         targets = [t for t in targets if t.get("id") in owner_target_ids]
 
+    # "Has manual list match" filter — narrow to only targets where at least
+    # one uploaded list has a connection with this target's LinkedIn URL.
+    manual_only = request.args.get("manual_only") == "1"
+    if manual_only:
+        manual_summary = manual_path_match_summary()
+        matched_ids = manual_summary["matched_target_ids"]
+        targets = [t for t in targets if t.get("id") in matched_ids]
+
     # Search filter (case-insensitive substring across name/title/company/tags)
     q = (request.args.get("q") or "").strip()
     q_lower = q.lower()
@@ -2488,6 +2496,8 @@ def targets_view():
         cache_age=cache_age_seconds(),
         owners_list=owners_list,
         owner_filter=owner_filter,
+        manual_only=manual_only,
+        manual_match_total=len(manual_path_match_summary()["matched_target_ids"]),
         me=me_for_template,
     )
 
@@ -3101,6 +3111,47 @@ def new_paths_view():
             "last_seen_at": r["last_seen_at"],
         })
         seen_targets.add(r["target_id"])
+
+    # Append manual-path matches to the new-paths feed. Each list's upload
+    # timestamp acts as first_seen_at — a list uploaded today shows ALL its
+    # matches under "Last 24h" / "Last 7d". Manual paths bypass the
+    # min_score filter entirely (they're user-curated; the customer
+    # uploaded them on purpose, no score gate makes sense). Owner filter
+    # also bypassed — manual paths have only the customer as owner, so a
+    # specific-teammate filter would always exclude them, which would feel
+    # broken when toggling owner filters.
+    summary = manual_path_match_summary()
+    for list_id, ldata in summary["by_list"].items():
+        list_uploaded = ldata.get("uploaded_at") or 0
+        if list_uploaded < since_ts:
+            continue
+        for tid in ldata["target_ids"]:
+            target = target_map.get(tid)
+            if not target:
+                continue
+            manual_conn_list = manual_paths_for_target(target)
+            manual_conn = next(
+                (m for m in manual_conn_list if m.get("_manual_list_id") == list_id),
+                None,
+            )
+            if manual_conn is None:
+                continue
+            enriched_conn = _enrich_connection(target, manual_conn, my_user_id=me_id)
+            enriched_paths.append({
+                "target": _enrich_target(target),
+                "target_id": tid,
+                "connection": enriched_conn,
+                "first_seen_at": list_uploaded,
+                "last_seen_at": list_uploaded,
+            })
+            seen_targets.add(tid)
+    # Re-sort the combined list: score desc, then first_seen_at desc. Manual
+    # paths (score=None) sort to the bottom — same convention as connector
+    # cards. Within the manual block, more recent uploads come first.
+    enriched_paths.sort(
+        key=lambda p: (p["connection"].get("score") or 0, p["first_seen_at"]),
+        reverse=True,
+    )
 
     me_for_template, _ = fetch_me()
     if me_for_template:
@@ -5447,6 +5498,7 @@ def manual_paths_view():
         upload_success=request.args.get("upload_success", ""),
         upload_imported=int(request.args.get("imported") or 0),
         upload_skipped=int(request.args.get("skipped") or 0),
+        upload_match_count=int(request.args.get("match_count") or 0),
         # Round-trip form values on validation error so the user doesn't
         # have to re-type 6 fields after a typo / missing file.
         upload_label=request.args.get("label", ""),
@@ -5540,11 +5592,27 @@ def manual_paths_upload():
         detected_cols=detected_cols,
         skipped=skipped,
     )
+    # Match-preview: count how many of the JUST-IMPORTED rows match a
+    # current target. Cheap inline lookup, no need to round-trip through
+    # manual_path_match_summary (which is per-request-cached anyway).
+    targets, _ = fetch_all_targets()
+    target_url_set = set()
+    for t in targets:
+        url = (t.get("linkedinUrl") or "").strip()
+        if url:
+            n = _normalize_linkedin(url)
+            if n:
+                target_url_set.add(n)
+    match_count = sum(
+        1 for r in rows if r["linkedin_url_normalized"] in target_url_set
+    )
     return redirect(url_for(
         "manual_paths_view",
         upload_success="1",
         imported=len(rows),
         skipped=skipped,
+        match_count=match_count,
+        list_id=list_id,
     ))
 
 

@@ -22,7 +22,25 @@
 
     {% if upload_success %}
       <div class="mb-4 rounded-md border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
-        ✓ Imported <strong>{{ upload_imported }}</strong> contact{{ '' if upload_imported == 1 else 's' }}{% if upload_skipped %} · skipped {{ upload_skipped }} (no LinkedIn URL){% endif %}.
+        <div>
+          ✓ Imported <strong>{{ upload_imported }}</strong> contact{{ '' if upload_imported == 1 else 's' }}{% if upload_skipped %} · skipped {{ upload_skipped }} (no LinkedIn URL or duplicate){% endif %}.
+        </div>
+        {% if upload_match_count > 0 %}
+          <div class="mt-1.5 flex items-center gap-2 flex-wrap">
+            <span>
+              🎯 <strong>{{ upload_match_count }}</strong> match{{ '' if upload_match_count == 1 else 'es' }}
+              against your existing targets — those targets now show this as a path on their drawer.
+            </span>
+            <a href="/?manual_only=1"
+               class="inline-flex items-center text-xs px-2.5 py-1 rounded-md bg-purple-600 text-white font-medium hover:bg-purple-700">
+              View matched targets →
+            </a>
+          </div>
+        {% else %}
+          <div class="mt-1.5 text-emerald-800">
+            No matches against your current targets yet. Add more targets (or import a different list) and these contacts may light up later — they're stored either way.
+          </div>
+        {% endif %}
       </div>
     {% endif %}
 

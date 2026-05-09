@@ -26,12 +26,30 @@
       </div>
       <div class="flex items-center gap-3 flex-wrap">
         {% include "_owner_filter.html" %}
+        {# "Manual list match" toggle — narrows to targets that have at
+           least one match in an uploaded CSV. Hidden when no lists exist
+           yet (would be a dead-end filter). #}
+        {% if manual_match_total %}
+          {% if manual_only %}
+            <a href="/{% if query %}?q={{ query|urlencode }}{% endif %}{% if owner_filter %}{{ '&' if query else '?' }}owner={{ owner_filter }}{% endif %}"
+               class="text-xs px-3 py-1.5 rounded-md bg-purple-600 text-white hover:bg-purple-700"
+               title="Currently filtering to targets with manual-list matches. Click to clear.">
+              ✓ Manual matches only ({{ manual_match_total }}) ✕
+            </a>
+          {% else %}
+            <a href="/?manual_only=1{% if query %}&q={{ query|urlencode }}{% endif %}{% if owner_filter %}&owner={{ owner_filter }}{% endif %}"
+               class="text-xs px-3 py-1.5 rounded-md border border-purple-300 bg-purple-50 text-purple-800 hover:bg-purple-100"
+               title="Show only targets with at least one manual-list match.">
+              📇 Manual matches ({{ manual_match_total }})
+            </a>
+          {% endif %}
+        {% endif %}
         {% if cache_age is not none %}
           <span class="text-[11px] text-slate-400">
             cached {{ cache_age }}s ago
           </span>
         {% endif %}
-        <a href="/?refresh=1{% if query %}&q={{ query|urlencode }}{% endif %}{% if owner_filter %}&owner={{ owner_filter }}{% endif %}"
+        <a href="/?refresh=1{% if query %}&q={{ query|urlencode }}{% endif %}{% if owner_filter %}&owner={{ owner_filter }}{% endif %}{% if manual_only %}&manual_only=1{% endif %}"
            class="text-xs px-3 py-1.5 rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">
           Refresh
         </a>
