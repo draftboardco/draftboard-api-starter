@@ -286,10 +286,16 @@ ACCOUNT_FANOUT_LIMIT = 50  # max targets to fan out (mostly cache hits after syn
 SYNC_CONCURRENCY = int(os.environ.get("SYNC_CONCURRENCY", "2"))
 SYNC_DELAY_SEC = float(os.environ.get("SYNC_DELAY_SEC", "0.3"))
 SYNC_INTERVAL_HOURS = float(os.environ.get("SYNC_INTERVAL_HOURS", "12"))  # background re-sync cadence
-# AUTO_SYNC_ENABLED gates BOTH the scheduled daemon AND the on-page-load
-# auto-trigger. Set to "false"/"0" to fully disable polling for read-only
-# testing on already-cached data. Manual /sync/start still works.
-AUTO_SYNC_ENABLED = os.environ.get("AUTO_SYNC_ENABLED", "true").strip().lower() not in ("false", "0", "no", "off")
+# AUTO_SYNC_ENABLED only gates AUTOMATIC bulk operations:
+#   - the scheduled background daemon (every SYNC_INTERVAL_HOURS)
+#   - the on-page-load auto-trigger (when fresh-cache count < target count)
+# It does NOT block per-target on-demand fetches (drawer opens) or manual
+# /sync/start clicks — those always work as long as an API key is set.
+# Default is OFF: restart-time API hammering for customers with 4k+
+# targets was a footgun. Pages render from cached data.db; the user clicks
+# "Sync paths" in the nav to bulk-fetch new data, and drawers fetch on
+# demand. Set AUTO_SYNC_ENABLED=true to re-enable the daemon + auto-trigger.
+AUTO_SYNC_ENABLED = os.environ.get("AUTO_SYNC_ENABLED", "false").strip().lower() not in ("false", "0", "no", "off")
 
 app = Flask(__name__)
 # Cap request bodies at 2 MiB. Without this, a malicious or malformed payload
@@ -362,6 +368,10 @@ def _inject_globals():
     )
     return {
         "feedback_mailto": feedback_mailto,
+        # Used by the nav sync pill: when no API key is set, the idle CTA
+        # links to /setup instead of POSTing /sync/start (which would
+        # silently no-op).
+        "global_api_key_set": bool(API_KEY),
     }
 
 # Per-field input caps for resolve endpoints. Apollo / CSE / OpenAI all reject
@@ -430,6 +440,17 @@ _sync_state = {
     "started_at": 0,
     "ended_at": 0,
     "last_target_name": "",
+    # User clicked "Stop" — workers check this between API calls and bail out
+    # without firing more requests. Cleared atomically at the start of every
+    # new sync (inside start_sync's lock, before running=True).
+    "stop_requested": False,
+    # True if the last completed sync was halted via stop_requested. The nav
+    # pill JS reads this to render the success message correctly ("⏸ Stopped"
+    # vs "✓ All synced"). Cleared by the next sync's run.
+    "last_run_stopped": False,
+    # "incremental" (default — only never-cached targets) or "full" (every
+    # target, regardless of cache state). Surfaced for the UI label.
+    "mode": "incremental",
 }
 _sync_thread = None
 _scheduled_thread = None
@@ -1501,14 +1522,12 @@ def fetch_me(force=False):
         except Exception:
             return None, None
 
-    if not AUTO_SYNC_ENABLED or not _current_api_key():
+    if not _current_api_key():
         cached, _err = _from_sqlite()
         if cached:
             _me_cache.update({"data": cached, "error": None, "fetched_at": now})
             return cached, None
-        if not _current_api_key():
-            return None, "DRAFTBOARD_API_KEY not set and no cached /me data."
-        return None, "AUTO_SYNC_ENABLED=false and /me not yet cached."
+        return None, "DRAFTBOARD_API_KEY not set and no cached /me data."
 
     try:
         r = requests.get(f"{API_BASE}/me", headers=_auth_headers(), timeout=10)
@@ -1589,12 +1608,12 @@ def fetch_tags(force=False):
         except Exception:
             return None
 
-    if not AUTO_SYNC_ENABLED or not _current_api_key():
+    if not _current_api_key():
         cached = _from_sqlite()
         if cached is not None:
             _tags_cache.update({"data": cached, "error": None, "fetched_at": now})
             return cached, None
-        return [], "Tags not yet cached (offline mode)."
+        return [], "Tags not yet cached and no API key set."
 
     try:
         r = requests.get(
@@ -1628,9 +1647,12 @@ def fetch_all_targets(force=False):
 
     Source priority:
       1. In-memory cache, if fresh (<5 min old)
-      2. If AUTO_SYNC_ENABLED is false → SQLite only, no API call ever
-      3. API call → on success, persist to SQLite + memory
-      4. API failure → fall back to SQLite (stale-but-better-than-nothing)
+      2. If no API key → SQLite only, no API call ever
+      3. SQLite cache, if present → return immediately (no API call). The
+         daemon-driven sync OR a manual /sync/start (force=True) refreshes
+         this. We don't want every page-load to re-paginate /targets.
+      4. SQLite empty + API key set → API call, persist on success.
+      5. API failure → fall back to SQLite (stale-but-better-than-nothing)
     """
     now = time.time()
     if (
@@ -1640,21 +1662,21 @@ def fetch_all_targets(force=False):
     ):
         return _targets_cache["data"], _targets_cache["error"]
 
-    # Offline mode (or no key): read from SQLite, no API call.
-    if not AUTO_SYNC_ENABLED or not _current_api_key():
-        sqlite_targets, sqlite_err = db_load_targets_cache()
+    # No API key: read from SQLite, no API call possible.
+    if not _current_api_key():
+        sqlite_targets, _ = db_load_targets_cache()
         if sqlite_targets:
             _targets_cache.update({"data": sqlite_targets, "error": None, "fetched_at": now})
             return sqlite_targets, None
-        if not _current_api_key():
-            return [], "No API key set and no cached target list in SQLite. Add a key OR populate targets_cache."
-        # AUTO_SYNC_ENABLED is false but SQLite is empty.
-        return [], (
-            "AUTO_SYNC_ENABLED=false and targets_cache is empty. The app can't render "
-            "Targets/Accounts/New-paths views without target metadata. Either set "
-            "AUTO_SYNC_ENABLED=true once to bootstrap from /targets, or pre-populate the "
-            "targets_cache table."
-        )
+        return [], "No API key set and no cached target list in SQLite. Add a key OR populate targets_cache."
+
+    # Have API key. Prefer SQLite cache if present (avoids hammering /targets
+    # on every page-load — a force=True call refreshes it).
+    if not force:
+        sqlite_targets, _ = db_load_targets_cache()
+        if sqlite_targets:
+            _targets_cache.update({"data": sqlite_targets, "error": None, "fetched_at": now})
+            return sqlite_targets, None
 
     # Online mode — try the API, persist on success, fall back to SQLite on failure.
     targets = []
@@ -1706,9 +1728,11 @@ def fetch_target_connections(target_id, force=False):
     """Paginate GET /targets/{id}/connections. SQLite-cached per-target.
 
     Returns (list, error_or_None). When `force=False`, returns the cached row
-    if it's within CONNECTIONS_CACHE_TTL seconds. When AUTO_SYNC_ENABLED is
-    false OR there's no API key, returns cached data even if stale (better
-    than nothing) and never makes an API call.
+    if it's within CONNECTIONS_CACHE_TTL seconds. When there's no API key,
+    returns cached data even if stale (better than nothing) and never makes
+    an API call. Per-target on-demand fetches are NOT gated by
+    AUTO_SYNC_ENABLED — that flag only controls automatic bulk operations.
+    A user clicking a target drawer should always cause a fetch when needed.
     """
     now = time.time()
     cached_data, fetched_at, cached_error = db_get_connections(target_id)
@@ -1720,11 +1744,11 @@ def fetch_target_connections(target_id, force=False):
     ):
         return cached_data, None
 
-    # Offline mode — never call the API. Return whatever we have, even stale.
-    if not AUTO_SYNC_ENABLED or not _current_api_key():
+    # No API key: return whatever we have, even stale.
+    if not _current_api_key():
         if cached_data is not None:
             return cached_data, None
-        return [], "Connections not cached for this target (offline mode)."
+        return [], "Connections not cached for this target and no API key set."
 
     connections = []
     page = 1
@@ -1766,6 +1790,14 @@ def _sync_one_target(t):
     tid = t.get("id")
     if not tid:
         return
+    # Honor a stop request — bail BEFORE making the API call. Workers in
+    # the pool that haven't started yet drain harmlessly through here. The
+    # ones already mid-fetch can't be cancelled, but the next batch won't
+    # fire. End-to-end latency from "click Stop" to "API calls cease" is
+    # bounded by SYNC_CONCURRENCY * (one in-flight request worth of time).
+    with _sync_lock:
+        if _sync_state["stop_requested"]:
+            return
     first = (t.get("firstName") or "").strip()
     last = (t.get("lastName") or "").strip()
     name = f"{first} {last}".strip() or "(no name)"
@@ -1781,12 +1813,17 @@ def _sync_one_target(t):
 
 
 def _sync_worker(force_all=False):
-    """Background worker: fetches and caches connections for every target in parallel.
+    """Background worker: fetches and caches connections for targets in parallel.
 
-    Skips targets already fresh in SQLite (unless force_all=True). Uses a
-    ThreadPoolExecutor so multiple /targets/{id}/connections calls run
-    concurrently — modest concurrency (SYNC_CONCURRENCY) keeps us friendly to
-    the API while cutting sync time ~5x.
+    Default mode is INCREMENTAL: only fetches targets that have never been
+    cached. Existing cached targets are left alone — restart cost = 0 API
+    calls, post-import cost = N calls where N is the number of newly imported
+    targets. `force_all=True` re-fetches every target regardless of cache
+    state — used by the "Force full resync" action when the customer wants
+    every connector list refreshed (rare).
+
+    Concurrent fetches via ThreadPoolExecutor; SYNC_CONCURRENCY caps how
+    many simultaneous /targets/{id}/connections calls hit the API.
     """
     targets, _err = fetch_all_targets()
     if not targets:
@@ -1796,45 +1833,66 @@ def _sync_worker(force_all=False):
         return
 
     target_ids = [t.get("id") for t in targets if t.get("id")]
-    fresh_count = db_count_fresh_connections(target_ids)
+    # `db_count_fresh_connections` here counts targets we already have cached
+    # data for (under the TTL). For the progress bar we treat ANY cached row
+    # as already-done so the percentage reflects work-actually-needed, not
+    # arbitrary TTL math.
+    cached_count = db_count_fresh_connections(target_ids, ttl=10**12)  # effectively "ever cached"
 
     with _sync_lock:
         _sync_state["total"] = len(target_ids)
-        _sync_state["completed"] = fresh_count
+        _sync_state["completed"] = cached_count
         _sync_state["errors"] = 0
         _sync_state["started_at"] = int(time.time())
         _sync_state["ended_at"] = 0
         _sync_state["last_target_name"] = ""
+        _sync_state["mode"] = "full" if force_all else "incremental"
+        # NB: stop_requested is reset inside start_sync() (before this thread
+        # gets scheduled), NOT here. Resetting here would lose stop clicks
+        # that arrive in the window between start_sync() returning and this
+        # worker thread entering its first lock.
 
-    threshold = int(time.time()) - CONNECTIONS_CACHE_TTL
-    # Filter to targets that actually need sync (skip fresh, skip missing id).
-    # When force_all=True, sync every target regardless of cache freshness —
-    # used by the "Force re-sync" button to populate discovered_paths from
-    # all currently-cached connections.
+    # Build the to_sync list:
+    # - force_all=True  → every target
+    # - force_all=False → only targets with NO cached connections at all
+    #
+    # Stale-but-cached targets are NOT re-fetched. The user can refresh a
+    # specific target by opening its drawer (per-target TTL still applies
+    # there), or click "Force full resync" to walk every target.
     to_sync = []
     for t in targets:
         tid = t.get("id")
         if not tid:
             continue
-        if not force_all:
-            cached_data, fetched_at, cached_error = db_get_connections(tid)
-            if cached_data is not None and fetched_at >= threshold and not cached_error:
-                continue
-        to_sync.append(t)
+        if force_all:
+            to_sync.append(t)
+            continue
+        cached_data, _fetched_at, cached_error = db_get_connections(tid)
+        if cached_data is None or cached_error:
+            to_sync.append(t)
 
     # Concurrent fetches. ThreadPoolExecutor handles the worker pool;
-    # _db_lock inside fetch_target_connections serializes writes.
+    # _db_lock inside fetch_target_connections serializes writes. Workers
+    # check _sync_state["stop_requested"] before each API call and bail.
     with ThreadPoolExecutor(max_workers=SYNC_CONCURRENCY) as pool:
         futures = [pool.submit(_sync_one_target, t) for t in to_sync]
         for _f in as_completed(futures):
             pass  # progress is tracked inside _sync_one_target
 
     with _sync_lock:
+        was_stopped = _sync_state["stop_requested"]
         _sync_state["running"] = False
         _sync_state["ended_at"] = int(time.time())
+        _sync_state["stop_requested"] = False
+        # Surfaced to the nav pill JS so the success message can branch
+        # ("✓ All synced" vs "⏸ Stopped at N/M"). Cleared at the start of
+        # the next sync.
+        _sync_state["last_run_stopped"] = was_stopped
     # Persist the completion timestamp for the "Since last sync" filter on the
-    # New Paths page (and for any future "last synced X minutes ago" UI).
-    db_app_state_set("last_sync_completed_at", int(time.time()))
+    # New Paths page. Only stamp it on a clean finish — a stop_requested run
+    # didn't actually cover everything, so a partial timestamp would be a lie.
+    if not was_stopped:
+        db_app_state_set("last_sync_completed_at", int(time.time()))
 
 
 def _scheduled_sync_loop():
@@ -1878,6 +1936,11 @@ def start_sync(force_all=False):
     with _sync_lock:
         if _sync_state["running"]:
             return False
+        # Reset stop_requested ATOMICALLY with running=True under the same
+        # lock. Doing this in _sync_worker (after the thread is scheduled)
+        # opens a race: a /sync/stop POST arriving in that window would set
+        # stop_requested=True only to be clobbered to False by the worker.
+        _sync_state["stop_requested"] = False
         _sync_state["running"] = True
     _sync_thread = threading.Thread(
         target=_sync_worker, args=(force_all,), daemon=True, name="db-sync"
@@ -3199,6 +3262,22 @@ def sync_start():
     force = request.args.get("force") == "1" or (request.get_json(silent=True) or {}).get("force") is True
     started = start_sync(force_all=force)
     return jsonify({"started": started, "force": force, "state": sync_progress_snapshot()})
+
+
+@app.route("/sync/stop", methods=["POST"])
+def sync_stop():
+    """Request a graceful halt of the running sync.
+
+    Sets _sync_state["stop_requested"] = True. Workers in the ThreadPoolExecutor
+    check this flag before each API call and return immediately. In-flight
+    requests can't be cancelled — at most SYNC_CONCURRENCY more calls will fire
+    before the pool drains. Per-target latency is bounded by one fetch.
+    """
+    with _sync_lock:
+        if not _sync_state["running"]:
+            return jsonify({"stopped": False, "reason": "not_running", "state": sync_progress_snapshot()})
+        _sync_state["stop_requested"] = True
+    return jsonify({"stopped": True, "state": sync_progress_snapshot()})
 
 
 # =====================================================================

@@ -2,8 +2,10 @@
   <span class="text-sm font-semibold tracking-tight text-slate-900">Draftboard API starter</span>
 
   <div class="flex items-center gap-3 flex-wrap">
-    <!-- Sync status pill (filled in by JS) -->
-    <div id="sync-status-pill" class="hidden text-xs">
+    <!-- Sync status pill (filled in by JS). data-api-key-set drives the
+         no-key CTA branch in the JS without an extra fetch. -->
+    <div id="sync-status-pill" class="hidden text-xs"
+         data-api-key-set="{{ '1' if global_api_key_set else '0' }}">
       <!-- populated dynamically -->
     </div>
 
@@ -80,39 +82,75 @@
   var hideTimer = null;
 
   function render(state) {
-    if (!state || (state.total === 0 && !state.running)) {
+    if (!state) {
       pill.classList.add('hidden');
       return;
     }
     pill.classList.remove('hidden');
     var pct = state.percent || 0;
+    var modeLabel = state.mode === 'full' ? 'Full re-sync' : 'Syncing new paths';
     if (state.running) {
+      var stopBtn = state.stop_requested
+        ? '<span class="text-indigo-400">Stopping…</span>'
+        : '<button type="button" onclick="stopSync()" class="px-2 py-0.5 rounded border border-indigo-300 text-indigo-700 hover:bg-indigo-100">Stop</button>';
       pill.innerHTML =
         '<div class="flex items-center gap-2 px-3 py-1.5 rounded-md bg-indigo-50 border border-indigo-200 text-indigo-800">' +
           '<span class="inline-block w-2 h-2 rounded-full bg-indigo-500 animate-pulse"></span>' +
-          '<span>Syncing paths <strong>' + state.completed + ' / ' + state.total + '</strong> ' +
+          '<span>' + modeLabel + ' <strong>' + state.completed + ' / ' + state.total + '</strong> ' +
           '<span class="text-indigo-500">(' + pct + '%)</span></span>' +
           (state.last_target_name ? '<span class="text-indigo-500 truncate max-w-[200px]">— ' + escapeHtml(state.last_target_name) + '</span>' : '') +
+          stopBtn +
         '</div>';
     } else if (state.ended_at && state.ended_at > lastEndedAt) {
       lastEndedAt = state.ended_at;
-      var msg = state.errors > 0
+      var stoppedMsg = '⏸ Stopped at ' + state.completed + ' / ' + state.total + ' — click Sync again to resume.';
+      var doneMsg = state.errors > 0
         ? '✓ Synced ' + state.completed + ' / ' + state.total + ' (' + state.errors + ' errors)'
-        : '✓ All ' + state.total + ' paths synced — drawers are now instant';
+        : (state.total > 0
+            ? '✓ All ' + state.total + ' paths synced — drawers are now instant'
+            : '✓ Sync finished');
+      var msg = state.last_run_stopped ? stoppedMsg : doneMsg;
+      var bannerCls = state.last_run_stopped
+        ? 'flex items-center gap-2 px-3 py-1.5 rounded-md bg-amber-50 border border-amber-200 text-amber-800'
+        : 'flex items-center gap-2 px-3 py-1.5 rounded-md bg-emerald-50 border border-emerald-200 text-emerald-800';
+      var btnCls = state.last_run_stopped
+        ? 'text-amber-700 hover:underline'
+        : 'text-emerald-700 hover:underline';
       pill.innerHTML =
-        '<div class="flex items-center gap-2 px-3 py-1.5 rounded-md bg-emerald-50 border border-emerald-200 text-emerald-800">' +
+        '<div class="' + bannerCls + '">' +
           '<span>' + msg + '</span>' +
-          '<button type="button" onclick="resyncPaths()" class="text-emerald-700 hover:underline">Re-sync</button>' +
+          '<button type="button" onclick="resyncPaths()" class="' + btnCls + '">Sync again</button>' +
         '</div>';
-      // Auto-hide success pill after 30s; keep it visible if there were errors
+      // Auto-hide success pill after 30s; keep it visible if there were errors.
+      // After it hides, the always-visible "Sync paths" CTA below takes over.
       if (hideTimer) clearTimeout(hideTimer);
       if (state.errors === 0) {
-        hideTimer = setTimeout(function () { pill.classList.add('hidden'); }, 30000);
+        hideTimer = setTimeout(function () { renderIdleCTA(); }, 30000);
       }
     } else {
-      // Not running, never started → hide
-      pill.classList.add('hidden');
+      // Not running, never ran in this session → show always-visible CTA so
+      // the user can manually kick a sync (the app no longer auto-starts).
+      renderIdleCTA();
     }
+  }
+
+  function renderIdleCTA() {
+    pill.classList.remove('hidden');
+    var apiKeySet = pill.getAttribute('data-api-key-set') === '1';
+    if (!apiKeySet) {
+      // No API key configured. Sending /sync/start would silently no-op.
+      // Send the user to /setup instead so they can paste a key.
+      pill.innerHTML =
+        '<div class="flex items-center gap-2 px-3 py-1.5 rounded-md bg-amber-50 border border-amber-200 text-amber-800">' +
+          '<a href="/setup" class="font-medium hover:underline">Add API key to sync →</a>' +
+        '</div>';
+      return;
+    }
+    pill.innerHTML =
+      '<div class="flex items-center gap-2 px-3 py-1.5 rounded-md bg-slate-100 border border-slate-200 text-slate-700">' +
+        '<button type="button" onclick="resyncPaths()" class="text-indigo-700 hover:underline font-medium">Sync paths</button>' +
+        '<span class="text-[10px] text-slate-500">(only fetches new targets)</span>' +
+      '</div>';
   }
 
   function escapeHtml(s) {
@@ -144,6 +182,17 @@
     fetch('/sync/start', { method: 'POST' })
       .then(function (r) { return r.json(); })
       .then(function () { poll(); startPolling(); });
+  };
+
+  window.stopSync = function () {
+    // Optimistic UI: flip to "Stopping…" before the server confirms so the
+    // user gets instant feedback. The next poll tick (~2.5s) will show the
+    // real state.
+    var btn = pill.querySelector('button');
+    if (btn) { btn.outerHTML = '<span class="text-indigo-400">Stopping…</span>'; }
+    fetch('/sync/stop', { method: 'POST' })
+      .then(function (r) { return r.json(); })
+      .then(function () { poll(); });
   };
 
   // Initial check on page load — kicks off polling if a sync is running.
