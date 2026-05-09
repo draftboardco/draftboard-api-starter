@@ -23,10 +23,16 @@
         </div>
       </div>
     </div>
-    <div class="flex-shrink-0 text-right">
-      <div class="font-semibold text-slate-900">{{ c.score }}</div>
-      <div class="text-[10px] text-slate-500 uppercase">score</div>
-    </div>
+    {# Hide the score block when score is 0 or unset. Mostly fires for
+       manual-list paths (no enrichment data, score=0) but also handles any
+       Draftboard edge case where score is missing. Rendering "0" in big
+       bold type reads as broken. #}
+    {% if c.score %}
+      <div class="flex-shrink-0 text-right">
+        <div class="font-semibold text-slate-900">{{ c.score }}</div>
+        <div class="text-[10px] text-slate-500 uppercase">score</div>
+      </div>
+    {% endif %}
   </header>
 
   {# Owner badge: who in your team can intro through this connection #}

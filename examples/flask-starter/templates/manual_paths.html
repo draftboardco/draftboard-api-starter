@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Settings — Manual paths</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+  <div class="max-w-4xl mx-auto px-6 py-10">
+    {% include "_nav.html" %}
+
+    <header class="mb-6">
+      <h1 class="text-2xl font-semibold tracking-tight">Manual paths</h1>
+      <p class="text-sm text-slate-500 mt-1">
+        Ask someone with a relevant network (an investor, advisor, etc.) to send you their LinkedIn connections export. Drop the CSV here and any contact whose LinkedIn URL matches a target in your workspace shows up as an extra path on that target's drawer — same as Draftboard-derived paths, just sourced from a list instead of from the API.
+      </p>
+      <p class="text-xs text-slate-500 mt-2">
+        The CSV stays on your laptop. It's stored in <code>data.db</code> (gitignored) and never uploaded anywhere.
+      </p>
+    </header>
+
+    {% if upload_success %}
+      <div class="mb-4 rounded-md border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
+        ✓ Imported <strong>{{ upload_imported }}</strong> contact{{ '' if upload_imported == 1 else 's' }}{% if upload_skipped %} · skipped {{ upload_skipped }} (no LinkedIn URL){% endif %}.
+      </div>
+    {% endif %}
+
+    {% if upload_error == "missing_required" %}
+      <div class="mb-4 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">
+        Label, list-owner first name, and list-owner email are required.
+      </div>
+    {% elif upload_error == "bad_email" %}
+      <div class="mb-4 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">
+        That email doesn't look right. Need a valid format like <code>name@company.com</code>.
+      </div>
+    {% elif upload_error == "no_file" %}
+      <div class="mb-4 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">
+        Pick a CSV file before clicking Upload.
+      </div>
+    {% elif upload_error == "no_url_column" %}
+      <div class="mb-4 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">
+        Couldn't find a LinkedIn URL column in that CSV. The parser looks for column headers like <code>URL</code>, <code>LinkedIn URL</code>, <code>Profile URL</code>, etc. Make sure your CSV has one of those.
+      </div>
+    {% elif upload_error == "no_valid_rows" %}
+      <div class="mb-4 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">
+        No rows had a LinkedIn URL in the URL column. Either the column is empty, or the CSV is empty.
+      </div>
+    {% elif upload_error and upload_error.startswith("parse_failed_") %}
+      <div class="mb-4 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">
+        Couldn't parse that CSV ({{ upload_error[14:] }}). Make sure it's a comma-separated file with a header row.
+      </div>
+    {% endif %}
+
+    {# ---- Upload form ---- #}
+    <section class="mb-8 bg-white border border-slate-200 rounded-lg shadow-sm p-5">
+      <h2 class="text-base font-semibold text-slate-900">Upload a list</h2>
+      <p class="text-xs text-slate-500 mt-0.5 mb-4">
+        Tell us who the list belongs to (so we can render them as the connector on matched paths) and drop the CSV.
+      </p>
+
+      <form method="POST" action="/settings/manual-paths" enctype="multipart/form-data" class="space-y-3">
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <label class="block">
+            <span class="text-[10px] uppercase tracking-wider text-slate-500">List label <span class="text-rose-600">*</span></span>
+            <input type="text" name="label" value="{{ upload_label }}"
+                   placeholder="Sarah's investor connections, May 2026"
+                   required maxlength="120"
+                   class="mt-1 w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+          </label>
+          <label class="block">
+            <span class="text-[10px] uppercase tracking-wider text-slate-500">List owner email <span class="text-rose-600">*</span></span>
+            <input type="email" name="owner_email"
+                   placeholder="sarah@vc.com"
+                   required maxlength="200"
+                   class="mt-1 w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+          </label>
+          <label class="block">
+            <span class="text-[10px] uppercase tracking-wider text-slate-500">List owner first name <span class="text-rose-600">*</span></span>
+            <input type="text" name="owner_first"
+                   placeholder="Sarah"
+                   required maxlength="80"
+                   class="mt-1 w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+          </label>
+          <label class="block">
+            <span class="text-[10px] uppercase tracking-wider text-slate-500">List owner last name</span>
+            <input type="text" name="owner_last"
+                   placeholder="Chen"
+                   maxlength="80"
+                   class="mt-1 w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+          </label>
+          <label class="block">
+            <span class="text-[10px] uppercase tracking-wider text-slate-500">Owner title (optional)</span>
+            <input type="text" name="owner_title"
+                   placeholder="Investor"
+                   maxlength="120"
+                   class="mt-1 w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+          </label>
+          <label class="block">
+            <span class="text-[10px] uppercase tracking-wider text-slate-500">Owner company (optional)</span>
+            <input type="text" name="owner_company"
+                   placeholder="Foo Capital"
+                   maxlength="120"
+                   class="mt-1 w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-[10px] uppercase tracking-wider text-slate-500">Owner LinkedIn URL (optional)</span>
+            <input type="url" name="owner_linkedin"
+                   placeholder="https://linkedin.com/in/sarah-chen"
+                   maxlength="200"
+                   class="mt-1 w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+          </label>
+        </div>
+
+        <label class="block pt-2">
+          <span class="text-[10px] uppercase tracking-wider text-slate-500">CSV file <span class="text-rose-600">*</span></span>
+          <input type="file" name="csv_file" accept=".csv,text/csv" required
+                 class="mt-1 block w-full text-sm text-slate-700 file:mr-3 file:py-1.5 file:px-3 file:rounded-md file:border-0 file:bg-indigo-50 file:text-indigo-700 file:font-medium hover:file:bg-indigo-100" />
+          <p class="text-[11px] text-slate-500 mt-1">
+            Works with LinkedIn's standard <code>Connections.csv</code> export, or any CSV with column headers we can recognize: a LinkedIn URL column (named anything like <code>URL</code>, <code>LinkedIn URL</code>, <code>Profile</code>, etc.) is required; name / email / company / position / connected-on columns are auto-detected when present.
+          </p>
+        </label>
+
+        <div class="pt-2">
+          <button type="submit"
+                  class="rounded-md bg-indigo-600 text-white px-4 py-2 text-sm font-medium hover:bg-indigo-700">
+            Upload list
+          </button>
+        </div>
+      </form>
+    </section>
+
+    {# ---- Existing lists ---- #}
+    {% if lists %}
+      <section class="bg-white border border-slate-200 rounded-lg shadow-sm overflow-hidden">
+        <h2 class="text-base font-semibold text-slate-900 px-5 pt-4">Uploaded lists</h2>
+        <table class="w-full text-sm mt-3">
+          <thead class="bg-slate-50 text-[10px] uppercase tracking-wider text-slate-500">
+            <tr>
+              <th class="text-left px-5 py-2">Label</th>
+              <th class="text-left px-5 py-2">Owner</th>
+              <th class="text-right px-5 py-2">Contacts</th>
+              <th class="text-right px-5 py-2">Skipped</th>
+              <th class="text-left px-5 py-2">Uploaded</th>
+              <th class="text-right px-5 py-2"></th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-slate-200">
+            {% for l in lists %}
+              <tr class="hover:bg-slate-50/50">
+                <td class="px-5 py-3">
+                  <div class="font-medium text-slate-900">{{ l.label }}</div>
+                </td>
+                <td class="px-5 py-3">
+                  <div class="text-slate-700">{{ l.owner_first }} {{ l.owner_last }}</div>
+                  <div class="text-xs text-slate-500">{{ l.owner_email }}{% if l.owner_title %} · {{ l.owner_title }}{% endif %}{% if l.owner_company %} at {{ l.owner_company }}{% endif %}</div>
+                </td>
+                <td class="px-5 py-3 text-right tabular-nums">{{ l.row_count }}</td>
+                <td class="px-5 py-3 text-right tabular-nums text-slate-400">{{ l.skipped_count }}</td>
+                <td class="px-5 py-3 text-xs text-slate-500">{{ l.uploaded_display }}</td>
+                <td class="px-5 py-3 text-right">
+                  <form method="POST" action="/settings/manual-paths/delete" class="inline"
+                        onsubmit="return confirm('Delete this list and its {{ l.row_count }} contacts? Manual paths from this list won\'t appear on target drawers anymore.');">
+                    <input type="hidden" name="list_id" value="{{ l.id }}" />
+                    <button type="submit" class="text-xs text-rose-600 hover:text-rose-800">Delete</button>
+                  </form>
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </section>
+    {% else %}
+      <p class="text-sm text-slate-500 mt-2">No lists uploaded yet.</p>
+    {% endif %}
+
+    <footer class="mt-10 text-xs text-slate-400 text-center">
+      Draftboard API starter · Manual paths
+    </footer>
+  </div>
+</body>
+</html>
