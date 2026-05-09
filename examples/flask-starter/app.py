@@ -4152,28 +4152,52 @@ def parse_manual_path_csv(file_obj) -> tuple[list[dict], dict, int]:
             return ""
         return (row[idx] or "").strip()
 
+    # Strict-ish LinkedIn person-profile pattern. Catches:
+    #   - non-LinkedIn URLs that just happen to contain "linkedin.com" in a
+    #     query string (e.g. github.com/?ref=linkedin.com)
+    #   - LinkedIn company / school / showcase URLs that can never match a
+    #     person target (e.g. linkedin.com/company/draftboard)
+    # Accepts any host on the linkedin.com domain (www, region subdomains
+    # like uk.linkedin.com) followed by /in/<slug>.
+    li_person_re = re.compile(
+        r"^https?://([a-z0-9-]+\.)?linkedin\.com/in/[^\s/?#]+",
+        re.IGNORECASE,
+    )
     rows = []
     skipped = 0
+    seen_norm = set()  # within-CSV dedup — same URL twice → import once
     for raw_row in reader:
         if not raw_row or all(not (c or "").strip() for c in raw_row):
             continue  # blank line
         url = _g(raw_row, "linkedin_url")
-        if not url or "linkedin.com" not in url.lower():
+        if not url or not li_person_re.match(url.strip()):
             skipped += 1
             continue
+        norm = _normalize_linkedin(url)
+        if not norm:
+            skipped += 1
+            continue
+        if norm in seen_norm:
+            skipped += 1
+            continue
+        seen_norm.add(norm)
         first = _g(raw_row, "first_name")
         last = _g(raw_row, "last_name")
         if not first and not last and "full_name" in cols:
             first, last = _split_full_name(_g(raw_row, "full_name"))
+        # Per-cell length cap — cosmetic for the connector card and a
+        # defense-in-depth against pathological CSVs with massive cells.
+        def _cap(s, n=240):
+            return (s or "")[:n]
         rows.append({
-            "linkedin_url": url,
-            "linkedin_url_normalized": _normalize_linkedin(url),
-            "first_name": first,
-            "last_name": last,
-            "email": _g(raw_row, "email"),
-            "company": _g(raw_row, "company"),
-            "position": _g(raw_row, "position"),
-            "connected_on": _g(raw_row, "connected_on"),
+            "linkedin_url": _cap(url),
+            "linkedin_url_normalized": norm,
+            "first_name": _cap(first, 80),
+            "last_name": _cap(last, 80),
+            "email": _cap(_g(raw_row, "email"), 200),
+            "company": _cap(_g(raw_row, "company"), 200),
+            "position": _cap(_g(raw_row, "position"), 200),
+            "connected_on": _cap(_g(raw_row, "connected_on"), 40),
         })
     return rows, cols, skipped
 
@@ -4268,8 +4292,6 @@ def manual_paths_for_target(target: dict) -> list[dict]:
     if not norm:
         return []
     target_first = (target.get("firstName") or "").strip()
-    target_last = (target.get("lastName") or "").strip()
-    target_full = f"{target_first} {target_last}".strip() or "this person"
     me_id = get_my_owner_id()
     me_data = {}
     raw = db_app_state_get("me_data")
@@ -4278,8 +4300,12 @@ def manual_paths_for_target(target: dict) -> list[dict]:
             me_data = json.loads(raw) or {}
         except (ValueError, TypeError):
             me_data = {}
+    # me_owner.id MUST equal my_user_id when /me is loaded, AND must equal
+    # None when /me is NOT loaded (so _enrich_connection's `o.get("id") ==
+    # my_user_id` check evaluates True in both cases). Using a sentinel
+    # like "_self" would break the comparison on fresh installs.
     me_owner = {
-        "id": me_id or "_self",
+        "id": me_id,  # None when /me hasn't run yet — matches my_user_id=None
         "firstName": (me_data.get("user_first") or "").strip(),
         "lastName": (me_data.get("user_last") or "").strip(),
         "linkedinUrl": (me_data.get("user_linkedin") or "").strip(),
@@ -4319,7 +4345,10 @@ def manual_paths_for_target(target: dict) -> list[dict]:
                 "lastName": ol,
                 "linkedinUrl": olu or "",
                 "position": {"title": ot or "", "companyName": oc or ""},
-                "score": 0,
+                # score=None (NOT 0) so the template's `score is not none`
+                # guard hides the pill cleanly. Setting to 0 would show "0"
+                # which reads as "weak relationship" — wrong signal.
+                "score": None,
                 "scoreDetails": details,
                 "owners": [me_owner],
                 # Carry-through metadata for the compose-email pre-fill,
@@ -5199,7 +5228,15 @@ def manual_paths_view():
         upload_success=request.args.get("upload_success", ""),
         upload_imported=int(request.args.get("imported") or 0),
         upload_skipped=int(request.args.get("skipped") or 0),
+        # Round-trip form values on validation error so the user doesn't
+        # have to re-type 6 fields after a typo / missing file.
         upload_label=request.args.get("label", ""),
+        upload_owner_first=request.args.get("owner_first", ""),
+        upload_owner_last=request.args.get("owner_last", ""),
+        upload_owner_email=request.args.get("owner_email", ""),
+        upload_owner_title=request.args.get("owner_title", ""),
+        upload_owner_company=request.args.get("owner_company", ""),
+        upload_owner_linkedin=request.args.get("owner_linkedin", ""),
         active="settings_manual_paths",
     )
 
@@ -5226,19 +5263,35 @@ def manual_paths_upload():
     owner_company = (request.form.get("owner_company") or "").strip()
     owner_linkedin = (request.form.get("owner_linkedin") or "").strip()
 
+    # Pack the form values into the redirect so a validation bounce
+    # doesn't blank the customer's 6 typed fields.
+    form_passthrough = {
+        "label": label[:200], "owner_first": owner_first[:80],
+        "owner_last": owner_last[:80], "owner_email": owner_email[:200],
+        "owner_title": owner_title[:200], "owner_company": owner_company[:200],
+        "owner_linkedin": owner_linkedin[:400],
+    }
     if not label or not owner_first or not owner_email:
         return redirect(url_for(
-            "manual_paths_view",
-            upload_error="missing_required",
-            label=label,
+            "manual_paths_view", upload_error="missing_required", **form_passthrough,
         ))
-    # Cheap email shape check
-    if "@" not in owner_email or "." not in owner_email.split("@")[-1]:
-        return redirect(url_for("manual_paths_view", upload_error="bad_email", label=label))
+    # Stricter email shape: rejects junk like "foo@b.co&body=injected" that
+    # the prior cheap "@... in last segment" check let through. Excludes
+    # URL-special chars (& ? = #) since those are the mailto/URL injection
+    # vectors we care about. Standard local-part chars allowed in the local
+    # part; standard domain chars + dots allowed after @.
+    if not re.match(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$", owner_email):
+        return redirect(url_for("manual_paths_view", upload_error="bad_email", **form_passthrough))
+    # Server-side length caps. The form has maxlength but a curl/scripted POST
+    # can submit anything; defense-in-depth.
+    if (len(label) > 200 or len(owner_first) > 80 or len(owner_last) > 80
+            or len(owner_email) > 200 or len(owner_title) > 200
+            or len(owner_company) > 200 or len(owner_linkedin) > 400):
+        return redirect(url_for("manual_paths_view", upload_error="too_long", **form_passthrough))
 
     file_obj = request.files.get("csv_file")
     if not file_obj or not file_obj.filename:
-        return redirect(url_for("manual_paths_view", upload_error="no_file", label=label))
+        return redirect(url_for("manual_paths_view", upload_error="no_file", **form_passthrough))
 
     try:
         rows, detected_cols, skipped = parse_manual_path_csv(file_obj)
@@ -5246,21 +5299,13 @@ def manual_paths_upload():
         return redirect(url_for(
             "manual_paths_view",
             upload_error=f"parse_failed_{type(e).__name__}",
-            label=label,
+            **form_passthrough,
         ))
 
     if "linkedin_url" not in detected_cols:
-        return redirect(url_for(
-            "manual_paths_view",
-            upload_error="no_url_column",
-            label=label,
-        ))
+        return redirect(url_for("manual_paths_view", upload_error="no_url_column", **form_passthrough))
     if not rows:
-        return redirect(url_for(
-            "manual_paths_view",
-            upload_error="no_valid_rows",
-            label=label,
-        ))
+        return redirect(url_for("manual_paths_view", upload_error="no_valid_rows", **form_passthrough))
 
     list_id = db_save_manual_path_list(
         meta={

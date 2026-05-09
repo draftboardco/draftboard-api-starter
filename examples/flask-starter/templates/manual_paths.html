@@ -34,6 +34,10 @@
       <div class="mb-4 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">
         That email doesn't look right. Need a valid format like <code>name@company.com</code>.
       </div>
+    {% elif upload_error == "too_long" %}
+      <div class="mb-4 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">
+        One of those fields is way longer than expected. Trim it down and try again.
+      </div>
     {% elif upload_error == "no_file" %}
       <div class="mb-4 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">
         Pick a CSV file before clicking Upload.
@@ -70,42 +74,42 @@
           </label>
           <label class="block">
             <span class="text-[10px] uppercase tracking-wider text-slate-500">List owner email <span class="text-rose-600">*</span></span>
-            <input type="email" name="owner_email"
+            <input type="email" name="owner_email" value="{{ upload_owner_email }}"
                    placeholder="sarah@vc.com"
                    required maxlength="200"
                    class="mt-1 w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
           </label>
           <label class="block">
             <span class="text-[10px] uppercase tracking-wider text-slate-500">List owner first name <span class="text-rose-600">*</span></span>
-            <input type="text" name="owner_first"
+            <input type="text" name="owner_first" value="{{ upload_owner_first }}"
                    placeholder="Sarah"
                    required maxlength="80"
                    class="mt-1 w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
           </label>
           <label class="block">
             <span class="text-[10px] uppercase tracking-wider text-slate-500">List owner last name</span>
-            <input type="text" name="owner_last"
+            <input type="text" name="owner_last" value="{{ upload_owner_last }}"
                    placeholder="Chen"
                    maxlength="80"
                    class="mt-1 w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
           </label>
           <label class="block">
             <span class="text-[10px] uppercase tracking-wider text-slate-500">Owner title (optional)</span>
-            <input type="text" name="owner_title"
+            <input type="text" name="owner_title" value="{{ upload_owner_title }}"
                    placeholder="Investor"
                    maxlength="120"
                    class="mt-1 w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
           </label>
           <label class="block">
             <span class="text-[10px] uppercase tracking-wider text-slate-500">Owner company (optional)</span>
-            <input type="text" name="owner_company"
+            <input type="text" name="owner_company" value="{{ upload_owner_company }}"
                    placeholder="Foo Capital"
                    maxlength="120"
                    class="mt-1 w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
           </label>
           <label class="block md:col-span-2">
             <span class="text-[10px] uppercase tracking-wider text-slate-500">Owner LinkedIn URL (optional)</span>
-            <input type="url" name="owner_linkedin"
+            <input type="url" name="owner_linkedin" value="{{ upload_owner_linkedin }}"
                    placeholder="https://linkedin.com/in/sarah-chen"
                    maxlength="200"
                    class="mt-1 w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
