@@ -2671,6 +2671,19 @@ def import_form():
     )
 
 
+@app.route("/import/supporters", methods=["GET"])
+def import_supporters_stub():
+    """Stub page for the planned 'paste LinkedIn URLs of known supporters'
+    flow. The real feature isn't built yet — this just renders a
+    'Coming soon' card so the nav link doesn't dead-end. When the feature
+    ships, this route swaps to a real form + handler."""
+    return render_template(
+        "import_supporters_stub.html",
+        api_key_set=bool(API_KEY),
+        active="import_supporters",
+    )
+
+
 @app.route("/import", methods=["POST"])
 def do_import():
     raw_urls = request.form.get("linkedin_urls", "")
@@ -6025,7 +6038,7 @@ def settings_slack_view():
         total_teammates=len(teammates),
         mapped_slack=mapped_slack,
         me=me,
-        active="settings",
+        active="settings_slack",
     )
 
 
@@ -6532,6 +6545,7 @@ def linkedin_resolver_settings():
         "settings_linkedin_resolver.html",
         status=_resolver_status(keys),
         secrets_path=RESOLVER_SECRETS_PATH,
+        active="settings_linkedin_resolver",
     )
 
 

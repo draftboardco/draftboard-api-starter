@@ -1,76 +1,90 @@
-<nav class="mb-6 flex items-center justify-between border-b border-slate-200 pb-3 gap-3 flex-wrap">
-  <span class="text-sm font-semibold tracking-tight text-slate-900">Draftboard API starter</span>
+{# Left sidebar nav. Replaces the old top-bar nav.
 
-  <div class="flex items-center gap-3 flex-wrap">
-    <!-- Sync status pill (filled in by JS). data-api-key-set drives the
-         no-key CTA branch in the JS without an extra fetch. -->
-    <div id="sync-status-pill" class="hidden text-xs"
+   Layout strategy: each page already wraps content in
+   `<div class="max-w-* mx-auto px-6 py-10">` and `{% include "_nav.html" %}`
+   inside that wrapper. Rather than edit every page, this include injects a
+   `body { padding-left: 240px }` rule so the existing centered wrapper
+   reflows into the right of the sidebar. Sidebar itself is `position:fixed`
+   so it doesn't sit in body flow.
+
+   IA (decided 2026-05-10):
+     VIEWS  → Targets / Accounts / Connections / New paths
+     IMPORT → Import targets / Scan for supporters / Import supporters
+              (stub) / Manual path finding
+     SETTINGS → Setup / Categorization / Slack / Google Workspace /
+                LinkedIn resolver / Team
+
+   Sync pill + Feedback + What's new live in the pinned footer.
+#}
+<style>
+  body { padding-left: 240px; }
+  .kit-hamburger { display: none; }
+  /* The kit is desktop-first. On narrow viewports we slide the sidebar
+     off-screen and reveal a hamburger toggle. Toggle adds .kit-sidebar-open
+     to reveal — kept dead simple to avoid pulling in any framework. */
+  @media (max-width: 768px) {
+    body { padding-left: 0; }
+    aside.kit-sidebar { transform: translateX(-100%); transition: transform 0.2s ease; }
+    aside.kit-sidebar.kit-sidebar-open { transform: translateX(0); box-shadow: 0 4px 24px rgba(0,0,0,0.15); }
+    .kit-hamburger { display: inline-flex; }
+  }
+</style>
+
+<button type="button" onclick="document.querySelector('aside.kit-sidebar').classList.toggle('kit-sidebar-open')"
+        class="kit-hamburger fixed top-3 left-3 z-40 w-9 h-9 items-center justify-center rounded-md bg-white border border-slate-300 text-slate-700 shadow-sm"
+        aria-label="Toggle menu">
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-5 h-5"><path d="M3 6h18v2H3zM3 11h18v2H3zM3 16h18v2H3z"/></svg>
+</button>
+
+<aside class="kit-sidebar fixed left-0 top-0 h-screen w-60 bg-white border-r border-slate-200 flex flex-col z-30">
+  <div class="px-4 py-4 border-b border-slate-100">
+    <span class="text-sm font-semibold tracking-tight text-slate-900">Draftboard kit</span>
+  </div>
+
+  <nav class="flex-1 overflow-y-auto py-3 text-sm">
+    {# --- VIEWS --- #}
+    <div class="px-3 mb-1 text-[10px] uppercase tracking-wider text-slate-400 font-semibold">Views</div>
+    <a href="/" class="block px-4 py-1.5 transition {% if active == 'targets' %}bg-indigo-50 text-indigo-900 font-medium border-l-4 border-indigo-600 pl-3{% else %}text-slate-600 hover:bg-slate-100 border-l-4 border-transparent{% endif %}">Targets</a>
+    <a href="/accounts" class="block px-4 py-1.5 transition {% if active == 'accounts' %}bg-indigo-50 text-indigo-900 font-medium border-l-4 border-indigo-600 pl-3{% else %}text-slate-600 hover:bg-slate-100 border-l-4 border-transparent{% endif %}">Accounts</a>
+    <a href="/connections" class="block px-4 py-1.5 transition {% if active == 'connections' %}bg-indigo-50 text-indigo-900 font-medium border-l-4 border-indigo-600 pl-3{% else %}text-slate-600 hover:bg-slate-100 border-l-4 border-transparent{% endif %}">Connections</a>
+    <a href="/new-paths" class="block px-4 py-1.5 transition {% if active == 'new_paths' %}bg-indigo-50 text-indigo-900 font-medium border-l-4 border-indigo-600 pl-3{% else %}text-slate-600 hover:bg-slate-100 border-l-4 border-transparent{% endif %}">New paths</a>
+
+    {# --- IMPORT --- #}
+    <div class="px-3 mt-4 mb-1 text-[10px] uppercase tracking-wider text-slate-400 font-semibold">Import</div>
+    <a href="/import" class="block px-4 py-1.5 transition {% if active == 'import' %}bg-indigo-50 text-indigo-900 font-medium border-l-4 border-indigo-600 pl-3{% else %}text-slate-600 hover:bg-slate-100 border-l-4 border-transparent{% endif %}">Import targets</a>
+    <a href="/supporters/candidates" class="block px-4 py-1.5 transition {% if active == 'candidates' %}bg-indigo-50 text-indigo-900 font-medium border-l-4 border-indigo-600 pl-3{% else %}text-slate-600 hover:bg-slate-100 border-l-4 border-transparent{% endif %}">Scan for supporters</a>
+    <a href="/import/supporters" class="block px-4 py-1.5 transition {% if active == 'import_supporters' %}bg-indigo-50 text-indigo-900 font-medium border-l-4 border-indigo-600 pl-3{% else %}text-slate-600 hover:bg-slate-100 border-l-4 border-transparent{% endif %}">Import supporters</a>
+    <a href="/settings/manual-paths" class="block px-4 py-1.5 transition {% if active == 'settings_manual_paths' %}bg-indigo-50 text-indigo-900 font-medium border-l-4 border-indigo-600 pl-3{% else %}text-slate-600 hover:bg-slate-100 border-l-4 border-transparent{% endif %}">Manual path finding</a>
+
+    {# --- SETTINGS --- #}
+    <div class="px-3 mt-4 mb-1 text-[10px] uppercase tracking-wider text-slate-400 font-semibold">Settings</div>
+    <a href="/setup" class="block px-4 py-1.5 transition {% if active == 'setup' %}bg-indigo-50 text-indigo-900 font-medium border-l-4 border-indigo-600 pl-3{% else %}text-slate-600 hover:bg-slate-100 border-l-4 border-transparent{% endif %}">Setup</a>
+    <a href="/settings/categorization" class="block px-4 py-1.5 transition {% if active == 'settings_categorization' %}bg-indigo-50 text-indigo-900 font-medium border-l-4 border-indigo-600 pl-3{% else %}text-slate-600 hover:bg-slate-100 border-l-4 border-transparent{% endif %}">Categorization</a>
+    <a href="/settings/slack" class="block px-4 py-1.5 transition {% if active == 'settings_slack' %}bg-indigo-50 text-indigo-900 font-medium border-l-4 border-indigo-600 pl-3{% else %}text-slate-600 hover:bg-slate-100 border-l-4 border-transparent{% endif %}">Slack</a>
+    <a href="/settings/google" class="block px-4 py-1.5 transition {% if active == 'settings_google' %}bg-indigo-50 text-indigo-900 font-medium border-l-4 border-indigo-600 pl-3{% else %}text-slate-600 hover:bg-slate-100 border-l-4 border-transparent{% endif %}">Google Workspace</a>
+    <a href="/settings/linkedin-resolver" class="block px-4 py-1.5 transition {% if active == 'settings_linkedin_resolver' %}bg-indigo-50 text-indigo-900 font-medium border-l-4 border-indigo-600 pl-3{% else %}text-slate-600 hover:bg-slate-100 border-l-4 border-transparent{% endif %}">LinkedIn resolver</a>
+    <a href="/settings/team" class="block px-4 py-1.5 transition {% if active == 'settings' %}bg-indigo-50 text-indigo-900 font-medium border-l-4 border-indigo-600 pl-3{% else %}text-slate-600 hover:bg-slate-100 border-l-4 border-transparent{% endif %}">Team</a>
+  </nav>
+
+  {# Pinned footer: sync pill + utility links. The sync pill is filled in by
+     the JS below (renders idle CTA when no sync is running, "Sync paths"
+     button when API key is set, or "Add API key" link when not). #}
+  <div class="border-t border-slate-100 p-3 space-y-2">
+    <div id="sync-status-pill" class="text-xs"
          data-api-key-set="{{ '1' if global_api_key_set else '0' }}">
       <!-- populated dynamically -->
     </div>
-
-    <div class="flex gap-1">
-      <a href="/"
-         class="px-3 py-1.5 text-sm rounded-md transition {% if active == 'targets' %}bg-indigo-100 text-indigo-700 font-medium{% else %}text-slate-600 hover:bg-slate-100{% endif %}">
-        Targets
-      </a>
-      <a href="/accounts"
-         class="px-3 py-1.5 text-sm rounded-md transition {% if active == 'accounts' %}bg-indigo-100 text-indigo-700 font-medium{% else %}text-slate-600 hover:bg-slate-100{% endif %}">
-        Accounts
-      </a>
-      <a href="/connections"
-         class="px-3 py-1.5 text-sm rounded-md transition {% if active == 'connections' %}bg-indigo-100 text-indigo-700 font-medium{% else %}text-slate-600 hover:bg-slate-100{% endif %}">
-        Connections
-      </a>
-      <a href="/new-paths"
-         class="px-3 py-1.5 text-sm rounded-md transition {% if active == 'new_paths' %}bg-indigo-100 text-indigo-700 font-medium{% else %}text-slate-600 hover:bg-slate-100{% endif %}">
-        New paths
-      </a>
-      <a href="/supporters/candidates"
-         class="px-3 py-1.5 text-sm rounded-md transition {% if active == 'candidates' %}bg-indigo-100 text-indigo-700 font-medium{% else %}text-slate-600 hover:bg-slate-100{% endif %}">
-        Supporters
-      </a>
-      <a href="/import"
-         class="px-3 py-1.5 text-sm rounded-md transition {% if active == 'import' %}bg-indigo-100 text-indigo-700 font-medium{% else %}text-slate-600 hover:bg-slate-100{% endif %}">
-        Import
-      </a>
-      <a href="/settings/team"
-         class="px-3 py-1.5 text-sm rounded-md transition {% if active == 'settings' %}bg-indigo-100 text-indigo-700 font-medium{% else %}text-slate-600 hover:bg-slate-100{% endif %}">
-        Settings
-      </a>
-      <a href="/settings/categorization"
-         class="px-3 py-1.5 text-sm rounded-md transition {% if active == 'settings_categorization' %}bg-indigo-100 text-indigo-700 font-medium{% else %}text-slate-600 hover:bg-slate-100{% endif %}">
-        Categories
-      </a>
-      <a href="/settings/manual-paths"
-         class="px-3 py-1.5 text-sm rounded-md transition {% if active == 'settings_manual_paths' %}bg-indigo-100 text-indigo-700 font-medium{% else %}text-slate-600 hover:bg-slate-100{% endif %}">
-        Manual paths
-      </a>
-      <a href="/setup"
-         class="px-3 py-1.5 text-sm rounded-md transition {% if active == 'setup' %}bg-indigo-100 text-indigo-700 font-medium{% else %}text-slate-600 hover:bg-slate-100{% endif %}">
-        Setup
-      </a>
-    </div>
-
-    {# Feedback link + what's-new link — muted styling so they don't compete
-       with the main nav items but are always one click away. The feedback
-       mailto body is built in app.py and exposed via the global Jinja
-       context (see context_processor). #}
-    <div class="flex items-center gap-2 ml-2">
+    <div class="flex items-center gap-3 text-[11px] text-slate-400 pt-1">
       <a href="https://github.com/draftboardco/draftboard-api-starter/blob/main/CHANGELOG.md"
          target="_blank" rel="noopener"
-         class="px-2 py-1.5 text-xs text-slate-400 hover:text-slate-700"
-         title="See what's changed recently">
-        What's new
-      </a>
+         class="hover:text-slate-700"
+         title="See what's changed recently">What's new</a>
       <a href="{{ feedback_mailto or 'mailto:zach@draftboard.com?subject=Draftboard%20kit%20feedback' }}"
-         class="px-2 py-1.5 text-xs text-slate-400 hover:text-slate-700"
-         title="Send feedback / report a bug to the kit author">
-        💬 Feedback
-      </a>
+         class="hover:text-slate-700"
+         title="Send feedback / report a bug to the kit author">💬 Feedback</a>
     </div>
   </div>
-</nav>
+</aside>
 
 <script>
 (function () {
@@ -83,53 +97,55 @@
 
   function render(state) {
     if (!state) {
-      pill.classList.add('hidden');
+      renderIdleCTA();
       return;
     }
     pill.classList.remove('hidden');
     var pct = state.percent || 0;
     var modeLabel = state.mode === 'full' ? 'Full re-sync' : 'Syncing new paths';
     if (state.running) {
+      // Vertical layout: works in a 240px-wide sidebar without wrapping.
       var stopBtn = state.stop_requested
-        ? '<span class="text-indigo-400">Stopping…</span>'
-        : '<button type="button" onclick="stopSync()" class="px-2 py-0.5 rounded border border-indigo-300 text-indigo-700 hover:bg-indigo-100">Stop</button>';
+        ? '<span class="text-indigo-400 text-[11px]">Stopping…</span>'
+        : '<button type="button" onclick="stopSync()" class="text-[11px] px-2 py-0.5 rounded border border-indigo-300 text-indigo-700 hover:bg-indigo-100">Stop</button>';
+      var nameLine = state.last_target_name
+        ? '<div class="text-[10px] text-indigo-500 truncate mt-0.5">' + escapeHtml(state.last_target_name) + '</div>'
+        : '';
       pill.innerHTML =
-        '<div class="flex items-center gap-2 px-3 py-1.5 rounded-md bg-indigo-50 border border-indigo-200 text-indigo-800">' +
-          '<span class="inline-block w-2 h-2 rounded-full bg-indigo-500 animate-pulse"></span>' +
-          '<span>' + modeLabel + ' <strong>' + state.completed + ' / ' + state.total + '</strong> ' +
-          '<span class="text-indigo-500">(' + pct + '%)</span></span>' +
-          (state.last_target_name ? '<span class="text-indigo-500 truncate max-w-[200px]">— ' + escapeHtml(state.last_target_name) + '</span>' : '') +
-          stopBtn +
+        '<div class="px-3 py-2 rounded-md bg-indigo-50 border border-indigo-200 text-indigo-800">' +
+          '<div class="flex items-center gap-1.5 text-[11px] font-medium">' +
+            '<span class="inline-block w-1.5 h-1.5 rounded-full bg-indigo-500 animate-pulse"></span>' +
+            '<span>' + modeLabel + '</span>' +
+          '</div>' +
+          '<div class="text-[11px] mt-0.5"><strong>' + state.completed + ' / ' + state.total + '</strong> <span class="text-indigo-500">(' + pct + '%)</span></div>' +
+          nameLine +
+          '<div class="mt-1.5">' + stopBtn + '</div>' +
         '</div>';
     } else if (state.ended_at && state.ended_at > lastEndedAt) {
       lastEndedAt = state.ended_at;
-      var stoppedMsg = '⏸ Stopped at ' + state.completed + ' / ' + state.total + ' — click Sync again to resume.';
+      var stoppedMsg = '⏸ Stopped at ' + state.completed + ' / ' + state.total;
       var doneMsg = state.errors > 0
         ? '✓ Synced ' + state.completed + ' / ' + state.total + ' (' + state.errors + ' errors)'
         : (state.total > 0
-            ? '✓ All ' + state.total + ' paths synced — drawers are now instant'
+            ? '✓ All ' + state.total + ' paths synced'
             : '✓ Sync finished');
       var msg = state.last_run_stopped ? stoppedMsg : doneMsg;
       var bannerCls = state.last_run_stopped
-        ? 'flex items-center gap-2 px-3 py-1.5 rounded-md bg-amber-50 border border-amber-200 text-amber-800'
-        : 'flex items-center gap-2 px-3 py-1.5 rounded-md bg-emerald-50 border border-emerald-200 text-emerald-800';
+        ? 'px-3 py-2 rounded-md bg-amber-50 border border-amber-200 text-amber-800 text-[11px]'
+        : 'px-3 py-2 rounded-md bg-emerald-50 border border-emerald-200 text-emerald-800 text-[11px]';
       var btnCls = state.last_run_stopped
-        ? 'text-amber-700 hover:underline'
-        : 'text-emerald-700 hover:underline';
+        ? 'text-amber-700 hover:underline mt-1 inline-block'
+        : 'text-emerald-700 hover:underline mt-1 inline-block';
       pill.innerHTML =
         '<div class="' + bannerCls + '">' +
-          '<span>' + msg + '</span>' +
+          '<div>' + msg + '</div>' +
           '<button type="button" onclick="resyncPaths()" class="' + btnCls + '">Sync again</button>' +
         '</div>';
-      // Auto-hide success pill after 30s; keep it visible if there were errors.
-      // After it hides, the always-visible "Sync paths" CTA below takes over.
       if (hideTimer) clearTimeout(hideTimer);
       if (state.errors === 0) {
         hideTimer = setTimeout(function () { renderIdleCTA(); }, 30000);
       }
     } else {
-      // Not running, never ran in this session → show always-visible CTA so
-      // the user can manually kick a sync (the app no longer auto-starts).
       renderIdleCTA();
     }
   }
@@ -138,18 +154,16 @@
     pill.classList.remove('hidden');
     var apiKeySet = pill.getAttribute('data-api-key-set') === '1';
     if (!apiKeySet) {
-      // No API key configured. Sending /sync/start would silently no-op.
-      // Send the user to /setup instead so they can paste a key.
       pill.innerHTML =
-        '<div class="flex items-center gap-2 px-3 py-1.5 rounded-md bg-amber-50 border border-amber-200 text-amber-800">' +
+        '<div class="px-3 py-2 rounded-md bg-amber-50 border border-amber-200 text-amber-800 text-[11px]">' +
           '<a href="/setup" class="font-medium hover:underline">Add API key to sync →</a>' +
         '</div>';
       return;
     }
     pill.innerHTML =
-      '<div class="flex items-center gap-2 px-3 py-1.5 rounded-md bg-slate-100 border border-slate-200 text-slate-700">' +
-        '<button type="button" onclick="resyncPaths()" class="text-indigo-700 hover:underline font-medium">Sync paths</button>' +
-        '<span class="text-[10px] text-slate-500">(only fetches new targets)</span>' +
+      '<div class="px-3 py-2 rounded-md bg-slate-100 border border-slate-200 text-slate-700">' +
+        '<button type="button" onclick="resyncPaths()" class="text-[12px] text-indigo-700 hover:underline font-medium block">Sync paths</button>' +
+        '<span class="text-[10px] text-slate-500">only fetches new targets</span>' +
       '</div>';
   }
 
@@ -164,7 +178,6 @@
       .then(function (r) { return r.json(); })
       .then(function (state) {
         render(state);
-        // Stop polling once sync completes
         if (!state.running && pollTimer) {
           clearInterval(pollTimer);
           pollTimer = null;
@@ -185,19 +198,19 @@
   };
 
   window.stopSync = function () {
-    // Optimistic UI: flip to "Stopping…" before the server confirms so the
-    // user gets instant feedback. The next poll tick (~2.5s) will show the
-    // real state.
     var btn = pill.querySelector('button');
-    if (btn) { btn.outerHTML = '<span class="text-indigo-400">Stopping…</span>'; }
+    if (btn) { btn.outerHTML = '<span class="text-indigo-400 text-[11px]">Stopping…</span>'; }
     fetch('/sync/stop', { method: 'POST' })
       .then(function (r) { return r.json(); })
       .then(function () { poll(); });
   };
 
-  // Initial check on page load — kicks off polling if a sync is running.
+  // Render the idle CTA synchronously so the footer has visible content
+  // before the first /sync/status round-trip. Otherwise the pill is a
+  // 0-height div and the "What's new / Feedback" row jumps when the first
+  // poll completes ~100-300ms later.
+  renderIdleCTA();
   poll();
-  // Brief delayed second check to catch a sync that auto-started during the page render
   setTimeout(function () { poll(); startPolling(); }, 800);
 })();
 </script>
