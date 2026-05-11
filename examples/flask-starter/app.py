@@ -2082,6 +2082,19 @@ def _build_messages(target, connection):
     target_company = (target.get("position") or {}).get("companyName") or ""
     connector_first = (connection.get("firstName") or "").strip() or "there"
 
+    # Pull user context. Empty strings if /settings/profile hasn't been
+    # filled out. When set, the draft frames the ask around what the user's
+    # company does instead of just "Happy to send a forwardable email."
+    try:
+        user_ctx = _user_context()
+        user_company = user_ctx.get("user_company") or ""
+        user_company_desc = user_ctx.get("user_company_description") or ""
+    except Exception:
+        # Defensive: if user_context can't be loaded (db init race, missing
+        # app_state key), fall back to the generic template.
+        user_company = ""
+        user_company_desc = ""
+
     raw_details = connection.get("scoreDetails") or []
     work_clause = None
     mutuals_present = False
@@ -2136,11 +2149,30 @@ def _build_messages(target, connection):
         company_clause = f" at {target_company}" if target_company else ""
         detail = f"saw you're connected to {{TGT}}{company_clause}"
 
-    template = (
-        f"Hey {connector_first} - quick question: {detail}.\n\n"
-        f"Any chance you'd be open to pinging {{TGT}} for a quick warm intro? "
-        f"Happy to send a forwardable email."
-    )
+    # Build the "why we're reaching out" line from the user's profile. The
+    # connector already knows the user (that's why we're asking them for an
+    # intro), so DON'T introduce the user — instead, frame the ask around
+    # what the user's company does and why the target specifically would
+    # benefit. The company description, when set, trails as a "by the way"
+    # parenthetical rather than a self-introduction sentence.
+    why_line = ""
+    if user_company:
+        why_line = (
+            f"Think what we're doing at {user_company} could really be useful "
+            f"for {{TGT}}."
+        )
+    description_line = user_company_desc if (user_company and user_company_desc) else ""
+
+    template_parts = [
+        f"Hey {connector_first} - quick question: {detail}.\n\n",
+        f"Any chance you'd be open to pinging {{TGT}} for a quick warm intro?",
+    ]
+    if why_line:
+        template_parts.append(f" {why_line}")
+    template_parts.append(" Happy to send a forwardable email.")
+    if description_line:
+        template_parts.append(f"\n\n({description_line})")
+    template = "".join(template_parts)
 
     plain = template.replace("{TGT}", target_first)
 
@@ -5885,6 +5917,82 @@ def settings_categorization_save():
             values = [line.strip() for line in raw.splitlines() if line.strip()]
             db_save_category_rules(category, rule_type, values)
     return redirect(url_for("settings_categorization_view", saved="1"))
+
+
+# ---------------------------------------------------------------------------
+# Settings → Your profile
+# ---------------------------------------------------------------------------
+# User-context fields drive personalization of every intro-request draft.
+# Set once on /settings/profile, picked up by _build_messages thereafter.
+# Without this, drafts say "Hey Yuval, saw you're connected to Jean-David..."
+# with no signal about who's asking or why. With it, the draft mentions what
+# the user's company does and frames the ask around the target.
+
+_USER_CONTEXT_KEYS = [
+    "user_first_name",
+    "user_last_name",
+    "user_email",
+    "user_company",
+    "user_company_description",
+    "user_linkedin",
+]
+
+
+def _user_context() -> dict:
+    """Read the user's profile from app_state. Returns dict with all
+    _USER_CONTEXT_KEYS as stripped strings (empty if unset), plus
+    `user_full_name` for convenience."""
+    out = {}
+    for key in _USER_CONTEXT_KEYS:
+        out[key] = (db_app_state_get(key) or "").strip()
+    out["user_full_name"] = f"{out['user_first_name']} {out['user_last_name']}".strip()
+    return out
+
+
+@app.route("/settings/profile", methods=["GET"])
+def settings_profile_view():
+    """Render the user-context form. Drives personalization in intro drafts —
+    the user fills in their name + company once and every Compose-email body
+    picks it up from then on."""
+    return render_template(
+        "settings_profile.html",
+        user=_user_context(),
+        saved=request.args.get("saved") == "1",
+        active="settings_profile",
+    )
+
+
+@app.route("/settings/profile", methods=["POST"])
+def settings_profile_save():
+    """Persist the user-context form. CSRF-guarded the same way as the other
+    settings POSTs. Honeypot bails the request without mutating state — the
+    public-facing kit ships with a `honey` input that real users never see."""
+    sec_site = request.headers.get("Sec-Fetch-Site")
+    if sec_site and sec_site not in ("same-origin", "none"):
+        return jsonify({"error": "cross-site form submission blocked"}), 403
+
+    # Honeypot — real users never see the hidden `honey` field. Bots that
+    # blindly fill every input do. Bail without mutating state. Matters once
+    # the kit is hosted past localhost (Tailscale / ngrok / a cheap VPS),
+    # where drive-by bots could poison user_company_description (which lands
+    # in every outgoing intro draft as a "by the way" footer).
+    if request.form.get("honey"):
+        return redirect(url_for("settings_profile_view", saved="1"))
+
+    # Length caps — defense-in-depth against scripted POSTs. Description gets
+    # 500 chars (a paragraph); everything else is short labels.
+    caps = {
+        "user_first_name": 80,
+        "user_last_name": 80,
+        "user_email": 200,
+        "user_company": 120,
+        "user_company_description": 500,
+        "user_linkedin": 200,
+    }
+    for key, max_len in caps.items():
+        val = (request.form.get(key) or "").strip()[:max_len]
+        db_app_state_set(key, val)
+    return redirect(url_for("settings_profile_view", saved="1"))
 
 
 @app.route("/supporters/categorize-one", methods=["POST"])
