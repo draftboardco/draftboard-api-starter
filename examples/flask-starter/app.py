@@ -2082,6 +2082,21 @@ def _build_messages(target, connection):
     target_company = (target.get("position") or {}).get("companyName") or ""
     connector_first = (connection.get("firstName") or "").strip() or "there"
 
+    # Pull user context. Empty strings if /settings/profile hasn't been
+    # filled out. When set, the draft frames the ask around what the user's
+    # company does instead of just "Happy to send a forwardable email."
+    try:
+        user_ctx = _user_context()
+        user_company = user_ctx.get("user_company") or ""
+        user_company_desc = user_ctx.get("user_company_description") or ""
+    except (sqlite3.Error, RuntimeError):
+        # DB-init race, missing app_state row, or "outside Flask context"
+        # (e.g. _build_messages called from a test). Fall back to the
+        # generic template rather than crash. Coding bugs in _user_context
+        # itself bubble up unmodified so they stay visible.
+        user_company = ""
+        user_company_desc = ""
+
     raw_details = connection.get("scoreDetails") or []
     work_clause = None
     mutuals_present = False
@@ -2136,17 +2151,41 @@ def _build_messages(target, connection):
         company_clause = f" at {target_company}" if target_company else ""
         detail = f"saw you're connected to {{TGT}}{company_clause}"
 
-    template = (
-        f"Hey {connector_first} - quick question: {detail}.\n\n"
-        f"Any chance you'd be open to pinging {{TGT}} for a quick warm intro? "
-        f"Happy to send a forwardable email."
-    )
+    # Build the "why we're reaching out" line from the user's profile. The
+    # connector already knows the user (that's why we're asking them for an
+    # intro), so DON'T introduce the user — instead, frame the ask around
+    # what the user's company does and why the target specifically would
+    # benefit. The company description, when set, trails as a "by the way"
+    # parenthetical rather than a self-introduction sentence.
+    why_line = ""
+    if user_company:
+        why_line = (
+            f"Think what we're doing at {user_company} could really be useful "
+            f"for {{TGT}}."
+        )
+    description_line = user_company_desc if (user_company and user_company_desc) else ""
+
+    template_parts = [
+        f"Hey {connector_first} - quick question: {detail}.\n\n",
+        f"Any chance you'd be open to pinging {{TGT}} for a quick warm intro?",
+    ]
+    if why_line:
+        template_parts.append(f" {why_line}")
+    template_parts.append(" Happy to send a forwardable email.")
+    if description_line:
+        template_parts.append(f"\n\n({description_line})")
+    template = "".join(template_parts)
 
     plain = template.replace("{TGT}", target_first)
 
     # Build the HTML version. Escape the surrounding text first so the
     # connector's name etc. is safe, then substitute {TGT} with an <a> tag.
-    if target_linkedin:
+    # URL-scheme guard: only emit a live link when the URL is plain http(s).
+    # Manual-paths CSV upload accepts only li_person_re-matching URLs today,
+    # but a future importer or restored data.db could land a `javascript:` or
+    # `data:` URL in targets_cache. The Slack builder already guards this way
+    # at _build_slack_assign_payload — match the pattern here too.
+    if target_linkedin and target_linkedin.startswith(("http://", "https://")):
         link = (
             f'<a href="{html.escape(target_linkedin, quote=True)}">'
             f'{html.escape(target_first)}</a>'
@@ -2184,6 +2223,229 @@ def _gmail_compose_url(subject, body, to=None):
     if to:
         parts.append(f"&to={quote(to)}")
     return "".join(parts)
+
+
+def _name_from_linkedin_url(url: str) -> str:
+    """Pull a human-readable name from a LinkedIn profile URL slug. Used as a
+    display fallback for paste-mode targets that don't have first/last
+    metadata from the API yet. Example: linkedin.com/in/yoav-oz → 'yoav oz'."""
+    if not url:
+        return ""
+    norm = _normalize_linkedin(url)
+    if "/in/" not in (norm or ""):
+        return ""
+    slug = norm.split("/in/", 1)[1].split("/", 1)[0]
+    return slug.replace("-", " ").replace("_", " ").strip()
+
+
+def _resolve_target_for_message(target: dict) -> dict:
+    """Resolve a target's display fields (first/last/full/title/company/linkedin)
+    using the same manual-path-metadata fallback chain as _build_messages.
+    Pulled out so the bulk-intro builder produces matching wording without
+    re-implementing the cascade.
+
+    Priority order per field:
+      1. target.firstName / lastName / position.title / position.companyName
+         (whatever the Draftboard API gave us)
+      2. manual_path_connections row matching the LinkedIn URL (when the
+         target was paste-imported and someone uploaded a CSV containing
+         the same URL)
+      3. URL slug as last-resort first/last
+    """
+    first = (target.get("firstName") or "").strip()
+    last = (target.get("lastName") or "").strip()
+    linkedin = target.get("linkedinUrl") or ""
+    company = ((target.get("position") or {}).get("companyName") or "").strip()
+    title = ((target.get("position") or {}).get("title") or "").strip()
+
+    if not (first and last and company and title):
+        try:
+            norm = _normalize_linkedin(linkedin)
+            if norm:
+                meta = _manual_path_metadata_map().get(norm)
+                if meta:
+                    first = first or (meta.get("first_name") or "")
+                    last = last or (meta.get("last_name") or "")
+                    company = company or (meta.get("company") or "")
+                    title = title or (meta.get("position") or "")
+        except RuntimeError:
+            # Outside Flask context — skip the fallback.
+            pass
+
+    if not first:
+        slug = _name_from_linkedin_url(linkedin)
+        if slug:
+            parts = slug.split()
+            first = parts[0].title() if parts else ""
+            if not last and len(parts) > 1:
+                last = parts[-1].title()
+    first = first or "them"
+    full = f"{first} {last}".strip() if last else first
+    return {
+        "first": first,
+        "last": last,
+        "full": full,
+        "title": title,
+        "company": company,
+        "linkedin": linkedin,
+    }
+
+
+def _build_bulk_intro_message(connector, targets):
+    """Build a single intro-request message asking one connector for multiple
+    intros at once. Returns the same shape as `_build_messages` so the drawer
+    JS can drive the Compose-email + Copy buttons with the existing handlers.
+
+    The connector is presumed to already know the user (that's why we're
+    asking them for intros), so the message does NOT introduce the user.
+    The user's company description, if set, lands as a parenthetical "by the
+    way" footer rather than a self-introduction sentence."""
+    connector_first = (connector.get("firstName") or "").strip() or "there"
+
+    try:
+        user_ctx = _user_context()
+        user_company = (user_ctx.get("user_company") or "").strip()
+        user_company_desc = (user_ctx.get("user_company_description") or "").strip()
+    except (sqlite3.Error, RuntimeError):
+        # Same narrow-catch logic as _build_messages.
+        user_company = ""
+        user_company_desc = ""
+
+    resolved = [_resolve_target_for_message(t) for t in targets]
+
+    def _descriptor(r):
+        if r["title"] and r["company"]:
+            return f"{r['title']} at {r['company']}"
+        if r["company"]:
+            return f"at {r['company']}"
+        return r["title"] or ""
+
+    plain_lines = []
+    for r in resolved:
+        descriptor = _descriptor(r)
+        line = f"- {r['full']}"
+        if descriptor:
+            line += f" ({descriptor})"
+        if r["linkedin"]:
+            line += f": {r['linkedin']}"
+        plain_lines.append(line)
+
+    n = len(resolved)
+    if n == 1:
+        opener = (
+            f"Hey {connector_first} - quick question: there's someone in your "
+            f"network I'd love to chat with. Open to pinging them for a quick "
+            f"warm intro?"
+        )
+    else:
+        opener = (
+            f"Hey {connector_first} - quick question: there are a few folks in "
+            f"your network I'd love to chat with. Any of them open for a quick "
+            f"warm intro?"
+        )
+    plain_parts = [opener, "", "\n".join(plain_lines), ""]
+    if user_company:
+        if n == 1:
+            plain_parts.append(
+                f"Think what we're doing at {user_company} could really be useful for them. "
+                f"Happy to send a forwardable email if it feels like a fit - no worries "
+                f"if it doesn't."
+            )
+        else:
+            plain_parts.append(
+                f"Think what we're doing at {user_company} could really be useful for them. "
+                f"Happy to send forwardable emails for whichever ones feel like a fit - no "
+                f"worries on any that feel awkward."
+            )
+    else:
+        if n == 1:
+            plain_parts.append(
+                "Happy to send a forwardable email if it feels like a fit - no worries "
+                "if it doesn't."
+            )
+        else:
+            plain_parts.append(
+                "Happy to send forwardable emails for whichever ones feel like a fit - no "
+                "worries on any that feel awkward."
+            )
+    if user_company and user_company_desc:
+        plain_parts.append("")
+        plain_parts.append(f"({user_company_desc})")
+
+    plain = "\n".join(plain_parts)
+
+    # HTML version — URL-scheme guard on each <a href> (defense in depth
+    # against a paste-imported target whose LinkedIn URL is somehow not
+    # plain http(s); mirrors the per-target builder's guard).
+    html_bullets = []
+    for r in resolved:
+        descriptor = _descriptor(r)
+        descriptor_html = f" ({html.escape(descriptor)})" if descriptor else ""
+        if r["linkedin"] and r["linkedin"].startswith(("http://", "https://")):
+            name_html = (
+                f'<a href="{html.escape(r["linkedin"], quote=True)}">'
+                f"{html.escape(r['full'])}</a>"
+            )
+        else:
+            name_html = html.escape(r["full"])
+        html_bullets.append(f"<li>{name_html}{descriptor_html}</li>")
+
+    html_intro = html.escape(opener)
+    outro_pieces = []
+    if user_company:
+        if n == 1:
+            outro_pieces.append(
+                html.escape(
+                    f"Think what we're doing at {user_company} could really be useful for them. "
+                    f"Happy to send a forwardable email if it feels like a fit - no worries "
+                    f"if it doesn't."
+                )
+            )
+        else:
+            outro_pieces.append(
+                html.escape(
+                    f"Think what we're doing at {user_company} could really be useful for them. "
+                    f"Happy to send forwardable emails for whichever ones feel like a fit - no "
+                    f"worries on any that feel awkward."
+                )
+            )
+    else:
+        if n == 1:
+            outro_pieces.append(
+                html.escape(
+                    "Happy to send a forwardable email if it feels like a fit - no worries "
+                    "if it doesn't."
+                )
+            )
+        else:
+            outro_pieces.append(
+                html.escape(
+                    "Happy to send forwardable emails for whichever ones feel like a fit - no "
+                    "worries on any that feel awkward."
+                )
+            )
+    if user_company and user_company_desc:
+        outro_pieces.append(f"({html.escape(user_company_desc)})")
+
+    html_body = (
+        f"<p>{html_intro}</p>"
+        f"<ul>{''.join(html_bullets)}</ul>"
+        f"<p>{'<br><br>'.join(outro_pieces)}</p>"
+    )
+
+    if n == 1:
+        subject = f"Intro to {resolved[0]['full']}?"
+    else:
+        subject = f"Quick intro request - {n} folks in your network"
+
+    return {
+        "plain": plain,
+        "html": html_body,
+        "plain_fallback": plain,
+        "subject": subject,
+        "count": n,
+        "gmail_url": _gmail_compose_url(subject, plain),
+    }
 
 
 def _build_assign_to_teammate_draft(target, connection, teammate):
@@ -2422,10 +2684,17 @@ _LI_RE = re.compile(r"linkedin\.com/in/[^\s,/?#]+", re.IGNORECASE)
 
 
 def normalize_linkedin_urls(raw: str):
-    """Accept comma- or newline-separated input. Normalize each entry to https://www.linkedin.com/in/<slug>."""
+    """Accept comma-, newline-, or tab-separated input. Normalize each entry to
+    https://www.linkedin.com/in/<slug>.
+
+    Tabs handled so that Excel / Google Sheets paste (which uses TAB as the
+    cell separator) still produces one URL per cell when a row contains
+    multiple LinkedIn URLs across columns. The client-side paste handler in
+    import.html does this conversion in the browser; this is defense in depth
+    for direct curl POSTs and older browsers."""
     if not raw:
         return []
-    parts = [p.strip() for p in re.split(r"[\n,]+", raw) if p.strip()]
+    parts = [p.strip() for p in re.split(r"[\n,\t]+", raw) if p.strip()]
     out = []
     seen = set()
     for p in parts:
@@ -2457,7 +2726,10 @@ def _matches_query(t, q_lower):
         t.get("firstName") or "",
         t.get("lastName") or "",
         (t.get("position") or {}).get("title") or "",
-        (t.get("position") or {}).get("companyName") or "",
+        # Search the manual-path-derived company too, so paste-mode targets
+        # whose company comes only from a CSV row still match search by
+        # company name.
+        _target_company_with_fallback(t),
         " ".join(t.get("tags") or []),
     ]).lower()
     return q_lower in haystack
@@ -2470,7 +2742,9 @@ def _enrich_target(t):
         "name": f"{t.get('firstName') or ''} {t.get('lastName') or ''}".strip() or "(no name)",
         "initials": _initials(t.get("firstName"), t.get("lastName")),
         "title": position.get("title") or "",
-        "company": position.get("companyName") or "",
+        # Display the manual-path-derived company when position is empty —
+        # matches the bucket key used by /accounts and the connector drawer.
+        "company": _target_company_with_fallback(t),
         "linkedinUrl": t.get("linkedinUrl") or "",
         "score": t.get("score") or 0,
         "connections_number": t.get("connectionsNumber") or 0,
@@ -2583,11 +2857,16 @@ def accounts_view():
         owner_target_ids = db_target_ids_for_owner(resolved_owner_id)
         targets = [t for t in targets if t.get("id") in owner_target_ids]
 
-    # Group by company name (case-insensitive key, preserve display case)
+    # Group by company name (case-insensitive key, preserve display case).
+    # Use the manual-path metadata fallback so paste-mode-added targets with
+    # an empty `position.companyName` still bucket under their real company
+    # when a manual_path_connections row supplies one. Without this, the
+    # listing groups them as "(unknown company)" but the account drawer's
+    # lookup (which also uses the fallback) can't find them — 404.
     accounts = {}
     for t in targets:
         position = t.get("position") or {}
-        company = (position.get("companyName") or "").strip() or "(unknown company)"
+        company = _target_company_with_fallback(t) or "(unknown company)"
         key = company.lower()
         if key not in accounts:
             accounts[key] = {
@@ -2821,11 +3100,13 @@ def account_drawer(account_key):
     targets_all, _ = fetch_all_targets()
     key_lower = account_key.lower()
 
+    # Match company using the same manual-path-metadata fallback the
+    # accounts listing uses (see `_target_company_with_fallback`). Without
+    # this, paste-mode targets that the listing groups under their
+    # manual-path-derived company will 404 here.
     matching = []
     for t in targets_all:
-        company = ((t.get("position") or {}).get("companyName") or "").strip()
-        if not company:
-            company = "(unknown company)"
+        company = _target_company_with_fallback(t) or "(unknown company)"
         if company.lower() == key_lower:
             matching.append(t)
 
@@ -2839,7 +3120,7 @@ def account_drawer(account_key):
     enriched_targets = [_enrich_target(t) for t in matching]
     selected_id = matching[0].get("id")
 
-    display_name = ((matching[0].get("position") or {}).get("companyName") or "").strip() or "(unknown company)"
+    display_name = _target_company_with_fallback(matching[0]) or "(unknown company)"
 
     return render_template(
         "_drawer_account.html",
@@ -3020,7 +3301,7 @@ def connector_drawer(connector_key):
                 "title": pos.get("title") or "",
                 "company": pos.get("companyName") or "",
             }
-        company = ((target.get("position") or {}).get("companyName") or "").strip() or "(unknown company)"
+        company = _target_company_with_fallback(target) or "(unknown company)"
         if company not in grouped:
             grouped[company] = []
         grouped[company].append({
@@ -3102,7 +3383,7 @@ def _connector_drawer_manual(connector_key: str):
         if manual_conn is None:
             continue
         paths_count += 1
-        company = ((target.get("position") or {}).get("companyName") or "").strip() or "(unknown company)"
+        company = _target_company_with_fallback(target) or "(unknown company)"
         grouped.setdefault(company, []).append({
             "target": _enrich_target(target),
             "target_id": tid,
@@ -3127,6 +3408,76 @@ def _connector_drawer_manual(connector_key: str):
         groups=sorted_groups,
         total_targets=paths_count,
     )
+
+
+@app.route("/connector/<path:connector_key>/bulk-intro", methods=["POST"])
+def connector_bulk_intro(connector_key):
+    """Build a single intro-request message asking ONE connector for intros to
+    MULTIPLE targets. Called from the connector drawer when the user checks
+    boxes on N targets and clicks "Compose bulk intro." Returns JSON in the
+    same shape as the per-target draft (subject/plain/html/plain_fallback/
+    gmail_url + a count) so the existing Compose-email / Copy handlers can
+    drive the result with no extra branching."""
+    sec_fetch = request.headers.get("Sec-Fetch-Site")
+    if sec_fetch and sec_fetch not in ("same-origin", "none"):
+        return jsonify({"ok": False, "error": "cross-site"}), 403
+
+    data = request.get_json(silent=True) or {}
+    target_ids_raw = data.get("target_ids")
+    if not isinstance(target_ids_raw, list) or not target_ids_raw:
+        return jsonify({"ok": False, "error": "no_targets"}), 400
+    target_ids = []
+    seen = set()
+    for tid in target_ids_raw:
+        if not isinstance(tid, str):
+            continue
+        tid = tid.strip()
+        if tid and tid not in seen:
+            seen.add(tid)
+            target_ids.append(tid)
+        if len(target_ids) >= 20:  # hard cap to keep messages readable
+            break
+    if not target_ids:
+        return jsonify({"ok": False, "error": "no_targets"}), 400
+
+    # Resolve connector identity. Manual lists store owner data on the
+    # list row; API connectors need a connection_id lookup against the
+    # cached per-target JSON.
+    connector = None
+    if connector_key.startswith("manual:"):
+        try:
+            list_id = int(connector_key.split(":", 1)[1])
+        except (IndexError, ValueError):
+            return jsonify({"ok": False, "error": "bad_connector_key"}), 404
+        summary = manual_path_match_summary()
+        list_data = summary["by_list"].get(list_id)
+        if not list_data:
+            return jsonify({"ok": False, "error": "connector_not_found"}), 404
+        connector = {
+            "firstName": list_data.get("owner_first", ""),
+            "lastName": list_data.get("owner_last", ""),
+        }
+    else:
+        paths = db_targets_for_connector(connector_key)
+        if not paths:
+            return jsonify({"ok": False, "error": "connector_not_found"}), 404
+        target_conns, _err = fetch_target_connections(paths[0]["target_id"])
+        conn_obj = next(
+            (c for c in target_conns if c.get("id") == paths[0]["connection_id"]),
+            None,
+        )
+        if not conn_obj:
+            return jsonify({"ok": False, "error": "connector_data_missing"}), 404
+        connector = conn_obj
+
+    targets_all, _ = fetch_all_targets()
+    target_map = {t.get("id"): t for t in targets_all}
+    targets = [target_map[tid] for tid in target_ids if tid in target_map]
+    if not targets:
+        return jsonify({"ok": False, "error": "no_matching_targets"}), 400
+
+    msg = _build_bulk_intro_message(connector, targets)
+    return jsonify({"ok": True, **msg})
 
 
 @app.route("/new-paths", methods=["GET"])
@@ -4668,6 +5019,69 @@ def manual_path_match_summary() -> dict:
     return out
 
 
+def _manual_path_metadata_map() -> dict:
+    """Per-request map of {normalized_linkedin_url → {first_name, last_name,
+    company, position, email}} aggregated across ALL manual_path_connections
+    rows. Used as a metadata fallback for targets whose own
+    `position.companyName` is empty — relevant when the target was added via
+    a paste-mode URL and someone else's manual list happens to include the
+    same LinkedIn URL with company/title attached.
+
+    Cached on flask.g so a single request that walks many targets (accounts
+    listing, account drawer) doesn't issue one SELECT per target."""
+    from flask import g
+    g_key = "_manual_path_metadata_map_cache"
+    cached = getattr(g, g_key, None)
+    if cached is not None:
+        return cached
+    out: dict = {}
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT linkedin_url_normalized, first_name, last_name, "
+            "       company, position, email "
+            "FROM manual_path_connections "
+            "WHERE linkedin_url_normalized != ''"
+        )
+        for norm, fn, ln, comp, pos, em in cur.fetchall():
+            if not norm or norm in out:
+                continue
+            out[norm] = {
+                "first_name": fn or "",
+                "last_name": ln or "",
+                "company": comp or "",
+                "position": pos or "",
+                "email": em or "",
+            }
+    setattr(g, g_key, out)
+    return out
+
+
+def _target_company_with_fallback(t: dict) -> str:
+    """Target's display company, with a manual-path-metadata fallback.
+
+    When the target's `position.companyName` is empty (typical for
+    paste-mode-added targets), look up the matching manual_path_connections
+    row by normalized LinkedIn URL and use its `company` instead. Preserves
+    the existing "(unknown company)" bucket only when neither source has a
+    company.
+
+    Use this anywhere the accounts grouping or the account drawer keys off
+    company name — otherwise the listing groups a paste-mode target into
+    "(unknown company)" while the drawer fails to find it because the
+    drawer's lookup uses the manual-path-derived display company."""
+    pos = (t.get("position") or {})
+    company = (pos.get("companyName") or "").strip()
+    if company:
+        return company
+    norm = _normalize_linkedin(t.get("linkedinUrl") or "")
+    if not norm:
+        return ""
+    meta = _manual_path_metadata_map().get(norm)
+    if meta:
+        return (meta.get("company") or "").strip()
+    return ""
+
+
 def manual_paths_for_target(target: dict) -> list[dict]:
     """Find manual-list connections that match this target's LinkedIn URL.
     Returns a list of Connection-shaped dicts (same shape as
@@ -5803,6 +6217,99 @@ def settings_categorization_save():
             values = [line.strip() for line in raw.splitlines() if line.strip()]
             db_save_category_rules(category, rule_type, values)
     return redirect(url_for("settings_categorization_view", saved="1"))
+
+
+# ---------------------------------------------------------------------------
+# Settings → Your profile
+# ---------------------------------------------------------------------------
+# User-context fields drive personalization of every intro-request draft.
+# Set once on /settings/profile, picked up by _build_messages thereafter.
+# Without this, drafts say "Hey Yuval, saw you're connected to Jean-David..."
+# with no signal about who's asking or why. With it, the draft mentions what
+# the user's company does and frames the ask around the target.
+
+_USER_CONTEXT_KEYS = [
+    "user_first_name",
+    "user_last_name",
+    "user_email",
+    "user_company",
+    "user_company_description",
+    "user_linkedin",
+]
+
+
+def _user_context() -> dict:
+    """Read the user's profile from app_state. Returns dict with all
+    _USER_CONTEXT_KEYS as stripped strings (empty if unset), plus
+    `user_full_name` for convenience.
+
+    Per-request cached on flask.g — `_build_messages` calls this for every
+    rendered connector card, which on a page with 100 targets × ~5
+    connectors each would otherwise issue ~3,000 locked DB roundtrips per
+    page load. Same pattern as `_manual_path_metadata_map`."""
+    try:
+        from flask import g
+        cached = getattr(g, "_user_context_cache", None)
+        if cached is not None:
+            return cached
+    except RuntimeError:
+        g = None  # outside Flask context — skip cache, fall through to read
+    out = {}
+    for key in _USER_CONTEXT_KEYS:
+        out[key] = (db_app_state_get(key) or "").strip()
+    out["user_full_name"] = f"{out['user_first_name']} {out['user_last_name']}".strip()
+    if g is not None:
+        try:
+            g._user_context_cache = out
+        except RuntimeError:
+            pass
+    return out
+
+
+@app.route("/settings/profile", methods=["GET"])
+def settings_profile_view():
+    """Render the user-context form. Drives personalization in intro drafts —
+    the user fills in their name + company once and every Compose-email body
+    picks it up from then on."""
+    return render_template(
+        "settings_profile.html",
+        user=_user_context(),
+        saved=request.args.get("saved") == "1",
+        active="settings_profile",
+    )
+
+
+@app.route("/settings/profile", methods=["POST"])
+def settings_profile_save():
+    """Persist the user-context form. CSRF-guarded the same way as the other
+    settings POSTs. Honeypot bails the request without mutating state — the
+    public-facing kit ships with a `honey` input that real users never see."""
+    sec_site = request.headers.get("Sec-Fetch-Site")
+    if sec_site and sec_site not in ("same-origin", "none"):
+        return jsonify({"error": "cross-site form submission blocked"}), 403
+
+    # Honeypot — real users never see the hidden `honey` field. Bots that
+    # blindly fill every input do. Bail without mutating state. Matters once
+    # the kit is hosted past localhost (Tailscale / ngrok / a cheap VPS),
+    # where drive-by bots could poison user_company_description (which lands
+    # in every outgoing intro draft as a "by the way" footer).
+    if request.form.get("honey"):
+        return redirect(url_for("settings_profile_view", saved="1"))
+
+    # Length caps — defense-in-depth against scripted POSTs. Description gets
+    # 500 chars (a paragraph); everything else is short labels.
+    caps = {
+        "user_first_name": 80,
+        "user_last_name": 80,
+        "user_email": 200,
+        "user_company": 120,
+        "user_company_description": 500,
+        "user_linkedin": 200,
+    }
+    for key, max_len in caps.items():
+        val = (request.form.get(key) or "").strip()[:max_len]
+        db_app_state_set(key, val)
+    return redirect(url_for("settings_profile_view", saved="1"))
 
 
 @app.route("/supporters/categorize-one", methods=["POST"])

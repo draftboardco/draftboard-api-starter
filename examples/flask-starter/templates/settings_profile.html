@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Settings — Your profile</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    {% include "_nav.html" %}
+
+    <header class="mb-6">
+      <h1 class="text-2xl font-semibold tracking-tight">Your profile</h1>
+      <p class="text-sm text-slate-500 mt-1">
+        Tell the kit who you are and what your company does. Every intro-request draft picks these values up so the message sounds like you wrote it instead of a generic template.
+      </p>
+      <p class="text-xs text-slate-500 mt-2">
+        Stays on your laptop in <code>data.db</code> (gitignored). Nothing is shipped to Draftboard or any other server.
+      </p>
+    </header>
+
+    {% if saved %}
+      <div class="mb-4 rounded-md border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
+        ✓ Saved. Compose-email drafts will use these values from now on.
+      </div>
+    {% endif %}
+
+    <section class="bg-white border border-slate-200 rounded-lg shadow-sm p-5">
+      <form method="POST" action="/settings/profile" class="space-y-4">
+        {# Honeypot — visually hidden from real users, but scripted bots that
+           blindly fill every input get caught. The save handler bails out on
+           any value here without mutating state. #}
+        <input type="text" name="honey" tabindex="-1" autocomplete="off"
+               style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0"
+               aria-hidden="true" />
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <label class="block">
+            <span class="text-[10px] uppercase tracking-wider text-slate-500">Your first name</span>
+            <input type="text" name="user_first_name" value="{{ user.user_first_name }}"
+                   placeholder="Zach" maxlength="80"
+                   class="mt-1 w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+          </label>
+          <label class="block">
+            <span class="text-[10px] uppercase tracking-wider text-slate-500">Your last name</span>
+            <input type="text" name="user_last_name" value="{{ user.user_last_name }}"
+                   placeholder="Roseman" maxlength="80"
+                   class="mt-1 w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+          </label>
+          <label class="block">
+            <span class="text-[10px] uppercase tracking-wider text-slate-500">Your email</span>
+            <input type="email" name="user_email" value="{{ user.user_email }}"
+                   placeholder="zach@yourcompany.com" maxlength="200"
+                   class="mt-1 w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+          </label>
+          <label class="block">
+            <span class="text-[10px] uppercase tracking-wider text-slate-500">Your LinkedIn URL (optional)</span>
+            <input type="url" name="user_linkedin" value="{{ user.user_linkedin }}"
+                   placeholder="https://linkedin.com/in/zach-roseman" maxlength="200"
+                   class="mt-1 w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-[10px] uppercase tracking-wider text-slate-500">Your company name</span>
+            <input type="text" name="user_company" value="{{ user.user_company }}"
+                   placeholder="Draftboard" maxlength="120"
+                   class="mt-1 w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+          </label>
+          <label class="block md:col-span-2">
+            <span class="text-[10px] uppercase tracking-wider text-slate-500">What does your company do? (1-3 sentences)</span>
+            <textarea name="user_company_description" rows="3" maxlength="500"
+                      placeholder="Draftboard helps GTM teams turn their network into pipeline. We map every warm-intro path through your team's combined LinkedIn graph automatically - no CSV exports."
+                      class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">{{ user.user_company_description }}</textarea>
+            <p class="text-[10px] text-slate-400 mt-1">
+              We include this in intro-request drafts so the connector knows why you want the intro. Keep it short and concrete - the kind of thing you'd say in a 1-sentence cold email pitch.
+            </p>
+          </label>
+        </div>
+
+        <div class="pt-2">
+          <button type="submit"
+                  class="rounded-md bg-indigo-600 text-white px-4 py-2 text-sm font-medium hover:bg-indigo-700">
+            Save
+          </button>
+        </div>
+      </form>
+    </section>
+
+    <div class="mt-6 text-xs text-slate-500">
+      Preview the personalization: open any target's drawer and check the "Draft intro request message" section on a path card. Empty fields fall back to a generic template.
+    </div>
+
+    <footer class="mt-10 text-xs text-slate-400 text-center">
+      Draftboard API Starter · Settings · Your profile
+    </footer>
+  </div>
+</body>
+</html>
