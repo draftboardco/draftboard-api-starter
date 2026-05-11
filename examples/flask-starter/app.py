@@ -2223,6 +2223,198 @@ def _gmail_compose_url(subject, body, to=None):
     return "".join(parts)
 
 
+def _name_from_linkedin_url(url: str) -> str:
+    """Pull a human-readable name from a LinkedIn profile URL slug. Used as a
+    display fallback for paste-mode targets that don't have first/last
+    metadata from the API yet. Example: linkedin.com/in/yoav-oz → 'yoav oz'."""
+    if not url:
+        return ""
+    norm = _normalize_linkedin(url)
+    if "/in/" not in (norm or ""):
+        return ""
+    slug = norm.split("/in/", 1)[1].split("/", 1)[0]
+    return slug.replace("-", " ").replace("_", " ").strip()
+
+
+def _resolve_target_for_message(target: dict) -> dict:
+    """Resolve a target's display fields (first/last/full/title/company/linkedin)
+    using the same manual-path-metadata fallback chain as _build_messages.
+    Pulled out so the bulk-intro builder produces matching wording without
+    re-implementing the cascade.
+
+    Priority order per field:
+      1. target.firstName / lastName / position.title / position.companyName
+         (whatever the Draftboard API gave us)
+      2. manual_path_connections row matching the LinkedIn URL (when the
+         target was paste-imported and someone uploaded a CSV containing
+         the same URL)
+      3. URL slug as last-resort first/last
+    """
+    first = (target.get("firstName") or "").strip()
+    last = (target.get("lastName") or "").strip()
+    linkedin = target.get("linkedinUrl") or ""
+    company = ((target.get("position") or {}).get("companyName") or "").strip()
+    title = ((target.get("position") or {}).get("title") or "").strip()
+
+    if not (first and last and company and title):
+        try:
+            norm = _normalize_linkedin(linkedin)
+            if norm:
+                meta = _manual_path_metadata_map().get(norm)
+                if meta:
+                    first = first or (meta.get("first_name") or "")
+                    last = last or (meta.get("last_name") or "")
+                    company = company or (meta.get("company") or "")
+                    title = title or (meta.get("position") or "")
+        except RuntimeError:
+            # Outside Flask context — skip the fallback.
+            pass
+
+    if not first:
+        slug = _name_from_linkedin_url(linkedin)
+        if slug:
+            parts = slug.split()
+            first = parts[0].title() if parts else ""
+            if not last and len(parts) > 1:
+                last = parts[-1].title()
+    first = first or "them"
+    full = f"{first} {last}".strip() if last else first
+    return {
+        "first": first,
+        "last": last,
+        "full": full,
+        "title": title,
+        "company": company,
+        "linkedin": linkedin,
+    }
+
+
+def _build_bulk_intro_message(connector, targets):
+    """Build a single intro-request message asking one connector for multiple
+    intros at once. Returns the same shape as `_build_messages` so the drawer
+    JS can drive the Compose-email + Copy buttons with the existing handlers.
+
+    The connector is presumed to already know the user (that's why we're
+    asking them for intros), so the message does NOT introduce the user.
+    The user's company description, if set, lands as a parenthetical "by the
+    way" footer rather than a self-introduction sentence."""
+    connector_first = (connector.get("firstName") or "").strip() or "there"
+
+    try:
+        user_ctx = _user_context()
+        user_company = (user_ctx.get("user_company") or "").strip()
+        user_company_desc = (user_ctx.get("user_company_description") or "").strip()
+    except Exception:
+        user_company = ""
+        user_company_desc = ""
+
+    resolved = [_resolve_target_for_message(t) for t in targets]
+
+    def _descriptor(r):
+        if r["title"] and r["company"]:
+            return f"{r['title']} at {r['company']}"
+        if r["company"]:
+            return f"at {r['company']}"
+        return r["title"] or ""
+
+    plain_lines = []
+    for r in resolved:
+        descriptor = _descriptor(r)
+        line = f"- {r['full']}"
+        if descriptor:
+            line += f" ({descriptor})"
+        if r["linkedin"]:
+            line += f": {r['linkedin']}"
+        plain_lines.append(line)
+
+    plain_parts = [
+        (
+            f"Hey {connector_first} - quick question: there are a few folks in "
+            f"your network I'd love to chat with. Any of them open for a quick "
+            f"warm intro?"
+        ),
+        "",
+        "\n".join(plain_lines),
+        "",
+    ]
+    if user_company:
+        plain_parts.append(
+            f"Think what we're doing at {user_company} could really be useful for them. "
+            f"Happy to send forwardable emails for whichever ones feel like a fit - no "
+            f"worries on any that feel awkward."
+        )
+    else:
+        plain_parts.append(
+            "Happy to send forwardable emails for whichever ones feel like a fit - no "
+            "worries on any that feel awkward."
+        )
+    if user_company and user_company_desc:
+        plain_parts.append("")
+        plain_parts.append(f"({user_company_desc})")
+
+    plain = "\n".join(plain_parts)
+
+    # HTML version — URL-scheme guard on each <a href> (defense in depth
+    # against a paste-imported target whose LinkedIn URL is somehow not
+    # plain http(s); mirrors the per-target builder's guard).
+    html_bullets = []
+    for r in resolved:
+        descriptor = _descriptor(r)
+        descriptor_html = f" ({html.escape(descriptor)})" if descriptor else ""
+        if r["linkedin"] and r["linkedin"].startswith(("http://", "https://")):
+            name_html = (
+                f'<a href="{html.escape(r["linkedin"], quote=True)}">'
+                f"{html.escape(r['full'])}</a>"
+            )
+        else:
+            name_html = html.escape(r["full"])
+        html_bullets.append(f"<li>{name_html}{descriptor_html}</li>")
+
+    html_intro = html.escape(
+        f"Hey {connector_first} - quick question: there are a few folks in your network "
+        f"I'd love to chat with. Any of them open for a quick warm intro?"
+    )
+    outro_pieces = []
+    if user_company:
+        outro_pieces.append(
+            html.escape(
+                f"Think what we're doing at {user_company} could really be useful for them. "
+                f"Happy to send forwardable emails for whichever ones feel like a fit - no "
+                f"worries on any that feel awkward."
+            )
+        )
+    else:
+        outro_pieces.append(
+            html.escape(
+                "Happy to send forwardable emails for whichever ones feel like a fit - no "
+                "worries on any that feel awkward."
+            )
+        )
+    if user_company and user_company_desc:
+        outro_pieces.append(f"({html.escape(user_company_desc)})")
+
+    html_body = (
+        f"<p>{html_intro}</p>"
+        f"<ul>{''.join(html_bullets)}</ul>"
+        f"<p>{'<br><br>'.join(outro_pieces)}</p>"
+    )
+
+    n = len(resolved)
+    if n == 1:
+        subject = f"Intro to {resolved[0]['full']}?"
+    else:
+        subject = f"Quick intro request - {n} folks in your network"
+
+    return {
+        "plain": plain,
+        "html": html_body,
+        "plain_fallback": plain,
+        "subject": subject,
+        "count": n,
+        "gmail_url": _gmail_compose_url(subject, plain),
+    }
+
+
 def _build_assign_to_teammate_draft(target, connection, teammate):
     """Generate a Gmail draft asking a teammate to ping the connector for an
     intro to the target. Used by the 'Assigned to' dropdown.
@@ -3178,6 +3370,76 @@ def _connector_drawer_manual(connector_key: str):
         groups=sorted_groups,
         total_targets=paths_count,
     )
+
+
+@app.route("/connector/<path:connector_key>/bulk-intro", methods=["POST"])
+def connector_bulk_intro(connector_key):
+    """Build a single intro-request message asking ONE connector for intros to
+    MULTIPLE targets. Called from the connector drawer when the user checks
+    boxes on N targets and clicks "Compose bulk intro." Returns JSON in the
+    same shape as the per-target draft (subject/plain/html/plain_fallback/
+    gmail_url + a count) so the existing Compose-email / Copy handlers can
+    drive the result with no extra branching."""
+    sec_fetch = request.headers.get("Sec-Fetch-Site")
+    if sec_fetch and sec_fetch not in ("same-origin", "none"):
+        return jsonify({"ok": False, "error": "cross-site"}), 403
+
+    data = request.get_json(silent=True) or {}
+    target_ids_raw = data.get("target_ids")
+    if not isinstance(target_ids_raw, list) or not target_ids_raw:
+        return jsonify({"ok": False, "error": "no_targets"}), 400
+    target_ids = []
+    seen = set()
+    for tid in target_ids_raw:
+        if not isinstance(tid, str):
+            continue
+        tid = tid.strip()
+        if tid and tid not in seen:
+            seen.add(tid)
+            target_ids.append(tid)
+        if len(target_ids) >= 20:  # hard cap to keep messages readable
+            break
+    if not target_ids:
+        return jsonify({"ok": False, "error": "no_targets"}), 400
+
+    # Resolve connector identity. Manual lists store owner data on the
+    # list row; API connectors need a connection_id lookup against the
+    # cached per-target JSON.
+    connector = None
+    if connector_key.startswith("manual:"):
+        try:
+            list_id = int(connector_key.split(":", 1)[1])
+        except (IndexError, ValueError):
+            return jsonify({"ok": False, "error": "bad_connector_key"}), 404
+        summary = manual_path_match_summary()
+        list_data = summary["by_list"].get(list_id)
+        if not list_data:
+            return jsonify({"ok": False, "error": "connector_not_found"}), 404
+        connector = {
+            "firstName": list_data.get("owner_first", ""),
+            "lastName": list_data.get("owner_last", ""),
+        }
+    else:
+        paths = db_targets_for_connector(connector_key)
+        if not paths:
+            return jsonify({"ok": False, "error": "connector_not_found"}), 404
+        target_conns, _err = fetch_target_connections(paths[0]["target_id"])
+        conn_obj = next(
+            (c for c in target_conns if c.get("id") == paths[0]["connection_id"]),
+            None,
+        )
+        if not conn_obj:
+            return jsonify({"ok": False, "error": "connector_data_missing"}), 404
+        connector = conn_obj
+
+    targets_all, _ = fetch_all_targets()
+    target_map = {t.get("id"): t for t in targets_all}
+    targets = [target_map[tid] for tid in target_ids if tid in target_map]
+    if not targets:
+        return jsonify({"ok": False, "error": "no_matching_targets"}), 400
+
+    msg = _build_bulk_intro_message(connector, targets)
+    return jsonify({"ok": True, **msg})
 
 
 @app.route("/new-paths", methods=["GET"])

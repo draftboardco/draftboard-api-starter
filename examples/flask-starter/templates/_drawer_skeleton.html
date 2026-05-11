@@ -258,6 +258,128 @@
       });
   };
 
+  // Bulk-intro selection in the connector drawer. Each target row has a
+  // checkbox; the sticky bar at the top of the drawer shows the count + a
+  // "Compose bulk intro" button. Clicking it POSTs the selected target IDs
+  // to /connector/{key}/bulk-intro and renders the returned draft inline,
+  // with Compose-email / Copy buttons that re-use the existing handlers.
+  // Lives in the skeleton (not the drawer partial) because scripts inserted
+  // via innerHTML don't execute.
+  function _bulkBar() {
+    return document.querySelector('#drawer-content [data-bulk-bar]');
+  }
+  function _bulkCheckboxes() {
+    return document.querySelectorAll('#drawer-content [data-bulk-target-id]');
+  }
+  function _refreshBulkBar() {
+    var bar = _bulkBar();
+    if (!bar) return;
+    var checked = [];
+    _bulkCheckboxes().forEach(function (cb) {
+      if (cb.checked) checked.push(cb.getAttribute('data-bulk-target-id'));
+    });
+    var counter = bar.querySelector('[data-bulk-count]');
+    if (counter) counter.textContent = checked.length;
+    if (checked.length === 0) {
+      bar.classList.add('hidden');
+      var draftEl = bar.querySelector('[data-bulk-draft]');
+      if (draftEl) {
+        draftEl.classList.add('hidden');
+        draftEl.innerHTML = '';
+      }
+    } else {
+      bar.classList.remove('hidden');
+    }
+    return checked;
+  }
+  window.toggleBulkTarget = function (cb) {
+    _refreshBulkBar();
+  };
+  window.clearBulkSelection = function () {
+    _bulkCheckboxes().forEach(function (cb) { cb.checked = false; });
+    _refreshBulkBar();
+  };
+  window.composeBulkIntro = function (btn) {
+    var bar = _bulkBar();
+    if (!bar) return;
+    var connectorKey = bar.getAttribute('data-connector-key') || '';
+    if (!connectorKey) {
+      if (window.showToast) showToast("Couldn't identify the connector for this bulk intro.", 5000);
+      return;
+    }
+    var checked = [];
+    _bulkCheckboxes().forEach(function (cb) {
+      if (cb.checked) checked.push(cb.getAttribute('data-bulk-target-id'));
+    });
+    if (checked.length === 0) return;
+
+    var draftEl = bar.querySelector('[data-bulk-draft]');
+    btn.disabled = true;
+    var origText = btn.textContent;
+    btn.textContent = 'Drafting…';
+    if (draftEl) {
+      draftEl.classList.remove('hidden');
+      draftEl.innerHTML = '<div class="text-xs text-slate-500">Building draft…</div>';
+    }
+
+    fetch('/connector/' + encodeURIComponent(connectorKey) + '/bulk-intro', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Sec-Fetch-Site': 'same-origin' },
+      body: JSON.stringify({ target_ids: checked }),
+      credentials: 'same-origin',
+    })
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+      .then(function (res) {
+        btn.disabled = false;
+        btn.textContent = origText;
+        if (!res.ok || !res.body || !res.body.ok) {
+          var err = (res.body && res.body.error) || 'unknown';
+          if (draftEl) {
+            draftEl.innerHTML = '<div class="text-xs text-rose-700">Couldn\'t build the draft: ' + err + '</div>';
+          }
+          return;
+        }
+        var b = res.body;
+        var wrap = document.createElement('div');
+        wrap.setAttribute('data-draft', b.plain);
+        wrap.innerHTML =
+          '<div class="p-3 rounded bg-white border border-indigo-200 text-xs text-slate-800 whitespace-pre-wrap font-sans">' +
+          (b.plain || '').replace(/[&<>]/g, function (m) {
+            return ({ '&':'&amp;', '<':'&lt;', '>':'&gt;' })[m];
+          }) +
+          '</div>' +
+          '<div class="mt-2 flex items-center gap-2 flex-wrap">' +
+          '  <a data-no-drawer href="' + (b.gmail_url || '#') + '" target="_blank" rel="noopener"' +
+          '     onclick="composeEmail(event, this)"' +
+          '     data-subject="' + (b.subject || '').replace(/"/g, '&quot;') + '"' +
+          '     data-plain-body="' + (b.plain || '').replace(/"/g, '&quot;') + '"' +
+          '     data-html-body="' + (b.html || '').replace(/"/g, '&quot;') + '"' +
+          '     data-fallback-body="' + (b.plain_fallback || '').replace(/"/g, '&quot;') + '"' +
+          '     class="text-xs px-3 py-1.5 rounded bg-indigo-600 hover:bg-indigo-700 text-white inline-flex items-center gap-1.5">' +
+          '    Compose email' +
+          '  </a>' +
+          '  <button data-no-drawer type="button" onclick="copyText(this)"' +
+          '          class="text-xs px-3 py-1.5 rounded border border-slate-300 bg-white hover:bg-slate-50">' +
+          '    Copy' +
+          '  </button>' +
+          '  <span class="text-[11px] text-slate-500 ml-1">' + (b.count || checked.length) + ' target' +
+            ((b.count || checked.length) === 1 ? '' : 's') + '</span>' +
+          '</div>';
+        if (draftEl) {
+          draftEl.innerHTML = '';
+          draftEl.appendChild(wrap);
+        }
+      })
+      .catch(function (e) {
+        btn.disabled = false;
+        btn.textContent = origText;
+        if (draftEl) {
+          draftEl.innerHTML = '<div class="text-xs text-rose-700">Network error: ' +
+            (e && e.message ? e.message : 'unknown') + '</div>';
+        }
+      });
+  };
+
   // Account-drawer left-column target click → swap the right-column connectors
   // panel without losing the targets list. Lives here (not in the drawer
   // template) because <script> tags inserted via innerHTML don't execute.
