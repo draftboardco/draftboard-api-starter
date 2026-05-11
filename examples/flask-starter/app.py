@@ -4353,14 +4353,26 @@ def _detect_csv_columns(header_row):
     output — caller should handle missing fields gracefully.
 
     Designed to handle: LinkedIn export, Apollo export, any tool with
-    reasonably-named columns, hand-rolled CSVs."""
+    reasonably-named columns, hand-rolled CSVs.
+
+    Defensive: only considers a cell as a possible header if it's short
+    (≤50 chars) — real CSV headers are short labels like "URL" or
+    "Email Address", never multi-sentence prose. This avoids matching
+    "url" or "email" as a substring inside a giant disclaimer paragraph
+    (LinkedIn's Connections.csv preamble does exactly this)."""
     if not header_row:
         return {}
     header_lower = [(h or "").strip().lower() for h in header_row]
+    # Treat any "cell" longer than 50 chars as prose, not a header label.
+    # This filters out LinkedIn's preamble disclaimer row which lands as
+    # a single ~500-char cell.
+    header_lower = [h if len(h) <= 50 else "" for h in header_lower]
     out = {}
     for field, aliases in MANUAL_PATH_COLUMN_ALIASES.items():
         for alias in aliases:
             for i, h in enumerate(header_lower):
+                if not h:
+                    continue
                 if h == alias or alias in h:
                     if field not in out:
                         out[field] = i
@@ -4404,23 +4416,37 @@ def parse_manual_path_csv(file_obj) -> tuple[list[dict], dict, int]:
                 return [], {}, 0
     else:
         text = raw
-    # LinkedIn's exports occasionally have notes/disclaimer rows above the
-    # actual header. Skip leading lines that don't have at least one comma.
-    lines = text.splitlines()
-    while lines and "," not in lines[0]:
-        lines.pop(0)
-    if not lines:
-        return [], {}, 0
-    cleaned = "\n".join(lines)
-    reader = csv.reader(io.StringIO(cleaned))
-    try:
-        header = next(reader)
-    except StopIteration:
-        return [], {}, 0
-    cols = _detect_csv_columns(header)
-    if "linkedin_url" not in cols:
-        # Without a URL column we can't match anything against targets.
-        # Caller surfaces this to the user.
+    # LinkedIn's standard Connections.csv export starts with:
+    #   line 1: "Notes:"
+    #   line 2: a quoted multi-line disclaimer (which itself contains commas
+    #           inside the quoted string — so the prior line-strip-on-comma
+    #           heuristic mistook the disclaimer for the header)
+    #   line 3: blank
+    #   line 4: real header (First Name,Last Name,URL,Email,Company,Position,Connected On)
+    # Use a proper CSV reader from the start and ITERATE rows looking for
+    # the first row that _detect_csv_columns can recognize as a header. Skip
+    # any earlier rows (preamble, blank, disclaimer).
+    reader = csv.reader(io.StringIO(text))
+    cols = {}
+    header = None
+    rows_consumed = 0
+    for candidate in reader:
+        rows_consumed += 1
+        if rows_consumed > 30:
+            # Defensive — don't scan the entire file looking for a header
+            # if every row is junk. Bail out and report no_url_column.
+            break
+        if not candidate or all(not (c or "").strip() for c in candidate):
+            continue
+        # A real header must have at least one cell that the alias map
+        # recognizes AND a URL column specifically (since URL is required).
+        candidate_cols = _detect_csv_columns(candidate)
+        if "linkedin_url" in candidate_cols:
+            header = candidate
+            cols = candidate_cols
+            break
+    if header is None or "linkedin_url" not in cols:
+        # Caller surfaces this to the user via no_url_column.
         return [], cols, 0
 
     def _g(row, field):
