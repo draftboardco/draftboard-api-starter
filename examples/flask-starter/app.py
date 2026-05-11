@@ -2089,9 +2089,11 @@ def _build_messages(target, connection):
         user_ctx = _user_context()
         user_company = user_ctx.get("user_company") or ""
         user_company_desc = user_ctx.get("user_company_description") or ""
-    except Exception:
-        # Defensive: if user_context can't be loaded (db init race, missing
-        # app_state key), fall back to the generic template.
+    except (sqlite3.Error, RuntimeError):
+        # DB-init race, missing app_state row, or "outside Flask context"
+        # (e.g. _build_messages called from a test). Fall back to the
+        # generic template rather than crash. Coding bugs in _user_context
+        # itself bubble up unmodified so they stay visible.
         user_company = ""
         user_company_desc = ""
 
@@ -2304,7 +2306,8 @@ def _build_bulk_intro_message(connector, targets):
         user_ctx = _user_context()
         user_company = (user_ctx.get("user_company") or "").strip()
         user_company_desc = (user_ctx.get("user_company_description") or "").strip()
-    except Exception:
+    except (sqlite3.Error, RuntimeError):
+        # Same narrow-catch logic as _build_messages.
         user_company = ""
         user_company_desc = ""
 
@@ -2327,27 +2330,44 @@ def _build_bulk_intro_message(connector, targets):
             line += f": {r['linkedin']}"
         plain_lines.append(line)
 
-    plain_parts = [
-        (
+    n = len(resolved)
+    if n == 1:
+        opener = (
+            f"Hey {connector_first} - quick question: there's someone in your "
+            f"network I'd love to chat with. Open to pinging them for a quick "
+            f"warm intro?"
+        )
+    else:
+        opener = (
             f"Hey {connector_first} - quick question: there are a few folks in "
             f"your network I'd love to chat with. Any of them open for a quick "
             f"warm intro?"
-        ),
-        "",
-        "\n".join(plain_lines),
-        "",
-    ]
+        )
+    plain_parts = [opener, "", "\n".join(plain_lines), ""]
     if user_company:
-        plain_parts.append(
-            f"Think what we're doing at {user_company} could really be useful for them. "
-            f"Happy to send forwardable emails for whichever ones feel like a fit - no "
-            f"worries on any that feel awkward."
-        )
+        if n == 1:
+            plain_parts.append(
+                f"Think what we're doing at {user_company} could really be useful for them. "
+                f"Happy to send a forwardable email if it feels like a fit - no worries "
+                f"if it doesn't."
+            )
+        else:
+            plain_parts.append(
+                f"Think what we're doing at {user_company} could really be useful for them. "
+                f"Happy to send forwardable emails for whichever ones feel like a fit - no "
+                f"worries on any that feel awkward."
+            )
     else:
-        plain_parts.append(
-            "Happy to send forwardable emails for whichever ones feel like a fit - no "
-            "worries on any that feel awkward."
-        )
+        if n == 1:
+            plain_parts.append(
+                "Happy to send a forwardable email if it feels like a fit - no worries "
+                "if it doesn't."
+            )
+        else:
+            plain_parts.append(
+                "Happy to send forwardable emails for whichever ones feel like a fit - no "
+                "worries on any that feel awkward."
+            )
     if user_company and user_company_desc:
         plain_parts.append("")
         plain_parts.append(f"({user_company_desc})")
@@ -2370,26 +2390,40 @@ def _build_bulk_intro_message(connector, targets):
             name_html = html.escape(r["full"])
         html_bullets.append(f"<li>{name_html}{descriptor_html}</li>")
 
-    html_intro = html.escape(
-        f"Hey {connector_first} - quick question: there are a few folks in your network "
-        f"I'd love to chat with. Any of them open for a quick warm intro?"
-    )
+    html_intro = html.escape(opener)
     outro_pieces = []
     if user_company:
-        outro_pieces.append(
-            html.escape(
-                f"Think what we're doing at {user_company} could really be useful for them. "
-                f"Happy to send forwardable emails for whichever ones feel like a fit - no "
-                f"worries on any that feel awkward."
+        if n == 1:
+            outro_pieces.append(
+                html.escape(
+                    f"Think what we're doing at {user_company} could really be useful for them. "
+                    f"Happy to send a forwardable email if it feels like a fit - no worries "
+                    f"if it doesn't."
+                )
             )
-        )
+        else:
+            outro_pieces.append(
+                html.escape(
+                    f"Think what we're doing at {user_company} could really be useful for them. "
+                    f"Happy to send forwardable emails for whichever ones feel like a fit - no "
+                    f"worries on any that feel awkward."
+                )
+            )
     else:
-        outro_pieces.append(
-            html.escape(
-                "Happy to send forwardable emails for whichever ones feel like a fit - no "
-                "worries on any that feel awkward."
+        if n == 1:
+            outro_pieces.append(
+                html.escape(
+                    "Happy to send a forwardable email if it feels like a fit - no worries "
+                    "if it doesn't."
+                )
             )
-        )
+        else:
+            outro_pieces.append(
+                html.escape(
+                    "Happy to send forwardable emails for whichever ones feel like a fit - no "
+                    "worries on any that feel awkward."
+                )
+            )
     if user_company and user_company_desc:
         outro_pieces.append(f"({html.escape(user_company_desc)})")
 
@@ -2399,7 +2433,6 @@ def _build_bulk_intro_message(connector, targets):
         f"<p>{'<br><br>'.join(outro_pieces)}</p>"
     )
 
-    n = len(resolved)
     if n == 1:
         subject = f"Intro to {resolved[0]['full']}?"
     else:
@@ -2693,7 +2726,10 @@ def _matches_query(t, q_lower):
         t.get("firstName") or "",
         t.get("lastName") or "",
         (t.get("position") or {}).get("title") or "",
-        (t.get("position") or {}).get("companyName") or "",
+        # Search the manual-path-derived company too, so paste-mode targets
+        # whose company comes only from a CSV row still match search by
+        # company name.
+        _target_company_with_fallback(t),
         " ".join(t.get("tags") or []),
     ]).lower()
     return q_lower in haystack
@@ -2706,7 +2742,9 @@ def _enrich_target(t):
         "name": f"{t.get('firstName') or ''} {t.get('lastName') or ''}".strip() or "(no name)",
         "initials": _initials(t.get("firstName"), t.get("lastName")),
         "title": position.get("title") or "",
-        "company": position.get("companyName") or "",
+        # Display the manual-path-derived company when position is empty —
+        # matches the bucket key used by /accounts and the connector drawer.
+        "company": _target_company_with_fallback(t),
         "linkedinUrl": t.get("linkedinUrl") or "",
         "score": t.get("score") or 0,
         "connections_number": t.get("connectionsNumber") or 0,
@@ -3263,7 +3301,7 @@ def connector_drawer(connector_key):
                 "title": pos.get("title") or "",
                 "company": pos.get("companyName") or "",
             }
-        company = ((target.get("position") or {}).get("companyName") or "").strip() or "(unknown company)"
+        company = _target_company_with_fallback(target) or "(unknown company)"
         if company not in grouped:
             grouped[company] = []
         grouped[company].append({
@@ -3345,7 +3383,7 @@ def _connector_drawer_manual(connector_key: str):
         if manual_conn is None:
             continue
         paths_count += 1
-        company = ((target.get("position") or {}).get("companyName") or "").strip() or "(unknown company)"
+        company = _target_company_with_fallback(target) or "(unknown company)"
         grouped.setdefault(company, []).append({
             "target": _enrich_target(target),
             "target_id": tid,
@@ -4997,7 +5035,7 @@ def _manual_path_metadata_map() -> dict:
     if cached is not None:
         return cached
     out: dict = {}
-    with _db_connect() as conn:
+    with _db_lock, _db_connect() as conn:
         cur = conn.execute(
             "SELECT linkedin_url_normalized, first_name, last_name, "
             "       company, position, email "
@@ -6203,11 +6241,28 @@ _USER_CONTEXT_KEYS = [
 def _user_context() -> dict:
     """Read the user's profile from app_state. Returns dict with all
     _USER_CONTEXT_KEYS as stripped strings (empty if unset), plus
-    `user_full_name` for convenience."""
+    `user_full_name` for convenience.
+
+    Per-request cached on flask.g — `_build_messages` calls this for every
+    rendered connector card, which on a page with 100 targets × ~5
+    connectors each would otherwise issue ~3,000 locked DB roundtrips per
+    page load. Same pattern as `_manual_path_metadata_map`."""
+    try:
+        from flask import g
+        cached = getattr(g, "_user_context_cache", None)
+        if cached is not None:
+            return cached
+    except RuntimeError:
+        g = None  # outside Flask context — skip cache, fall through to read
     out = {}
     for key in _USER_CONTEXT_KEYS:
         out[key] = (db_app_state_get(key) or "").strip()
     out["user_full_name"] = f"{out['user_first_name']} {out['user_last_name']}".strip()
+    if g is not None:
+        try:
+            g._user_context_cache = out
+        except RuntimeError:
+            pass
     return out
 
 
