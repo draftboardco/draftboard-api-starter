@@ -2146,7 +2146,12 @@ def _build_messages(target, connection):
 
     # Build the HTML version. Escape the surrounding text first so the
     # connector's name etc. is safe, then substitute {TGT} with an <a> tag.
-    if target_linkedin:
+    # URL-scheme guard: only emit a live link when the URL is plain http(s).
+    # Manual-paths CSV upload accepts only li_person_re-matching URLs today,
+    # but a future importer or restored data.db could land a `javascript:` or
+    # `data:` URL in targets_cache. The Slack builder already guards this way
+    # at _build_slack_assign_payload — match the pattern here too.
+    if target_linkedin and target_linkedin.startswith(("http://", "https://")):
         link = (
             f'<a href="{html.escape(target_linkedin, quote=True)}">'
             f'{html.escape(target_first)}</a>'
@@ -2422,10 +2427,17 @@ _LI_RE = re.compile(r"linkedin\.com/in/[^\s,/?#]+", re.IGNORECASE)
 
 
 def normalize_linkedin_urls(raw: str):
-    """Accept comma- or newline-separated input. Normalize each entry to https://www.linkedin.com/in/<slug>."""
+    """Accept comma-, newline-, or tab-separated input. Normalize each entry to
+    https://www.linkedin.com/in/<slug>.
+
+    Tabs handled so that Excel / Google Sheets paste (which uses TAB as the
+    cell separator) still produces one URL per cell when a row contains
+    multiple LinkedIn URLs across columns. The client-side paste handler in
+    import.html does this conversion in the browser; this is defense in depth
+    for direct curl POSTs and older browsers."""
     if not raw:
         return []
-    parts = [p.strip() for p in re.split(r"[\n,]+", raw) if p.strip()]
+    parts = [p.strip() for p in re.split(r"[\n,\t]+", raw) if p.strip()]
     out = []
     seen = set()
     for p in parts:
@@ -2583,11 +2595,16 @@ def accounts_view():
         owner_target_ids = db_target_ids_for_owner(resolved_owner_id)
         targets = [t for t in targets if t.get("id") in owner_target_ids]
 
-    # Group by company name (case-insensitive key, preserve display case)
+    # Group by company name (case-insensitive key, preserve display case).
+    # Use the manual-path metadata fallback so paste-mode-added targets with
+    # an empty `position.companyName` still bucket under their real company
+    # when a manual_path_connections row supplies one. Without this, the
+    # listing groups them as "(unknown company)" but the account drawer's
+    # lookup (which also uses the fallback) can't find them — 404.
     accounts = {}
     for t in targets:
         position = t.get("position") or {}
-        company = (position.get("companyName") or "").strip() or "(unknown company)"
+        company = _target_company_with_fallback(t) or "(unknown company)"
         key = company.lower()
         if key not in accounts:
             accounts[key] = {
@@ -2821,11 +2838,13 @@ def account_drawer(account_key):
     targets_all, _ = fetch_all_targets()
     key_lower = account_key.lower()
 
+    # Match company using the same manual-path-metadata fallback the
+    # accounts listing uses (see `_target_company_with_fallback`). Without
+    # this, paste-mode targets that the listing groups under their
+    # manual-path-derived company will 404 here.
     matching = []
     for t in targets_all:
-        company = ((t.get("position") or {}).get("companyName") or "").strip()
-        if not company:
-            company = "(unknown company)"
+        company = _target_company_with_fallback(t) or "(unknown company)"
         if company.lower() == key_lower:
             matching.append(t)
 
@@ -2839,7 +2858,7 @@ def account_drawer(account_key):
     enriched_targets = [_enrich_target(t) for t in matching]
     selected_id = matching[0].get("id")
 
-    display_name = ((matching[0].get("position") or {}).get("companyName") or "").strip() or "(unknown company)"
+    display_name = _target_company_with_fallback(matching[0]) or "(unknown company)"
 
     return render_template(
         "_drawer_account.html",
@@ -4666,6 +4685,69 @@ def manual_path_match_summary() -> dict:
     }
     g._manual_path_match_summary = out
     return out
+
+
+def _manual_path_metadata_map() -> dict:
+    """Per-request map of {normalized_linkedin_url → {first_name, last_name,
+    company, position, email}} aggregated across ALL manual_path_connections
+    rows. Used as a metadata fallback for targets whose own
+    `position.companyName` is empty — relevant when the target was added via
+    a paste-mode URL and someone else's manual list happens to include the
+    same LinkedIn URL with company/title attached.
+
+    Cached on flask.g so a single request that walks many targets (accounts
+    listing, account drawer) doesn't issue one SELECT per target."""
+    from flask import g
+    g_key = "_manual_path_metadata_map_cache"
+    cached = getattr(g, g_key, None)
+    if cached is not None:
+        return cached
+    out: dict = {}
+    with _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT linkedin_url_normalized, first_name, last_name, "
+            "       company, position, email "
+            "FROM manual_path_connections "
+            "WHERE linkedin_url_normalized != ''"
+        )
+        for norm, fn, ln, comp, pos, em in cur.fetchall():
+            if not norm or norm in out:
+                continue
+            out[norm] = {
+                "first_name": fn or "",
+                "last_name": ln or "",
+                "company": comp or "",
+                "position": pos or "",
+                "email": em or "",
+            }
+    setattr(g, g_key, out)
+    return out
+
+
+def _target_company_with_fallback(t: dict) -> str:
+    """Target's display company, with a manual-path-metadata fallback.
+
+    When the target's `position.companyName` is empty (typical for
+    paste-mode-added targets), look up the matching manual_path_connections
+    row by normalized LinkedIn URL and use its `company` instead. Preserves
+    the existing "(unknown company)" bucket only when neither source has a
+    company.
+
+    Use this anywhere the accounts grouping or the account drawer keys off
+    company name — otherwise the listing groups a paste-mode target into
+    "(unknown company)" while the drawer fails to find it because the
+    drawer's lookup uses the manual-path-derived display company."""
+    pos = (t.get("position") or {})
+    company = (pos.get("companyName") or "").strip()
+    if company:
+        return company
+    norm = _normalize_linkedin(t.get("linkedinUrl") or "")
+    if not norm:
+        return ""
+    meta = _manual_path_metadata_map().get(norm)
+    if meta:
+        return (meta.get("company") or "").strip()
+    return ""
 
 
 def manual_paths_for_target(target: dict) -> list[dict]:

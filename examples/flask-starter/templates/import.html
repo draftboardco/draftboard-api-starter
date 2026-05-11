@@ -44,6 +44,43 @@
         >{{ prev_urls or '' }}</textarea>
       </div>
 
+      <script>
+        // Paste handler: when a user pastes from Excel / Google Sheets / any
+        // multi-column source, the clipboard text comes in with TABs separating
+        // cells and \r\n or \r line endings. The browser pastes it raw, which
+        // leaves URLs hidden behind other columns and produces visible blank
+        // rows from CR-only line endings. Intercept paste, normalize line
+        // endings, split each line on tabs, trim each cell, drop empties — so
+        // every potential URL ends up on its own clean line. The server-side
+        // URL validator silently skips non-URL cells (emails, names, etc.).
+        (function () {
+          var ta = document.getElementById('linkedin_urls');
+          if (!ta) return;
+          ta.addEventListener('paste', function (e) {
+            var clip = (e.clipboardData || window.clipboardData);
+            if (!clip) return;
+            var text = clip.getData('text/plain') || '';
+            if (!text) return;
+            e.preventDefault();
+            text = text.replace(/\r\n?/g, '\n').replace(/\r/g, '\n');
+            var cleaned = [];
+            text.split('\n').forEach(function (line) {
+              line.split('\t').forEach(function (cell) {
+                cell = cell.trim();
+                if (cell) cleaned.push(cell);
+              });
+            });
+            var joined = cleaned.join('\n');
+            var start = ta.selectionStart;
+            var end = ta.selectionEnd;
+            ta.value = ta.value.substring(0, start) + joined + ta.value.substring(end);
+            var newPos = start + joined.length;
+            ta.selectionStart = ta.selectionEnd = newPos;
+            ta.dispatchEvent(new Event('input', { bubbles: true }));
+          });
+        })();
+      </script>
+
       <!-- Capacity warning -->
       <div class="rounded-md border border-blue-200 bg-blue-50 px-4 py-3 text-xs text-blue-900">
         <strong>Capacity:</strong> Core plans cap at ~<strong>300</strong> active targets/month.
