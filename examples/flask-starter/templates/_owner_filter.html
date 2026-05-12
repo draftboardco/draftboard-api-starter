@@ -12,6 +12,7 @@
     {% if intro_status_filter %}<input type="hidden" name="intro_status" value="{{ intro_status_filter }}">{% endif %}
     {% if tag_filter %}<input type="hidden" name="tag" value="{{ tag_filter }}">{% endif %}
     {% if manual_only is defined and manual_only %}<input type="hidden" name="manual_only" value="1">{% endif %}
+    {% if sort_by and sort_by != 'score' %}<input type="hidden" name="sort" value="{{ sort_by }}">{% endif %}
     <label class="inline-flex items-center gap-2 text-xs">
       <span class="text-slate-500">Owner:</span>
       <select name="owner" onchange="this.form.submit()"

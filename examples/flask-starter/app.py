@@ -3159,8 +3159,21 @@ def targets_view():
     if q_lower:
         targets = [t for t in targets if _matches_query(t, q_lower)]
 
-    # Sort by score desc
-    targets.sort(key=lambda t: (t.get("score") or 0), reverse=True)
+    # Sort. `?sort=score` (default) or `?sort=paths` — desc on both.
+    # Secondary key keeps ordering stable when the primary ties.
+    sort_by = (request.args.get("sort") or "score").strip().lower()
+    if sort_by not in ("score", "paths"):
+        sort_by = "score"
+    if sort_by == "paths":
+        targets.sort(
+            key=lambda t: (t.get("connectionsNumber") or 0, t.get("score") or 0),
+            reverse=True,
+        )
+    else:
+        targets.sort(
+            key=lambda t: (t.get("score") or 0, t.get("connectionsNumber") or 0),
+            reverse=True,
+        )
 
     # Pagination — 100 per page
     total = len(targets)
@@ -3205,6 +3218,7 @@ def targets_view():
         intro_status_meta=INTRO_STATUS_META,
         all_tags=db_all_tags_with_counts(),
         tag_filter=tag_filter,
+        sort_by=sort_by,
         me=me_for_template,
     )
 
