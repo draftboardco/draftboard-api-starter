@@ -27,6 +27,7 @@
       <div class="flex items-center gap-3 flex-wrap">
         {% include "_owner_filter.html" %}
         {% include "_tag_filter.html" %}
+        {% include "_date_filter.html" %}
         {% include "_status_filter.html" %}
         <form method="GET" action="/" class="inline-block">
           {% if query %}<input type="hidden" name="q" value="{{ query }}">{% endif %}

@@ -1121,11 +1121,30 @@ def db_targets_for_connector(connector_key):
 
 
 def db_save_targets_cache(targets):
-    """Persist the /targets list to SQLite. Idempotent — INSERT OR REPLACE per id."""
+    """Persist the /targets list to SQLite. Idempotent — INSERT OR REPLACE per id.
+    First-time targets also get an auto-applied YYYY-MM-DD tag (tag_type=
+    'upload_date') so the Upload date filter has something to slice on.
+    Re-saving an existing target preserves its original date — we only
+    tag IDs that weren't already in targets_cache."""
     if not targets:
         return
+    import datetime as _dt
     now = int(time.time())
+    today_str = _dt.datetime.now().strftime("%Y-%m-%d")
     with _db_lock, _db_connect() as conn:
+        # Identify which incoming IDs are net-new so we can date-tag them
+        # (and only them). One round-trip — cheap.
+        incoming_ids = [t.get("id") for t in targets if t.get("id")]
+        existing: set = set()
+        if incoming_ids:
+            placeholders = ",".join("?" for _ in incoming_ids)
+            cur = conn.execute(
+                f"SELECT target_id FROM targets_cache WHERE target_id IN ({placeholders})",
+                incoming_ids,
+            )
+            existing = {row[0] for row in cur.fetchall()}
+        new_ids = [tid for tid in incoming_ids if tid not in existing]
+
         for t in targets:
             tid = t.get("id")
             if not tid:
@@ -1133,6 +1152,12 @@ def db_save_targets_cache(targets):
             conn.execute(
                 "INSERT OR REPLACE INTO targets_cache (target_id, data_json, fetched_at) VALUES (?, ?, ?)",
                 (tid, json.dumps(t), now),
+            )
+        if new_ids:
+            conn.executemany(
+                "INSERT OR IGNORE INTO target_tags (target_id, tag, created_at, tag_type) "
+                "VALUES (?, ?, ?, 'upload_date')",
+                [(tid, today_str, now) for tid in new_ids],
             )
         conn.commit()
 
@@ -1749,6 +1774,30 @@ def db_target_ids_with_tag(tag: str) -> set:
         return {row[0] for row in cur.fetchall()}
 
 
+def db_all_upload_dates_with_counts() -> list:
+    """Sorted [(YYYY-MM-DD, count)] newest first. Drives the "Upload date"
+    filter dropdown — when a target landed in the local cache, derived
+    from db_save_targets_cache or the boot-time backfill."""
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT tag, COUNT(DISTINCT target_id) FROM target_tags "
+            "WHERE tag_type = 'upload_date' GROUP BY tag ORDER BY tag DESC"
+        )
+        return [(row[0], row[1]) for row in cur.fetchall()]
+
+
+def db_target_ids_with_upload_date(date_str: str) -> set:
+    date_str = (date_str or "").strip()[:10]
+    if not date_str:
+        return set()
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT target_id FROM target_tags WHERE tag_type = 'upload_date' AND tag = ?",
+            (date_str,),
+        )
+        return {row[0] for row in cur.fetchall()}
+
+
 # Initialize DB on import + backfill the target_owners index from existing rows.
 # (start_scheduled_sync() is called at the bottom of this module, after its
 # definition — Python doesn't hoist.)
@@ -1780,6 +1829,44 @@ def _migrate_slack_channel_name_strip_hash():
 
 
 _migrate_slack_channel_name_strip_hash()
+
+
+def _backfill_target_upload_dates():
+    """One-shot migration: for every cached target without an upload_date
+    tag, derive a date from targets_cache.fetched_at and insert one.
+    Gated on app_state['upload_date_backfill_done'] so subsequent boots
+    skip the work."""
+    if db_app_state_get("upload_date_backfill_done"):
+        return
+    import datetime as _dt
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT target_id FROM target_tags WHERE tag_type = 'upload_date'"
+        )
+        already_tagged = {row[0] for row in cur.fetchall()}
+        cur = conn.execute("SELECT target_id, fetched_at FROM targets_cache")
+        rows = cur.fetchall()
+        now_ts = int(time.time())
+        to_insert = []
+        for tid, fetched_at in rows:
+            if tid in already_tagged:
+                continue
+            try:
+                date_str = _dt.datetime.fromtimestamp(int(fetched_at)).strftime("%Y-%m-%d")
+            except (ValueError, OSError):
+                date_str = _dt.datetime.now().strftime("%Y-%m-%d")
+            to_insert.append((tid, date_str, now_ts, "upload_date"))
+        if to_insert:
+            conn.executemany(
+                "INSERT OR IGNORE INTO target_tags (target_id, tag, created_at, tag_type) "
+                "VALUES (?, ?, ?, ?)",
+                to_insert,
+            )
+            conn.commit()
+    db_app_state_set("upload_date_backfill_done", "1")
+
+
+_backfill_target_upload_dates()
 
 
 def _auth_headers():
@@ -3134,6 +3221,12 @@ def targets_view():
         tagged_ids = db_target_ids_with_tag(tag_filter)
         targets = [t for t in targets if t.get("id") in tagged_ids]
 
+    # Upload-date filter — auto-applied YYYY-MM-DD tag per target.
+    upload_date_filter = (request.args.get("upload_date") or "").strip()[:10]
+    if upload_date_filter:
+        dated_ids = db_target_ids_with_upload_date(upload_date_filter)
+        targets = [t for t in targets if t.get("id") in dated_ids]
+
     # Intro-status filter. Special pseudo-statuses:
     #   "any"   → any tracked status (requested, in_progress, made, rejected)
     #   "open"  → still in flight (requested + in_progress)
@@ -3218,6 +3311,8 @@ def targets_view():
         intro_status_meta=INTRO_STATUS_META,
         all_tags=db_all_tags_with_counts(),
         tag_filter=tag_filter,
+        all_upload_dates=db_all_upload_dates_with_counts(),
+        upload_date_filter=upload_date_filter,
         sort_by=sort_by,
         me=me_for_template,
     )
@@ -3241,6 +3336,12 @@ def accounts_view():
     if tag_filter:
         tagged_ids = db_target_ids_with_tag(tag_filter)
         targets = [t for t in targets if t.get("id") in tagged_ids]
+
+    # Upload-date filter — auto-applied per target on first-seen.
+    upload_date_filter = (request.args.get("upload_date") or "").strip()[:10]
+    if upload_date_filter:
+        dated_ids = db_target_ids_with_upload_date(upload_date_filter)
+        targets = [t for t in targets if t.get("id") in dated_ids]
 
     # Intro-status filter — same semantics as targets_view (pseudo + real
     # values). Filters AT THE TARGET LEVEL pre-grouping so accounts with
@@ -3348,6 +3449,8 @@ def accounts_view():
         intro_status_meta=INTRO_STATUS_META,
         all_tags=db_all_tags_with_counts(),
         tag_filter=tag_filter,
+        all_upload_dates=db_all_upload_dates_with_counts(),
+        upload_date_filter=upload_date_filter,
         me=me_for_template,
     )
 
