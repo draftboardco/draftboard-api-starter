@@ -372,6 +372,9 @@ def _inject_globals():
         # links to /setup instead of POSTing /sync/start (which would
         # silently no-op).
         "global_api_key_set": bool(API_KEY),
+        # Status dropdown menu shares one meta dict across every connector
+        # card render — no need for every route to pass it explicitly.
+        "intro_status_meta_all": INTRO_STATUS_META,
     }
 
 # Per-field input caps for resolve endpoints. Apollo / CSE / OpenAI all reject
@@ -481,6 +484,39 @@ def init_db():
                 PRIMARY KEY (target_id, connection_id)
             )
         """)
+        # Status tracking columns (added later). Existing rows get
+        # 'requested' as the default so the legacy "Mark as requested"
+        # toggle still produces a usable status without a backfill query.
+        try:
+            conn.execute("ALTER TABLE intro_requests ADD COLUMN status TEXT NOT NULL DEFAULT 'requested'")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE intro_requests ADD COLUMN last_updated_at INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_intro_requests_status ON intro_requests(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_intro_requests_target ON intro_requests(target_id)")
+
+        # Local editable per-target tags. Layered ON TOP of the Draftboard
+        # API's read-only tag taxonomy — users get to add their own labels
+        # without touching the API-driven tag list. tag_type splits user-
+        # typed tags ('user') from auto-applied date tags ('upload_date')
+        # so each surfaces in its own filter dropdown.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS target_tags (
+                target_id TEXT NOT NULL,
+                tag TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (target_id, tag)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_target_tags_tag ON target_tags(tag)")
+        try:
+            conn.execute("ALTER TABLE target_tags ADD COLUMN tag_type TEXT NOT NULL DEFAULT 'user'")
+        except sqlite3.OperationalError:
+            pass
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_target_tags_type ON target_tags(tag_type)")
         # Denormalized index: which team-member owners can intro to which target.
         # Populated alongside `connections` in db_put_connections. Lets us filter
         # the Targets/Accounts views by owner without scanning every JSON blob.
@@ -1085,11 +1121,30 @@ def db_targets_for_connector(connector_key):
 
 
 def db_save_targets_cache(targets):
-    """Persist the /targets list to SQLite. Idempotent — INSERT OR REPLACE per id."""
+    """Persist the /targets list to SQLite. Idempotent — INSERT OR REPLACE per id.
+    First-time targets also get an auto-applied YYYY-MM-DD tag (tag_type=
+    'upload_date') so the Upload date filter has something to slice on.
+    Re-saving an existing target preserves its original date — we only
+    tag IDs that weren't already in targets_cache."""
     if not targets:
         return
+    import datetime as _dt
     now = int(time.time())
+    today_str = _dt.datetime.now().strftime("%Y-%m-%d")
     with _db_lock, _db_connect() as conn:
+        # Identify which incoming IDs are net-new so we can date-tag them
+        # (and only them). One round-trip — cheap.
+        incoming_ids = [t.get("id") for t in targets if t.get("id")]
+        existing: set = set()
+        if incoming_ids:
+            placeholders = ",".join("?" for _ in incoming_ids)
+            cur = conn.execute(
+                f"SELECT target_id FROM targets_cache WHERE target_id IN ({placeholders})",
+                incoming_ids,
+            )
+            existing = {row[0] for row in cur.fetchall()}
+        new_ids = [tid for tid in incoming_ids if tid not in existing]
+
         for t in targets:
             tid = t.get("id")
             if not tid:
@@ -1097,6 +1152,12 @@ def db_save_targets_cache(targets):
             conn.execute(
                 "INSERT OR REPLACE INTO targets_cache (target_id, data_json, fetched_at) VALUES (?, ?, ?)",
                 (tid, json.dumps(t), now),
+            )
+        if new_ids:
+            conn.executemany(
+                "INSERT OR IGNORE INTO target_tags (target_id, tag, created_at, tag_type) "
+                "VALUES (?, ?, ?, 'upload_date')",
+                [(tid, today_str, now) for tid in new_ids],
             )
         conn.commit()
 
@@ -1425,8 +1486,51 @@ def db_intro_request_get(target_id, connection_id):
         return cur.fetchone() is not None
 
 
+# Six-state intro funnel. Kept compact so the UI dropdown stays usable.
+# Order matters: rollup uses the FIRST hit on this priority list for a
+# target's badge (so "intro_made" beats "requested" beats nothing).
+INTRO_STATUS_ORDER = [
+    "intro_made",          # success — intro happened
+    "in_progress",         # connector replied / intro in flight
+    "requested",           # user asked the connector, awaiting reply
+    "no_reply",            # connector ignored / gave up
+    "connector_rejected",  # connector said no
+    "prospect_rejected",   # target said no via connector
+]
+INTRO_STATUS_VALID = set(INTRO_STATUS_ORDER)
+
+# Display metadata for badges + dropdown labels. Kept in Python (not the
+# template) so the connector card + target row + filter UI all stay in
+# sync without three copies of the same dict.
+INTRO_STATUS_META = {
+    "requested":          {"label": "Requested",        "icon": "📨",
+                            "badge_class": "bg-indigo-50 text-indigo-800 border-indigo-200",
+                            "active": True},
+    "in_progress":        {"label": "In progress",      "icon": "🔄",
+                            "badge_class": "bg-blue-50 text-blue-800 border-blue-200",
+                            "active": True},
+    "intro_made":         {"label": "Intro made",       "icon": "✓",
+                            "badge_class": "bg-emerald-50 text-emerald-800 border-emerald-200",
+                            "active": False},
+    "no_reply":           {"label": "No reply",         "icon": "🤐",
+                            "badge_class": "bg-slate-50 text-slate-700 border-slate-200",
+                            "active": False},
+    "connector_rejected": {"label": "Connector passed", "icon": "✕",
+                            "badge_class": "bg-rose-50 text-rose-800 border-rose-200",
+                            "active": False},
+    "prospect_rejected":  {"label": "Prospect passed",  "icon": "✕",
+                            "badge_class": "bg-rose-50 text-rose-800 border-rose-200",
+                            "active": False},
+}
+
+
 def db_intro_request_toggle(target_id, connection_id):
-    """Toggle and return the new state (True = requested, False = cleared)."""
+    """Toggle existence of an intro request. Adds with status='requested'
+    on first call, clears the row entirely on second call. Returns the
+    new state (True = requested, False = cleared). Used by the legacy
+    'Mark as requested' button — status mutation goes through
+    db_intro_request_set_status instead."""
+    now = int(time.time())
     with _db_lock, _db_connect() as conn:
         cur = conn.execute(
             "SELECT 1 FROM intro_requests WHERE target_id = ? AND connection_id = ?",
@@ -1440,18 +1544,256 @@ def db_intro_request_toggle(target_id, connection_id):
             conn.commit()
             return False
         conn.execute(
-            "INSERT INTO intro_requests (target_id, connection_id, requested_at) VALUES (?, ?, ?)",
-            (target_id, connection_id, int(time.time())),
+            "INSERT INTO intro_requests (target_id, connection_id, requested_at, status, last_updated_at) "
+            "VALUES (?, ?, ?, 'requested', ?)",
+            (target_id, connection_id, now, now),
         )
         conn.commit()
         return True
 
 
+def db_intro_request_set_status(target_id, connection_id, status):
+    """Upsert an intro request with the given status. Returns the persisted
+    status string, or '' if the status was invalid. Marks `last_updated_at`
+    on every change so future timeline UI can show 'requested 3 days ago,
+    in progress 1 day ago'."""
+    if status not in INTRO_STATUS_VALID:
+        return ""
+    now = int(time.time())
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT 1 FROM intro_requests WHERE target_id = ? AND connection_id = ?",
+            (target_id, connection_id),
+        )
+        if cur.fetchone():
+            conn.execute(
+                "UPDATE intro_requests SET status = ?, last_updated_at = ? "
+                "WHERE target_id = ? AND connection_id = ?",
+                (status, now, target_id, connection_id),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO intro_requests (target_id, connection_id, requested_at, status, last_updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (target_id, connection_id, now, status, now),
+            )
+        conn.commit()
+    return status
+
+
+def db_intro_request_clear(target_id, connection_id):
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM intro_requests WHERE target_id = ? AND connection_id = ?",
+            (target_id, connection_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
 def db_intro_requests_for_target(target_id):
+    """{connection_id} for backwards-compat with the legacy callers that
+    only need 'is this requested at all'. Status-aware callers should use
+    db_intro_requests_status_map_for_target instead."""
     with _db_lock, _db_connect() as conn:
         cur = conn.execute(
             "SELECT connection_id FROM intro_requests WHERE target_id = ?",
             (target_id,),
+        )
+        return {row[0] for row in cur.fetchall()}
+
+
+def db_intro_requests_status_map_for_target(target_id):
+    """{connection_id → status} for one target. Used by the target drawer
+    so each connector card knows what to pre-select in its status dropdown."""
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT connection_id, status FROM intro_requests WHERE target_id = ?",
+            (target_id,),
+        )
+        return {row[0]: row[1] for row in cur.fetchall()}
+
+
+def db_intro_status_rollup_map() -> dict:
+    """{target_id → rollup_status} for every target with at least one
+    intro_requests row. Rollup picks the FIRST hit per INTRO_STATUS_ORDER
+    (so 'intro_made' beats 'requested'). Per-request cached in flask.g.
+    Drives the badge on the Targets/Accounts list rows."""
+    try:
+        from flask import g
+        cached = getattr(g, "_intro_status_rollup", None)
+    except RuntimeError:
+        cached = None
+        g = None
+    if cached is not None:
+        return cached
+    per_target: dict = {}
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute("SELECT target_id, status FROM intro_requests")
+        for tid, status in cur.fetchall():
+            per_target.setdefault(tid, set()).add(status)
+    out: dict = {}
+    for tid, statuses in per_target.items():
+        for s in INTRO_STATUS_ORDER:
+            if s in statuses:
+                out[tid] = s
+                break
+    if g is not None:
+        g._intro_status_rollup = out
+    return out
+
+
+# Per-target tag helpers. Tags are normalized to lowercase + length-capped
+# so the lookup map stays small and the filter dropdown doesn't get clogged
+# with case variants. user-typed tags are capped at TAG_PER_TARGET_CAP per
+# target; auto-applied date tags bypass the cap.
+TAG_MAX_LEN = 40
+TAG_PER_TARGET_CAP = 20
+
+
+def _normalize_tag(raw: str) -> str:
+    s = " ".join((raw or "").split()).lower()
+    return s[:TAG_MAX_LEN]
+
+
+def db_add_target_tag(target_id: str, tag: str, tag_type: str = "user") -> bool:
+    """INSERT a (target_id, tag) row. Returns True if added, False if it
+    already existed or input was empty. Enforces TAG_PER_TARGET_CAP for
+    user-typed tags only — auto-applied date tags bypass the cap so a
+    target with 20 user tags still gets its date stamp."""
+    tag = _normalize_tag(tag)
+    if not tag or not target_id:
+        return False
+    if tag_type not in ("user", "upload_date"):
+        tag_type = "user"
+    with _db_lock, _db_connect() as conn:
+        if tag_type == "user":
+            cur = conn.execute(
+                "SELECT COUNT(*) FROM target_tags WHERE target_id = ? AND tag_type = 'user'",
+                (target_id,),
+            )
+            existing = cur.fetchone()[0]
+            if existing >= TAG_PER_TARGET_CAP:
+                return False
+        try:
+            conn.execute(
+                "INSERT INTO target_tags (target_id, tag, created_at, tag_type) "
+                "VALUES (?, ?, ?, ?)",
+                (target_id, tag, int(time.time()), tag_type),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            return False
+    _invalidate_target_tags_cache()
+    return True
+
+
+def db_remove_target_tag(target_id: str, tag: str) -> bool:
+    tag = _normalize_tag(tag)
+    if not tag or not target_id:
+        return False
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM target_tags WHERE target_id = ? AND tag = ? AND tag_type = 'user'",
+            (target_id, tag),
+        )
+        conn.commit()
+        removed = cur.rowcount > 0
+    if removed:
+        _invalidate_target_tags_cache()
+    return removed
+
+
+def db_tags_for_target(target_id: str) -> list:
+    """User-typed editable tags only. Drawer chip editor reads this."""
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT tag FROM target_tags WHERE target_id = ? AND tag_type = 'user' "
+            "ORDER BY created_at ASC",
+            (target_id,),
+        )
+        return [row[0] for row in cur.fetchall()]
+
+
+def db_target_tags_map() -> dict:
+    """{target_id → [tag, ...]} for every user-tagged target. Per-request
+    cached in flask.g."""
+    try:
+        from flask import g
+        cached = getattr(g, "_target_tags_map", None)
+    except RuntimeError:
+        cached = None
+        g = None
+    if cached is not None:
+        return cached
+    out: dict = {}
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT target_id, tag FROM target_tags WHERE tag_type = 'user' "
+            "ORDER BY created_at ASC"
+        )
+        for tid, tag in cur.fetchall():
+            out.setdefault(tid, []).append(tag)
+    if g is not None:
+        g._target_tags_map = out
+    return out
+
+
+def _invalidate_target_tags_cache():
+    try:
+        from flask import g
+        if hasattr(g, "_target_tags_map"):
+            delattr(g, "_target_tags_map")
+        if hasattr(g, "_target_upload_dates_map"):
+            delattr(g, "_target_upload_dates_map")
+    except RuntimeError:
+        pass
+
+
+def db_all_tags_with_counts() -> list:
+    """Sorted [(tag, count)] across all targets (user-typed only)."""
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT tag, COUNT(*) AS c FROM target_tags WHERE tag_type = 'user' "
+            "GROUP BY tag ORDER BY c DESC, tag ASC"
+        )
+        return [(row[0], row[1]) for row in cur.fetchall()]
+
+
+def db_target_ids_with_tag(tag: str) -> set:
+    """target_ids carrying a given user-typed tag (date-tag filter uses
+    db_target_ids_with_upload_date instead)."""
+    tag = _normalize_tag(tag)
+    if not tag:
+        return set()
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT target_id FROM target_tags WHERE tag = ? AND tag_type = 'user'",
+            (tag,),
+        )
+        return {row[0] for row in cur.fetchall()}
+
+
+def db_all_upload_dates_with_counts() -> list:
+    """Sorted [(YYYY-MM-DD, count)] newest first. Drives the "Upload date"
+    filter dropdown — when a target landed in the local cache, derived
+    from db_save_targets_cache or the boot-time backfill."""
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT tag, COUNT(DISTINCT target_id) FROM target_tags "
+            "WHERE tag_type = 'upload_date' GROUP BY tag ORDER BY tag DESC"
+        )
+        return [(row[0], row[1]) for row in cur.fetchall()]
+
+
+def db_target_ids_with_upload_date(date_str: str) -> set:
+    date_str = (date_str or "").strip()[:10]
+    if not date_str:
+        return set()
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT target_id FROM target_tags WHERE tag_type = 'upload_date' AND tag = ?",
+            (date_str,),
         )
         return {row[0] for row in cur.fetchall()}
 
@@ -1487,6 +1829,44 @@ def _migrate_slack_channel_name_strip_hash():
 
 
 _migrate_slack_channel_name_strip_hash()
+
+
+def _backfill_target_upload_dates():
+    """One-shot migration: for every cached target without an upload_date
+    tag, derive a date from targets_cache.fetched_at and insert one.
+    Gated on app_state['upload_date_backfill_done'] so subsequent boots
+    skip the work."""
+    if db_app_state_get("upload_date_backfill_done"):
+        return
+    import datetime as _dt
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT target_id FROM target_tags WHERE tag_type = 'upload_date'"
+        )
+        already_tagged = {row[0] for row in cur.fetchall()}
+        cur = conn.execute("SELECT target_id, fetched_at FROM targets_cache")
+        rows = cur.fetchall()
+        now_ts = int(time.time())
+        to_insert = []
+        for tid, fetched_at in rows:
+            if tid in already_tagged:
+                continue
+            try:
+                date_str = _dt.datetime.fromtimestamp(int(fetched_at)).strftime("%Y-%m-%d")
+            except (ValueError, OSError):
+                date_str = _dt.datetime.now().strftime("%Y-%m-%d")
+            to_insert.append((tid, date_str, now_ts, "upload_date"))
+        if to_insert:
+            conn.executemany(
+                "INSERT OR IGNORE INTO target_tags (target_id, tag, created_at, tag_type) "
+                "VALUES (?, ?, ?, ?)",
+                to_insert,
+            )
+            conn.commit()
+    db_app_state_set("upload_date_backfill_done", "1")
+
+
+_backfill_target_upload_dates()
 
 
 def _auth_headers():
@@ -2590,10 +2970,27 @@ def _enrich_connection(target, connection, requested_set=None, my_user_id=None):
     first = (connection.get("firstName") or "").strip()
     last = (connection.get("lastName") or "").strip()
     cid = connection.get("id")
-    if requested_set is not None:
-        is_requested = cid in requested_set
+    # Normalize the legacy `requested_set` signature.
+    if isinstance(requested_set, dict):
+        intro_status = requested_set.get(cid, "")
+    elif isinstance(requested_set, set):
+        intro_status = "requested" if cid in requested_set else ""
+    elif requested_set is None:
+        intro_status = (
+            "requested" if db_intro_request_get(target.get("id"), cid) else ""
+        )
+        if intro_status == "requested":
+            with _db_lock, _db_connect() as conn:
+                row = conn.execute(
+                    "SELECT status FROM intro_requests WHERE target_id = ? AND connection_id = ?",
+                    (target.get("id"), cid),
+                ).fetchone()
+                if row and row[0]:
+                    intro_status = row[0]
     else:
-        is_requested = db_intro_request_get(target.get("id"), cid)
+        intro_status = ""
+    is_requested = bool(intro_status)
+    status_meta = INTRO_STATUS_META.get(intro_status) if intro_status else None
 
     if my_user_id is None:
         my_user_id = get_my_owner_id()
@@ -2677,6 +3074,8 @@ def _enrich_connection(target, connection, requested_set=None, my_user_id=None):
         "compose_subject": messages["subject"],
         "gmail_url": gmail_url,
         "requested": is_requested,
+        "intro_status": intro_status,
+        "intro_status_meta": status_meta,
     }
 
 
@@ -2737,8 +3136,27 @@ def _matches_query(t, q_lower):
 
 def _enrich_target(t):
     position = t.get("position") or {}
+    # Funnel rollup — the worst-case status across this target's intro
+    # requests, picking 'intro_made' > 'in_progress' > 'requested' > the
+    # negative outcomes. Drives the badge on the Targets/Accounts list rows.
+    tid = t.get("id") or ""
+    rollup_status = db_intro_status_rollup_map().get(tid, "")
+    rollup_meta = INTRO_STATUS_META.get(rollup_status) if rollup_status else None
+    # Merge Draftboard-API tags (read-only) with locally-added user tags
+    # from target_tags. Dedup case-insensitively so an API "Investor" tag
+    # doesn't double-up with a local "investor".
+    api_tags = [str(x).strip() for x in (t.get("tags") or []) if str(x).strip()]
+    editable_tags = db_target_tags_map().get(tid, []) if tid else []
+    merged = []
+    seen_lower = set()
+    for tag in list(editable_tags) + api_tags:
+        key = tag.lower()
+        if key in seen_lower:
+            continue
+        seen_lower.add(key)
+        merged.append(tag)
     return {
-        "id": t.get("id"),
+        "id": tid,
         "name": f"{t.get('firstName') or ''} {t.get('lastName') or ''}".strip() or "(no name)",
         "initials": _initials(t.get("firstName"), t.get("lastName")),
         "title": position.get("title") or "",
@@ -2748,9 +3166,12 @@ def _enrich_target(t):
         "linkedinUrl": t.get("linkedinUrl") or "",
         "score": t.get("score") or 0,
         "connections_number": t.get("connectionsNumber") or 0,
-        "tags": t.get("tags") or [],
+        "tags": merged,
+        "editable_tags": list(editable_tags),
         "status": t.get("status") or "",
         "updated_at": t.get("updatedAt") or "",
+        "intro_status": rollup_status,
+        "intro_status_meta": rollup_meta,
     }
 
 
@@ -2792,14 +3213,60 @@ def targets_view():
         matched_ids = manual_summary["matched_target_ids"]
         targets = [t for t in targets if t.get("id") in matched_ids]
 
+    # Local tag filter — show only targets carrying the given user-typed
+    # tag from the target_tags table. Draftboard-API tags are intentionally
+    # NOT in scope here (this is the personal-overlay filter).
+    tag_filter = _normalize_tag(request.args.get("tag") or "")
+    if tag_filter:
+        tagged_ids = db_target_ids_with_tag(tag_filter)
+        targets = [t for t in targets if t.get("id") in tagged_ids]
+
+    # Upload-date filter — auto-applied YYYY-MM-DD tag per target.
+    upload_date_filter = (request.args.get("upload_date") or "").strip()[:10]
+    if upload_date_filter:
+        dated_ids = db_target_ids_with_upload_date(upload_date_filter)
+        targets = [t for t in targets if t.get("id") in dated_ids]
+
+    # Intro-status filter. Special pseudo-statuses:
+    #   "any"   → any tracked status (requested, in_progress, made, rejected)
+    #   "open"  → still in flight (requested + in_progress)
+    #   "none"  → no intro request row at all
+    # Otherwise must be a valid INTRO_STATUS value.
+    status_filter = (request.args.get("intro_status") or "").strip()
+    if status_filter:
+        rollup = db_intro_status_rollup_map()
+        if status_filter == "any":
+            targets = [t for t in targets if rollup.get(t.get("id"))]
+        elif status_filter == "open":
+            targets = [t for t in targets if rollup.get(t.get("id")) in ("requested", "in_progress")]
+        elif status_filter == "none":
+            targets = [t for t in targets if not rollup.get(t.get("id"))]
+        elif status_filter in INTRO_STATUS_VALID:
+            targets = [t for t in targets if rollup.get(t.get("id")) == status_filter]
+        else:
+            status_filter = ""
+
     # Search filter (case-insensitive substring across name/title/company/tags)
     q = (request.args.get("q") or "").strip()
     q_lower = q.lower()
     if q_lower:
         targets = [t for t in targets if _matches_query(t, q_lower)]
 
-    # Sort by score desc
-    targets.sort(key=lambda t: (t.get("score") or 0), reverse=True)
+    # Sort. `?sort=score` (default) or `?sort=paths` — desc on both.
+    # Secondary key keeps ordering stable when the primary ties.
+    sort_by = (request.args.get("sort") or "score").strip().lower()
+    if sort_by not in ("score", "paths"):
+        sort_by = "score"
+    if sort_by == "paths":
+        targets.sort(
+            key=lambda t: (t.get("connectionsNumber") or 0, t.get("score") or 0),
+            reverse=True,
+        )
+    else:
+        targets.sort(
+            key=lambda t: (t.get("score") or 0, t.get("connectionsNumber") or 0),
+            reverse=True,
+        )
 
     # Pagination — 100 per page
     total = len(targets)
@@ -2840,6 +3307,13 @@ def targets_view():
         owner_filter=owner_filter,
         manual_only=manual_only,
         manual_match_total=len(manual_path_match_summary()["matched_target_ids"]),
+        intro_status_filter=status_filter,
+        intro_status_meta=INTRO_STATUS_META,
+        all_tags=db_all_tags_with_counts(),
+        tag_filter=tag_filter,
+        all_upload_dates=db_all_upload_dates_with_counts(),
+        upload_date_filter=upload_date_filter,
+        sort_by=sort_by,
         me=me_for_template,
     )
 
@@ -2856,6 +3330,35 @@ def accounts_view():
     if resolved_owner_id:
         owner_target_ids = db_target_ids_for_owner(resolved_owner_id)
         targets = [t for t in targets if t.get("id") in owner_target_ids]
+
+    # Local tag filter (same as targets_view).
+    tag_filter = _normalize_tag(request.args.get("tag") or "")
+    if tag_filter:
+        tagged_ids = db_target_ids_with_tag(tag_filter)
+        targets = [t for t in targets if t.get("id") in tagged_ids]
+
+    # Upload-date filter — auto-applied per target on first-seen.
+    upload_date_filter = (request.args.get("upload_date") or "").strip()[:10]
+    if upload_date_filter:
+        dated_ids = db_target_ids_with_upload_date(upload_date_filter)
+        targets = [t for t in targets if t.get("id") in dated_ids]
+
+    # Intro-status filter — same semantics as targets_view (pseudo + real
+    # values). Filters AT THE TARGET LEVEL pre-grouping so accounts with
+    # zero surviving targets disappear.
+    status_filter = (request.args.get("intro_status") or "").strip()
+    if status_filter:
+        rollup = db_intro_status_rollup_map()
+        if status_filter == "any":
+            targets = [t for t in targets if rollup.get(t.get("id"))]
+        elif status_filter == "open":
+            targets = [t for t in targets if rollup.get(t.get("id")) in ("requested", "in_progress")]
+        elif status_filter == "none":
+            targets = [t for t in targets if not rollup.get(t.get("id"))]
+        elif status_filter in INTRO_STATUS_VALID:
+            targets = [t for t in targets if rollup.get(t.get("id")) == status_filter]
+        else:
+            status_filter = ""
 
     # Group by company name (case-insensitive key, preserve display case).
     # Use the manual-path metadata fallback so paste-mode-added targets with
@@ -2907,9 +3410,18 @@ def accounts_view():
     end = start + ACCOUNTS_PAGE_SIZE
     page_accounts = sorted_accounts[start:end]
 
-    # Sort each account's targets by score desc for nicer display when expanded
+    # Sort each account's targets by score desc + roll up the best intro
+    # status across them so the row gets a single funnel pill.
     for a in page_accounts:
         a["targets"].sort(key=lambda x: x["score"], reverse=True)
+        statuses = {t.get("intro_status") for t in a["targets"] if t.get("intro_status")}
+        a["intro_status"] = ""
+        a["intro_status_meta"] = None
+        for s in INTRO_STATUS_ORDER:
+            if s in statuses:
+                a["intro_status"] = s
+                a["intro_status_meta"] = INTRO_STATUS_META.get(s)
+                break
 
     # Auto-start background sync of per-target connections.
     maybe_auto_start_sync(targets)
@@ -2933,6 +3445,12 @@ def accounts_view():
         cache_age=cache_age_seconds(),
         owners_list=owners_list,
         owner_filter=owner_filter,
+        intro_status_filter=status_filter,
+        intro_status_meta=INTRO_STATUS_META,
+        all_tags=db_all_tags_with_counts(),
+        tag_filter=tag_filter,
+        all_upload_dates=db_all_upload_dates_with_counts(),
+        upload_date_filter=upload_date_filter,
         me=me_for_template,
     )
 
@@ -3060,8 +3578,8 @@ def target_drawer(target_id):
     # + template, so they're indistinguishable in the UI except for score=0.
     connections = list(connections) + manual_paths_for_target(target)
     connections.sort(key=lambda c: c.get("score") or 0, reverse=True)
-    requested_set = db_intro_requests_for_target(target_id)
-    enriched_conns = [_enrich_connection(target, c, requested_set) for c in connections]
+    status_map = db_intro_requests_status_map_for_target(target_id)
+    enriched_conns = [_enrich_connection(target, c, status_map) for c in connections]
 
     return render_template(
         "_drawer_target.html",
@@ -3078,8 +3596,8 @@ def _connectors_panel_for_target(target):
     connections, error = fetch_target_connections(target_id)
     connections = list(connections) + manual_paths_for_target(target)
     connections.sort(key=lambda c: c.get("score") or 0, reverse=True)
-    requested_set = db_intro_requests_for_target(target_id)
-    enriched = [_enrich_connection(target, c, requested_set) for c in connections]
+    status_map = db_intro_requests_status_map_for_target(target_id)
+    enriched = [_enrich_connection(target, c, status_map) for c in connections]
     return {
         "target": _enrich_target(target),
         "target_id": target_id,
@@ -3158,6 +3676,67 @@ def toggle_intro_request():
         return jsonify({"error": "missing target_id or connection_id"}), 400
     new_state = db_intro_request_toggle(target_id, connection_id)
     return jsonify({"requested": new_state})
+
+
+@app.route("/target/<target_id>/tags", methods=["POST"])
+def target_tags_add(target_id):
+    """Add a user-typed tag to a target. JSON body: {tag: "investor"}.
+    Tag is normalized to lowercase + length-capped at 40 chars.
+    Returns the updated editable tag list."""
+    sec_site = request.headers.get("Sec-Fetch-Site")
+    if sec_site and sec_site not in ("same-origin", "none"):
+        return jsonify({"error": "cross-site request blocked"}), 403
+    data = request.get_json(silent=True) or {}
+    tag = (data.get("tag") or "").strip()
+    if not tag:
+        return jsonify({"error": "missing tag"}), 400
+    added = db_add_target_tag(target_id, tag)
+    return jsonify({
+        "ok": True,
+        "added": added,
+        "tag": _normalize_tag(tag),
+        "tags": db_tags_for_target(target_id),
+    })
+
+
+@app.route("/target/<target_id>/tags/delete", methods=["POST"])
+def target_tags_remove(target_id):
+    sec_site = request.headers.get("Sec-Fetch-Site")
+    if sec_site and sec_site not in ("same-origin", "none"):
+        return jsonify({"error": "cross-site request blocked"}), 403
+    data = request.get_json(silent=True) or {}
+    tag = (data.get("tag") or "").strip()
+    if not tag:
+        return jsonify({"error": "missing tag"}), 400
+    removed = db_remove_target_tag(target_id, tag)
+    return jsonify({
+        "ok": True,
+        "removed": removed,
+        "tags": db_tags_for_target(target_id),
+    })
+
+
+@app.route("/intro_requests/status", methods=["POST"])
+def set_intro_request_status():
+    """Set the status for an intro request. Empty status clears the row
+    (treats this like 'unmark requested'). Returns the persisted status
+    so the front-end can re-render the dropdown without a reload."""
+    sec_site = request.headers.get("Sec-Fetch-Site")
+    if sec_site and sec_site not in ("same-origin", "none"):
+        return jsonify({"error": "cross-site request blocked"}), 403
+    data = request.get_json(silent=True) or {}
+    target_id = data.get("target_id")
+    connection_id = data.get("connection_id")
+    status = (data.get("status") or "").strip()
+    if not target_id or not connection_id:
+        return jsonify({"error": "missing target_id or connection_id"}), 400
+    if not status:
+        cleared = db_intro_request_clear(target_id, connection_id)
+        return jsonify({"ok": True, "status": "", "cleared": cleared})
+    if status not in INTRO_STATUS_VALID:
+        return jsonify({"error": f"invalid status '{status}'"}), 400
+    persisted = db_intro_request_set_status(target_id, connection_id, status)
+    return jsonify({"ok": True, "status": persisted})
 
 
 @app.route("/connections", methods=["GET"])

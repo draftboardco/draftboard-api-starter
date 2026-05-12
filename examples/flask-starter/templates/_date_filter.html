@@ -1,0 +1,31 @@
+{# Upload-date filter pill. Required vars:
+     all_upload_dates — [(YYYY-MM-DD, count)] newest first
+     upload_date_filter — current ?upload_date= value
+     active — "targets" or "accounts"
+     query / owner_filter / tag_filter / intro_status_filter / manual_only — preserved
+   Date tags are auto-applied when a target first lands in targets_cache; users
+   don't set them by hand. Lets you slice by "what came in last Tuesday."
+#}
+{% if all_upload_dates %}
+  {% set form_action = '/' if active == 'targets' else '/accounts' %}
+  <form method="GET" action="{{ form_action }}" class="inline-block">
+    {% if query %}<input type="hidden" name="q" value="{{ query }}">{% endif %}
+    {% if owner_filter %}<input type="hidden" name="owner" value="{{ owner_filter }}">{% endif %}
+    {% if tag_filter %}<input type="hidden" name="tag" value="{{ tag_filter }}">{% endif %}
+    {% if intro_status_filter %}<input type="hidden" name="intro_status" value="{{ intro_status_filter }}">{% endif %}
+    {% if manual_only is defined and manual_only %}<input type="hidden" name="manual_only" value="1">{% endif %}
+    {% if sort_by and sort_by != 'score' %}<input type="hidden" name="sort" value="{{ sort_by }}">{% endif %}
+    <label class="inline-flex items-center gap-2 text-xs">
+      <span class="text-slate-500">Upload date:</span>
+      <select name="upload_date" onchange="this.form.submit()"
+              class="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-indigo-500">
+        <option value="" {% if not upload_date_filter %}selected{% endif %}>Any date</option>
+        {% for d, count in all_upload_dates %}
+          <option value="{{ d }}" {% if upload_date_filter == d %}selected{% endif %}>
+            {{ d }} ({{ count }})
+          </option>
+        {% endfor %}
+      </select>
+    </label>
+  </form>
+{% endif %}

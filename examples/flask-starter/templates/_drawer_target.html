@@ -21,13 +21,31 @@
                class="hover:text-indigo-700 hover:underline">{{ target.company }}</a>
           {% endif %}
         </div>
-        {% if target.tags %}
-          <div class="mt-1 flex flex-wrap gap-1">
-            {% for tag in target.tags %}
-              <span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-600">{{ tag }}</span>
-            {% endfor %}
-          </div>
-        {% endif %}
+        {# Tags row. API-driven tags from Draftboard render as gray
+           non-deletable chips; user-typed tags from the local target_tags
+           table render as indigo chips with an × to remove. Input below
+           adds a new local tag on Enter. #}
+        <div class="mt-1.5 flex flex-wrap gap-1 items-center" data-target-tags
+             data-target-id="{{ target_id }}">
+          {% for tag in target.tags %}
+            {% set is_editable = tag in target.editable_tags %}
+            <span class="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded
+                         {% if is_editable %}bg-indigo-50 text-indigo-800 border border-indigo-200{% else %}bg-slate-100 text-slate-600{% endif %}"
+                  data-tag-chip="{{ tag }}">
+              <span>{{ tag }}</span>
+              {% if is_editable %}
+                <button type="button" data-no-drawer
+                        onclick="removeTargetTag(this, '{{ target_id }}', '{{ tag|e }}')"
+                        class="text-indigo-500 hover:text-rose-700 leading-none"
+                        aria-label="Remove tag {{ tag }}">&times;</button>
+              {% endif %}
+            </span>
+          {% endfor %}
+          <input type="text" data-no-drawer placeholder="+ tag"
+                 onkeydown="if (event.key === 'Enter') { event.preventDefault(); addTargetTag(this, '{{ target_id }}'); }"
+                 maxlength="40"
+                 class="text-[10px] px-1.5 py-0.5 rounded border border-dashed border-slate-300 bg-white focus:outline-none focus:border-indigo-400 focus:bg-indigo-50 w-20" />
+        </div>
       </div>
     </div>
     <button data-no-drawer onclick="closeDrawer()"

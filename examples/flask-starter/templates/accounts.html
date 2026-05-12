@@ -26,6 +26,9 @@
       </div>
       <div class="flex items-center gap-3 flex-wrap">
         {% include "_owner_filter.html" %}
+        {% include "_tag_filter.html" %}
+        {% include "_date_filter.html" %}
+        {% include "_status_filter.html" %}
         {% if cache_age is not none %}
           <span class="text-[11px] text-slate-400">
             cached {{ cache_age }}s ago
@@ -85,12 +88,19 @@
             </div>
 
             <div class="flex-1 min-w-0">
-              <div class="flex items-center gap-2">
+              <div class="flex items-center gap-2 flex-wrap">
                 <span class="text-sm font-semibold text-slate-900 truncate">{{ a.name }}</span>
                 {% if a.company_linkedin %}
                   <a data-no-drawer href="{{ a.company_linkedin }}" target="_blank" rel="noopener"
                      onclick="event.stopPropagation()"
                      class="text-[10px] text-slate-400 hover:text-indigo-700">↗ LinkedIn</a>
+                {% endif %}
+                {% if a.intro_status_meta %}
+                  <span class="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full border {{ a.intro_status_meta.badge_class }}"
+                        title="Best intro status across the targets at this account">
+                    <span>{{ a.intro_status_meta.icon }}</span>
+                    <span>{{ a.intro_status_meta.label }}</span>
+                  </span>
                 {% endif %}
               </div>
               <div class="text-xs text-slate-500">

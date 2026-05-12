@@ -1,0 +1,36 @@
+{# Intro-status filter pill. Required vars:
+     intro_status_meta — INTRO_STATUS_META dict (label / icon / tone per key)
+     intro_status_filter — current ?intro_status= value (pseudo or real status)
+     active — "targets" or "accounts"
+     owner_filter / query — preserved as hidden inputs
+   Pseudo-values:
+     ""     — show all (no filter)
+     "any"  — any tracked status
+     "open" — requested OR in_progress
+     "none" — no intro_requests row
+#}
+{% set form_action = '/' if active == 'targets' else '/accounts' %}
+<form method="GET" action="{{ form_action }}" class="inline-block">
+  {% if query %}<input type="hidden" name="q" value="{{ query }}">{% endif %}
+  {% if owner_filter %}<input type="hidden" name="owner" value="{{ owner_filter }}">{% endif %}
+  {% if tag_filter %}<input type="hidden" name="tag" value="{{ tag_filter }}">{% endif %}
+  {% if upload_date_filter %}<input type="hidden" name="upload_date" value="{{ upload_date_filter }}">{% endif %}
+  {% if manual_only is defined and manual_only %}<input type="hidden" name="manual_only" value="1">{% endif %}
+  {% if sort_by and sort_by != 'score' %}<input type="hidden" name="sort" value="{{ sort_by }}">{% endif %}
+  <label class="inline-flex items-center gap-2 text-xs">
+    <span class="text-slate-500">Status:</span>
+    <select name="intro_status" onchange="this.form.submit()"
+            class="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-indigo-500">
+      <option value="" {% if not intro_status_filter %}selected{% endif %}>All</option>
+      <option value="open" {% if intro_status_filter == 'open' %}selected{% endif %}>↻ Open (requested + in progress)</option>
+      <option value="any" {% if intro_status_filter == 'any' %}selected{% endif %}>Any tracked</option>
+      <option value="none" {% if intro_status_filter == 'none' %}selected{% endif %}>No intro started</option>
+      <option disabled>────────</option>
+      {% for key, meta in intro_status_meta.items() %}
+        <option value="{{ key }}" {% if intro_status_filter == key %}selected{% endif %}>
+          {{ meta.icon }} {{ meta.label }}
+        </option>
+      {% endfor %}
+    </select>
+  </label>
+</form>

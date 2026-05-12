@@ -11,6 +11,10 @@
 
 <script>
 (function () {
+  // Track the currently-open drawer URL so handlers can re-render the
+  // drawer in place after mutating data (status changes, tag edits).
+  var _currentDrawerUrl = null;
+
   function openDrawer(url) {
     var drawer = document.getElementById('drawer');
     var backdrop = document.getElementById('drawer-backdrop');
@@ -18,6 +22,7 @@
     drawer.classList.remove('hidden');
     backdrop.classList.remove('hidden');
     content.innerHTML = '<div class="p-12 text-center text-slate-500">Loading...</div>';
+    _currentDrawerUrl = url;
     fetch(url, { headers: { 'Accept': 'text/html' } })
       .then(function (r) { return r.text(); })
       .then(function (html) { content.innerHTML = html; })
@@ -26,13 +31,32 @@
       });
   }
 
+  function reloadDrawer() {
+    // Re-fetch the currently-open drawer URL and replace its content.
+    // Used after mutations (status, tags) so the new state shows
+    // immediately without the user closing + reopening.
+    if (_currentDrawerUrl) openDrawer(_currentDrawerUrl);
+  }
+
   function closeDrawer() {
     document.getElementById('drawer').classList.add('hidden');
     document.getElementById('drawer-backdrop').classList.add('hidden');
+    _currentDrawerUrl = null;
+    // Status / tag mutations inside the drawer change row-level data on
+    // the parent page. Drawer re-renders itself fine; the page underneath
+    // would stay stale until reload. Cheaper to reload on close than to
+    // diff per-row.
+    if (window._listNeedsRefresh) {
+      window._listNeedsRefresh = false;
+      window.location.reload();
+    }
   }
+
+  window.markListStale = function () { window._listNeedsRefresh = true; };
 
   // Expose globally so inline onclick handlers in the partials can call them.
   window.openDrawer = openDrawer;
+  window.reloadDrawer = reloadDrawer;
   window.closeDrawer = closeDrawer;
 
   // Delegated click handler — any element with [data-target-id] or [data-account-key]
@@ -155,6 +179,123 @@
       }
     }
     showToast('Body filled with plain text.');
+  };
+
+  // Target tags — add via Enter on the input, remove via × on a chip.
+  // Reloads the drawer after mutation so the chip list reflects new state
+  // without manual DOM splicing, AND marks the parent page stale so the
+  // row tag chips + filter dropdown refresh on drawer close.
+  window.addTargetTag = function (input, targetId) {
+    var raw = (input.value || '').trim();
+    if (!raw) return;
+    input.disabled = true;
+    fetch('/target/' + encodeURIComponent(targetId) + '/tags', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Sec-Fetch-Site': 'same-origin',
+      },
+      credentials: 'same-origin',
+      body: JSON.stringify({ tag: raw }),
+    })
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+      .then(function (res) {
+        input.disabled = false;
+        input.value = '';
+        if (res.ok && res.body && res.body.ok) {
+          if (window.markListStale) window.markListStale();
+          if (window.reloadDrawer) window.reloadDrawer();
+        } else {
+          showToast((res.body && res.body.error) || "Couldn't add tag");
+        }
+      })
+      .catch(function () {
+        input.disabled = false;
+        showToast('Network error adding tag');
+      });
+  };
+  window.removeTargetTag = function (btn, targetId, tag) {
+    btn.disabled = true;
+    fetch('/target/' + encodeURIComponent(targetId) + '/tags/delete', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Sec-Fetch-Site': 'same-origin',
+      },
+      credentials: 'same-origin',
+      body: JSON.stringify({ tag: tag }),
+    })
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+      .then(function (res) {
+        if (res.ok && res.body && res.body.ok) {
+          if (window.markListStale) window.markListStale();
+          if (window.reloadDrawer) window.reloadDrawer();
+        } else {
+          btn.disabled = false;
+          showToast((res.body && res.body.error) || "Couldn't remove tag");
+        }
+      })
+      .catch(function () {
+        btn.disabled = false;
+        showToast('Network error removing tag');
+      });
+  };
+
+  // Intro-status dropdown on each connector card. Toggles the menu open
+  // (closes any other open ones first). setIntroStatus posts the change
+  // and reloads the drawer so the badge + rollup pill update everywhere.
+  window.toggleStatusMenu = function (e, btn) {
+    e.preventDefault();
+    e.stopPropagation();
+    var wrapper = btn.closest('[data-status-control]');
+    if (!wrapper) return;
+    var menu = wrapper.querySelector('[data-status-menu]');
+    if (!menu) return;
+    document.querySelectorAll('[data-status-menu]:not(.hidden)').forEach(function (m) {
+      if (m !== menu) m.classList.add('hidden');
+    });
+    menu.classList.toggle('hidden');
+  };
+  document.addEventListener('click', function (e) {
+    document.querySelectorAll('[data-status-menu]:not(.hidden)').forEach(function (menu) {
+      var ctl = menu.closest('[data-status-control]');
+      if (!ctl || !ctl.contains(e.target)) menu.classList.add('hidden');
+    });
+  });
+  window.setIntroStatus = function (btn, status) {
+    var wrapper = btn.closest('[data-status-control]');
+    if (!wrapper) return;
+    var targetId = wrapper.getAttribute('data-target-id');
+    var connectionId = wrapper.getAttribute('data-connection-id');
+    if (!targetId || !connectionId) return;
+    btn.disabled = true;
+    fetch('/intro_requests/status', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Sec-Fetch-Site': 'same-origin',
+      },
+      credentials: 'same-origin',
+      body: JSON.stringify({
+        target_id: targetId,
+        connection_id: connectionId,
+        status: status,
+      }),
+    })
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+      .then(function (res) {
+        if (res.ok && res.body && res.body.ok) {
+          if (window.markListStale) window.markListStale();
+          if (window.reloadDrawer) window.reloadDrawer();
+        } else {
+          btn.disabled = false;
+          showToast((res.body && res.body.error) || "Couldn't set status");
+        }
+      })
+      .catch(function () {
+        btn.disabled = false;
+        showToast('Network error setting status');
+      });
   };
 
   // "Assigned to teammate" dropdown — show/hide on click. Auto-closes on outside click.

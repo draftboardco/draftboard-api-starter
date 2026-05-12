@@ -26,6 +26,24 @@
       </div>
       <div class="flex items-center gap-3 flex-wrap">
         {% include "_owner_filter.html" %}
+        {% include "_tag_filter.html" %}
+        {% include "_date_filter.html" %}
+        {% include "_status_filter.html" %}
+        <form method="GET" action="/" class="inline-block">
+          {% if query %}<input type="hidden" name="q" value="{{ query }}">{% endif %}
+          {% if owner_filter %}<input type="hidden" name="owner" value="{{ owner_filter }}">{% endif %}
+          {% if tag_filter %}<input type="hidden" name="tag" value="{{ tag_filter }}">{% endif %}
+          {% if intro_status_filter %}<input type="hidden" name="intro_status" value="{{ intro_status_filter }}">{% endif %}
+          {% if manual_only %}<input type="hidden" name="manual_only" value="1">{% endif %}
+          <label class="inline-flex items-center gap-2 text-xs">
+            <span class="text-slate-500">Sort:</span>
+            <select name="sort" onchange="this.form.submit()"
+                    class="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-indigo-500">
+              <option value="score" {% if sort_by == 'score' %}selected{% endif %}>Score</option>
+              <option value="paths" {% if sort_by == 'paths' %}selected{% endif %}>Paths</option>
+            </select>
+          </label>
+        </form>
         {# "Manual list match" toggle — narrows to targets that have at
            least one match in an uploaded CSV. Shown when either there are
            matches OR the user has the filter active (so they're never
@@ -127,6 +145,13 @@
                 {% endif %}
                 {% if t.status and t.status != 'new' %}
                   <span class="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded-full bg-slate-100 text-slate-600">{{ t.status }}</span>
+                {% endif %}
+                {% if t.intro_status_meta %}
+                  <span class="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full border {{ t.intro_status_meta.badge_class }}"
+                        title="Best status across paths to this target">
+                    <span>{{ t.intro_status_meta.icon }}</span>
+                    <span>{{ t.intro_status_meta.label }}</span>
+                  </span>
                 {% endif %}
               </div>
               <div class="text-xs text-slate-500 truncate">
