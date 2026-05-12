@@ -1,0 +1,30 @@
+{# Tag filter pill — sibling of _owner_filter.html. Filters by the LOCAL
+   editable tags (target_tags table). API-driven tags from Draftboard are
+   intentionally NOT here — they have their own /tags page surface.
+   Required vars:
+     all_tags — list of (tag, count) tuples (server-sorted)
+     tag_filter — current ?tag= value (normalized lowercase)
+     active — "targets" or "accounts"
+     owner_filter / query / intro_status_filter — preserved as hidden inputs
+#}
+{% if all_tags %}
+  {% set form_action = '/' if active == 'targets' else '/accounts' %}
+  <form method="GET" action="{{ form_action }}" class="inline-block">
+    {% if query %}<input type="hidden" name="q" value="{{ query }}">{% endif %}
+    {% if owner_filter %}<input type="hidden" name="owner" value="{{ owner_filter }}">{% endif %}
+    {% if intro_status_filter %}<input type="hidden" name="intro_status" value="{{ intro_status_filter }}">{% endif %}
+    {% if manual_only is defined and manual_only %}<input type="hidden" name="manual_only" value="1">{% endif %}
+    <label class="inline-flex items-center gap-2 text-xs">
+      <span class="text-slate-500">Your tag:</span>
+      <select name="tag" onchange="this.form.submit()"
+              class="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-indigo-500">
+        <option value="" {% if not tag_filter %}selected{% endif %}>All</option>
+        {% for tag, count in all_tags %}
+          <option value="{{ tag }}" {% if tag_filter == tag %}selected{% endif %}>
+            {{ tag }} ({{ count }})
+          </option>
+        {% endfor %}
+      </select>
+    </label>
+  </form>
+{% endif %}

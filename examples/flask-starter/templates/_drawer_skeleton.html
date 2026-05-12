@@ -181,6 +181,66 @@
     showToast('Body filled with plain text.');
   };
 
+  // Target tags — add via Enter on the input, remove via × on a chip.
+  // Reloads the drawer after mutation so the chip list reflects new state
+  // without manual DOM splicing, AND marks the parent page stale so the
+  // row tag chips + filter dropdown refresh on drawer close.
+  window.addTargetTag = function (input, targetId) {
+    var raw = (input.value || '').trim();
+    if (!raw) return;
+    input.disabled = true;
+    fetch('/target/' + encodeURIComponent(targetId) + '/tags', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Sec-Fetch-Site': 'same-origin',
+      },
+      credentials: 'same-origin',
+      body: JSON.stringify({ tag: raw }),
+    })
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+      .then(function (res) {
+        input.disabled = false;
+        input.value = '';
+        if (res.ok && res.body && res.body.ok) {
+          if (window.markListStale) window.markListStale();
+          if (window.reloadDrawer) window.reloadDrawer();
+        } else {
+          showToast((res.body && res.body.error) || "Couldn't add tag");
+        }
+      })
+      .catch(function () {
+        input.disabled = false;
+        showToast('Network error adding tag');
+      });
+  };
+  window.removeTargetTag = function (btn, targetId, tag) {
+    btn.disabled = true;
+    fetch('/target/' + encodeURIComponent(targetId) + '/tags/delete', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Sec-Fetch-Site': 'same-origin',
+      },
+      credentials: 'same-origin',
+      body: JSON.stringify({ tag: tag }),
+    })
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+      .then(function (res) {
+        if (res.ok && res.body && res.body.ok) {
+          if (window.markListStale) window.markListStale();
+          if (window.reloadDrawer) window.reloadDrawer();
+        } else {
+          btn.disabled = false;
+          showToast((res.body && res.body.error) || "Couldn't remove tag");
+        }
+      })
+      .catch(function () {
+        btn.disabled = false;
+        showToast('Network error removing tag');
+      });
+  };
+
   // Intro-status dropdown on each connector card. Toggles the menu open
   // (closes any other open ones first). setIntroStatus posts the change
   // and reloads the drawer so the badge + rollup pill update everywhere.
