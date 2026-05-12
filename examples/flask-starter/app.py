@@ -2955,6 +2955,60 @@ def invalidate_supporter_attribution_cache():
     _supporter_attribution_cache["fetched_at"] = 0
 
 
+def _targets_with_supporter_paths() -> set:
+    """Set of target_ids where at least one connector path (API connector OR
+    manual-list owner) is on the Supporters list — i.e., someone the user
+    or a teammate has flagged as a likely intro-maker.
+
+    Drives the "Supporters only" filter chip on /, /accounts, /connections.
+
+    Per-request cached on flask.g — the filter chip lives on three list
+    pages, and each can call this multiple times (e.g. /connections also
+    builds a separate "is_supporter" map for badges). One DB pass per
+    request rather than per target."""
+    from flask import g
+    cached = getattr(g, "_targets_with_supporter_paths_cache", None)
+    if cached is not None:
+        return cached
+
+    supporter_urls = set(db_supporter_attribution_map().keys())
+    out: set = set()
+    if not supporter_urls:
+        g._targets_with_supporter_paths_cache = out
+        return out
+
+    # API-mode connectors: connector_paths has connector_linkedin per
+    # (target, connector) pair. Normalize and intersect with the supporter
+    # URL set.
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT DISTINCT target_id, connector_linkedin "
+            "FROM connector_paths "
+            "WHERE connector_linkedin != ''"
+        )
+        for tid, link in cur.fetchall():
+            norm = _normalize_linkedin(link)
+            if norm and norm in supporter_urls:
+                out.add(tid)
+
+    # Manual-list connectors: the "connector" on a manual path IS the list
+    # owner (not the contacts in the CSV). The supporter check is on the
+    # owner's LinkedIn URL. manual_path_match_summary gives the joined
+    # (list_id → owner_linkedin) + target_ids per list.
+    summary = manual_path_match_summary()
+    list_by_id = {l["id"]: l for l in summary.get("lists", [])}
+    for list_id, data in summary.get("by_list", {}).items():
+        owner_link = (list_by_id.get(list_id, {}).get("owner_linkedin") or "").strip()
+        if not owner_link:
+            continue
+        norm = _normalize_linkedin(owner_link)
+        if norm and norm in supporter_urls:
+            out.update(data.get("target_ids") or [])
+
+    g._targets_with_supporter_paths_cache = out
+    return out
+
+
 def _enrich_connection(target, connection, requested_set=None, my_user_id=None):
     """Format a Connection for the drawer template.
 
@@ -3073,6 +3127,11 @@ def _enrich_connection(target, connection, requested_set=None, my_user_id=None):
         "draft_plain_fallback": messages["plain_fallback"],
         "compose_subject": messages["subject"],
         "gmail_url": gmail_url,
+        # Surface the To: address as a separate field so the composeEmail JS
+        # can keep it when it rebuilds the URL (the JS calls preventDefault
+        # and constructs a fresh URL from the data-* attrs, which dropped
+        # the to= param baked into gmail_url before this field existed).
+        "compose_to": manual_to,
         "requested": is_requested,
         "intro_status": intro_status,
         "intro_status_meta": status_meta,
@@ -3213,6 +3272,14 @@ def targets_view():
         matched_ids = manual_summary["matched_target_ids"]
         targets = [t for t in targets if t.get("id") in matched_ids]
 
+    # "Supporters only" filter — narrow to targets that have at least one
+    # path through a connector on the Supporters list (own scanner or
+    # teammate scans). These are the highest-confidence intro asks.
+    supporters_only = request.args.get("supporters_only") == "1"
+    if supporters_only:
+        supporter_target_ids = _targets_with_supporter_paths()
+        targets = [t for t in targets if t.get("id") in supporter_target_ids]
+
     # Local tag filter — show only targets carrying the given user-typed
     # tag from the target_tags table. Draftboard-API tags are intentionally
     # NOT in scope here (this is the personal-overlay filter).
@@ -3307,6 +3374,8 @@ def targets_view():
         owner_filter=owner_filter,
         manual_only=manual_only,
         manual_match_total=len(manual_path_match_summary()["matched_target_ids"]),
+        supporters_only=supporters_only,
+        supporter_match_total=len(_targets_with_supporter_paths()),
         intro_status_filter=status_filter,
         intro_status_meta=INTRO_STATUS_META,
         all_tags=db_all_tags_with_counts(),
@@ -3342,6 +3411,14 @@ def accounts_view():
     if upload_date_filter:
         dated_ids = db_target_ids_with_upload_date(upload_date_filter)
         targets = [t for t in targets if t.get("id") in dated_ids]
+
+    # "Supporters only" — narrow to targets with at least one path through
+    # a Supporter-list connector. Applied at the target level pre-grouping
+    # so accounts with zero supporter-path targets disappear.
+    supporters_only = request.args.get("supporters_only") == "1"
+    if supporters_only:
+        supporter_target_ids = _targets_with_supporter_paths()
+        targets = [t for t in targets if t.get("id") in supporter_target_ids]
 
     # Intro-status filter — same semantics as targets_view (pseudo + real
     # values). Filters AT THE TARGET LEVEL pre-grouping so accounts with
@@ -3445,6 +3522,8 @@ def accounts_view():
         cache_age=cache_age_seconds(),
         owners_list=owners_list,
         owner_filter=owner_filter,
+        supporters_only=supporters_only,
+        supporter_match_total=len(_targets_with_supporter_paths()),
         intro_status_filter=status_filter,
         intro_status_meta=INTRO_STATUS_META,
         all_tags=db_all_tags_with_counts(),
@@ -3749,6 +3828,8 @@ def connections_view():
     except ValueError:
         page = 1
     PAGE_SIZE = 100
+    supporters_only = request.args.get("supporters_only") == "1"
+
     # Build manual-list-derived "connectors" first so we can include them in
     # the total count + interleave them with Draftboard connectors. Each
     # uploaded list with >=1 target match becomes one row, with the list
@@ -3780,17 +3861,42 @@ def connections_view():
             "list_label": data.get("label", ""),
         })
 
-    db_total = db_count_connectors(query=q or None)
-    total = db_total + len(manual_connectors)
-    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
-    page = min(page, total_pages)
-    offset = (page - 1) * PAGE_SIZE
+    if supporters_only:
+        # Filter both connector pools to only those whose LinkedIn URL is on
+        # the Supporters list. Need to fetch the full DB-connector pool
+        # (not just one page) because filtering after limit/offset would
+        # produce inconsistent page sizes.
+        supporter_urls = set(db_supporter_attribution_map().keys())
+        manual_connectors = [
+            m for m in manual_connectors
+            if _normalize_linkedin(m.get("linkedin") or "") in supporter_urls
+        ]
+        # 10k limit is a safe upper bound — a workspace with more than 10k
+        # distinct supporter-connectors is well beyond typical usage and
+        # would warrant a SQL-level filter anyway.
+        all_db = db_list_connectors(query=q or None, limit=10000, offset=0)
+        all_db = [
+            c for c in all_db
+            if _normalize_linkedin(c.get("linkedin") or "") in supporter_urls
+        ]
+        db_total = len(all_db)
+        total = db_total + len(manual_connectors)
+        total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+        page = min(page, total_pages)
+        offset = (page - 1) * PAGE_SIZE
+        db_connectors = all_db[offset:offset + PAGE_SIZE]
+    else:
+        db_total = db_count_connectors(query=q or None)
+        total = db_total + len(manual_connectors)
+        total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+        page = min(page, total_pages)
+        offset = (page - 1) * PAGE_SIZE
+        db_connectors = db_list_connectors(query=q or None, limit=PAGE_SIZE, offset=offset)
 
     # Manual connectors render at the BOTTOM of the list (after Draftboard
     # connectors, sorted by intro_count). With ~5 manual lists max in a
     # realistic workspace, they fit on the last page or two without
     # disrupting the existing pagination math.
-    db_connectors = db_list_connectors(query=q or None, limit=PAGE_SIZE, offset=offset)
     db_to_show = max(0, PAGE_SIZE - len(db_connectors))  # how many slots left
     if len(db_connectors) < PAGE_SIZE and len(manual_connectors) > 0:
         # Page is partially filled by Draftboard rows; pad with manual rows.
@@ -3813,6 +3919,7 @@ def connections_view():
         current_page=page,
         total_pages=total_pages,
         query=q,
+        supporters_only=supporters_only,
         me=me_for_template,
         api_key_set=bool(API_KEY),
         active="connections",

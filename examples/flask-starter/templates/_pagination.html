@@ -4,7 +4,7 @@
       Showing <strong>{{ showing_start }}</strong>–<strong>{{ showing_end }}</strong> of <strong>{{ total_count }}</strong>
     </div>
     <div class="flex items-center gap-1">
-      {% set base_qs %}{% if query %}q={{ query|urlencode }}&amp;{% endif %}{% if owner_filter %}owner={{ owner_filter }}&amp;{% endif %}{% if manual_only %}manual_only=1&amp;{% endif %}{% endset %}
+      {% set base_qs %}{% if query %}q={{ query|urlencode }}&amp;{% endif %}{% if owner_filter %}owner={{ owner_filter }}&amp;{% endif %}{% if manual_only %}manual_only=1&amp;{% endif %}{% if supporters_only %}supporters_only=1&amp;{% endif %}{% endset %}
       {% if current_page > 1 %}
         <a href="?{{ base_qs }}page={{ current_page - 1 }}"
            class="px-2 py-1 rounded border border-slate-300 bg-white hover:bg-slate-50">← Prev</a>

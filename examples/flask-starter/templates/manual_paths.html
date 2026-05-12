@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Settings — Manual paths</title>
+  <title>Settings — Import connections</title>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-50 text-slate-900 min-h-screen">
@@ -11,7 +11,7 @@
     {% include "_nav.html" %}
 
     <header class="mb-6">
-      <h1 class="text-2xl font-semibold tracking-tight">Manual paths</h1>
+      <h1 class="text-2xl font-semibold tracking-tight">Import connections</h1>
       <p class="text-sm text-slate-500 mt-1">
         Ask someone with a relevant network (an investor, advisor, etc.) to send you their LinkedIn connections export. Drop the CSV here and any contact whose LinkedIn URL matches a target in your workspace shows up as an extra path on that target's drawer — same as Draftboard-derived paths, just sourced from a list instead of from the API.
       </p>
@@ -76,7 +76,7 @@
 
     {# ---- Upload form ---- #}
     <section class="mb-8 bg-white border border-slate-200 rounded-lg shadow-sm p-5">
-      <h2 class="text-base font-semibold text-slate-900">Upload a list</h2>
+      <h2 class="text-base font-semibold text-slate-900">Import a list</h2>
       <p class="text-xs text-slate-500 mt-0.5 mb-4">
         Tell us who the list belongs to (so we can render them as the connector on matched paths) and drop the CSV.
       </p>
@@ -146,7 +146,7 @@
         <div class="pt-2">
           <button type="submit"
                   class="rounded-md bg-indigo-600 text-white px-4 py-2 text-sm font-medium hover:bg-indigo-700">
-            Upload list
+            Import list
           </button>
         </div>
       </form>
@@ -197,7 +197,7 @@
     {% endif %}
 
     <footer class="mt-10 text-xs text-slate-400 text-center">
-      Draftboard API starter · Manual paths
+      Draftboard API starter · Import connections
     </footer>
   </div>
 </body>
