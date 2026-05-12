@@ -26,6 +26,7 @@
       </div>
       <div class="flex items-center gap-3 flex-wrap">
         {% include "_owner_filter.html" %}
+        {% include "_status_filter.html" %}
         {# "Manual list match" toggle — narrows to targets that have at
            least one match in an uploaded CSV. Shown when either there are
            matches OR the user has the filter active (so they're never
@@ -127,6 +128,13 @@
                 {% endif %}
                 {% if t.status and t.status != 'new' %}
                   <span class="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded-full bg-slate-100 text-slate-600">{{ t.status }}</span>
+                {% endif %}
+                {% if t.intro_status_meta %}
+                  <span class="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full border {{ t.intro_status_meta.badge_class }}"
+                        title="Best status across paths to this target">
+                    <span>{{ t.intro_status_meta.icon }}</span>
+                    <span>{{ t.intro_status_meta.label }}</span>
+                  </span>
                 {% endif %}
               </div>
               <div class="text-xs text-slate-500 truncate">

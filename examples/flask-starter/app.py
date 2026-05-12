@@ -372,6 +372,9 @@ def _inject_globals():
         # links to /setup instead of POSTing /sync/start (which would
         # silently no-op).
         "global_api_key_set": bool(API_KEY),
+        # Status dropdown menu shares one meta dict across every connector
+        # card render — no need for every route to pass it explicitly.
+        "intro_status_meta_all": INTRO_STATUS_META,
     }
 
 # Per-field input caps for resolve endpoints. Apollo / CSE / OpenAI all reject
@@ -481,6 +484,19 @@ def init_db():
                 PRIMARY KEY (target_id, connection_id)
             )
         """)
+        # Status tracking columns (added later). Existing rows get
+        # 'requested' as the default so the legacy "Mark as requested"
+        # toggle still produces a usable status without a backfill query.
+        try:
+            conn.execute("ALTER TABLE intro_requests ADD COLUMN status TEXT NOT NULL DEFAULT 'requested'")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE intro_requests ADD COLUMN last_updated_at INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_intro_requests_status ON intro_requests(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_intro_requests_target ON intro_requests(target_id)")
         # Denormalized index: which team-member owners can intro to which target.
         # Populated alongside `connections` in db_put_connections. Lets us filter
         # the Targets/Accounts views by owner without scanning every JSON blob.
@@ -1425,8 +1441,51 @@ def db_intro_request_get(target_id, connection_id):
         return cur.fetchone() is not None
 
 
+# Six-state intro funnel. Kept compact so the UI dropdown stays usable.
+# Order matters: rollup uses the FIRST hit on this priority list for a
+# target's badge (so "intro_made" beats "requested" beats nothing).
+INTRO_STATUS_ORDER = [
+    "intro_made",          # success — intro happened
+    "in_progress",         # connector replied / intro in flight
+    "requested",           # user asked the connector, awaiting reply
+    "no_reply",            # connector ignored / gave up
+    "connector_rejected",  # connector said no
+    "prospect_rejected",   # target said no via connector
+]
+INTRO_STATUS_VALID = set(INTRO_STATUS_ORDER)
+
+# Display metadata for badges + dropdown labels. Kept in Python (not the
+# template) so the connector card + target row + filter UI all stay in
+# sync without three copies of the same dict.
+INTRO_STATUS_META = {
+    "requested":          {"label": "Requested",        "icon": "📨",
+                            "badge_class": "bg-indigo-50 text-indigo-800 border-indigo-200",
+                            "active": True},
+    "in_progress":        {"label": "In progress",      "icon": "🔄",
+                            "badge_class": "bg-blue-50 text-blue-800 border-blue-200",
+                            "active": True},
+    "intro_made":         {"label": "Intro made",       "icon": "✓",
+                            "badge_class": "bg-emerald-50 text-emerald-800 border-emerald-200",
+                            "active": False},
+    "no_reply":           {"label": "No reply",         "icon": "🤐",
+                            "badge_class": "bg-slate-50 text-slate-700 border-slate-200",
+                            "active": False},
+    "connector_rejected": {"label": "Connector passed", "icon": "✕",
+                            "badge_class": "bg-rose-50 text-rose-800 border-rose-200",
+                            "active": False},
+    "prospect_rejected":  {"label": "Prospect passed",  "icon": "✕",
+                            "badge_class": "bg-rose-50 text-rose-800 border-rose-200",
+                            "active": False},
+}
+
+
 def db_intro_request_toggle(target_id, connection_id):
-    """Toggle and return the new state (True = requested, False = cleared)."""
+    """Toggle existence of an intro request. Adds with status='requested'
+    on first call, clears the row entirely on second call. Returns the
+    new state (True = requested, False = cleared). Used by the legacy
+    'Mark as requested' button — status mutation goes through
+    db_intro_request_set_status instead."""
+    now = int(time.time())
     with _db_lock, _db_connect() as conn:
         cur = conn.execute(
             "SELECT 1 FROM intro_requests WHERE target_id = ? AND connection_id = ?",
@@ -1440,20 +1499,103 @@ def db_intro_request_toggle(target_id, connection_id):
             conn.commit()
             return False
         conn.execute(
-            "INSERT INTO intro_requests (target_id, connection_id, requested_at) VALUES (?, ?, ?)",
-            (target_id, connection_id, int(time.time())),
+            "INSERT INTO intro_requests (target_id, connection_id, requested_at, status, last_updated_at) "
+            "VALUES (?, ?, ?, 'requested', ?)",
+            (target_id, connection_id, now, now),
         )
         conn.commit()
         return True
 
 
+def db_intro_request_set_status(target_id, connection_id, status):
+    """Upsert an intro request with the given status. Returns the persisted
+    status string, or '' if the status was invalid. Marks `last_updated_at`
+    on every change so future timeline UI can show 'requested 3 days ago,
+    in progress 1 day ago'."""
+    if status not in INTRO_STATUS_VALID:
+        return ""
+    now = int(time.time())
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT 1 FROM intro_requests WHERE target_id = ? AND connection_id = ?",
+            (target_id, connection_id),
+        )
+        if cur.fetchone():
+            conn.execute(
+                "UPDATE intro_requests SET status = ?, last_updated_at = ? "
+                "WHERE target_id = ? AND connection_id = ?",
+                (status, now, target_id, connection_id),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO intro_requests (target_id, connection_id, requested_at, status, last_updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (target_id, connection_id, now, status, now),
+            )
+        conn.commit()
+    return status
+
+
+def db_intro_request_clear(target_id, connection_id):
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM intro_requests WHERE target_id = ? AND connection_id = ?",
+            (target_id, connection_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
 def db_intro_requests_for_target(target_id):
+    """{connection_id} for backwards-compat with the legacy callers that
+    only need 'is this requested at all'. Status-aware callers should use
+    db_intro_requests_status_map_for_target instead."""
     with _db_lock, _db_connect() as conn:
         cur = conn.execute(
             "SELECT connection_id FROM intro_requests WHERE target_id = ?",
             (target_id,),
         )
         return {row[0] for row in cur.fetchall()}
+
+
+def db_intro_requests_status_map_for_target(target_id):
+    """{connection_id → status} for one target. Used by the target drawer
+    so each connector card knows what to pre-select in its status dropdown."""
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT connection_id, status FROM intro_requests WHERE target_id = ?",
+            (target_id,),
+        )
+        return {row[0]: row[1] for row in cur.fetchall()}
+
+
+def db_intro_status_rollup_map() -> dict:
+    """{target_id → rollup_status} for every target with at least one
+    intro_requests row. Rollup picks the FIRST hit per INTRO_STATUS_ORDER
+    (so 'intro_made' beats 'requested'). Per-request cached in flask.g.
+    Drives the badge on the Targets/Accounts list rows."""
+    try:
+        from flask import g
+        cached = getattr(g, "_intro_status_rollup", None)
+    except RuntimeError:
+        cached = None
+        g = None
+    if cached is not None:
+        return cached
+    per_target: dict = {}
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute("SELECT target_id, status FROM intro_requests")
+        for tid, status in cur.fetchall():
+            per_target.setdefault(tid, set()).add(status)
+    out: dict = {}
+    for tid, statuses in per_target.items():
+        for s in INTRO_STATUS_ORDER:
+            if s in statuses:
+                out[tid] = s
+                break
+    if g is not None:
+        g._intro_status_rollup = out
+    return out
 
 
 # Initialize DB on import + backfill the target_owners index from existing rows.
@@ -2590,10 +2732,27 @@ def _enrich_connection(target, connection, requested_set=None, my_user_id=None):
     first = (connection.get("firstName") or "").strip()
     last = (connection.get("lastName") or "").strip()
     cid = connection.get("id")
-    if requested_set is not None:
-        is_requested = cid in requested_set
+    # Normalize the legacy `requested_set` signature.
+    if isinstance(requested_set, dict):
+        intro_status = requested_set.get(cid, "")
+    elif isinstance(requested_set, set):
+        intro_status = "requested" if cid in requested_set else ""
+    elif requested_set is None:
+        intro_status = (
+            "requested" if db_intro_request_get(target.get("id"), cid) else ""
+        )
+        if intro_status == "requested":
+            with _db_lock, _db_connect() as conn:
+                row = conn.execute(
+                    "SELECT status FROM intro_requests WHERE target_id = ? AND connection_id = ?",
+                    (target.get("id"), cid),
+                ).fetchone()
+                if row and row[0]:
+                    intro_status = row[0]
     else:
-        is_requested = db_intro_request_get(target.get("id"), cid)
+        intro_status = ""
+    is_requested = bool(intro_status)
+    status_meta = INTRO_STATUS_META.get(intro_status) if intro_status else None
 
     if my_user_id is None:
         my_user_id = get_my_owner_id()
@@ -2677,6 +2836,8 @@ def _enrich_connection(target, connection, requested_set=None, my_user_id=None):
         "compose_subject": messages["subject"],
         "gmail_url": gmail_url,
         "requested": is_requested,
+        "intro_status": intro_status,
+        "intro_status_meta": status_meta,
     }
 
 
@@ -2737,6 +2898,11 @@ def _matches_query(t, q_lower):
 
 def _enrich_target(t):
     position = t.get("position") or {}
+    # Funnel rollup — the worst-case status across this target's intro
+    # requests, picking 'intro_made' > 'in_progress' > 'requested' > the
+    # negative outcomes. Drives the badge on the Targets/Accounts list rows.
+    rollup_status = db_intro_status_rollup_map().get(t.get("id") or "", "")
+    rollup_meta = INTRO_STATUS_META.get(rollup_status) if rollup_status else None
     return {
         "id": t.get("id"),
         "name": f"{t.get('firstName') or ''} {t.get('lastName') or ''}".strip() or "(no name)",
@@ -2751,6 +2917,8 @@ def _enrich_target(t):
         "tags": t.get("tags") or [],
         "status": t.get("status") or "",
         "updated_at": t.get("updatedAt") or "",
+        "intro_status": rollup_status,
+        "intro_status_meta": rollup_meta,
     }
 
 
@@ -2791,6 +2959,25 @@ def targets_view():
         manual_summary = manual_path_match_summary()
         matched_ids = manual_summary["matched_target_ids"]
         targets = [t for t in targets if t.get("id") in matched_ids]
+
+    # Intro-status filter. Special pseudo-statuses:
+    #   "any"   → any tracked status (requested, in_progress, made, rejected)
+    #   "open"  → still in flight (requested + in_progress)
+    #   "none"  → no intro request row at all
+    # Otherwise must be a valid INTRO_STATUS value.
+    status_filter = (request.args.get("intro_status") or "").strip()
+    if status_filter:
+        rollup = db_intro_status_rollup_map()
+        if status_filter == "any":
+            targets = [t for t in targets if rollup.get(t.get("id"))]
+        elif status_filter == "open":
+            targets = [t for t in targets if rollup.get(t.get("id")) in ("requested", "in_progress")]
+        elif status_filter == "none":
+            targets = [t for t in targets if not rollup.get(t.get("id"))]
+        elif status_filter in INTRO_STATUS_VALID:
+            targets = [t for t in targets if rollup.get(t.get("id")) == status_filter]
+        else:
+            status_filter = ""
 
     # Search filter (case-insensitive substring across name/title/company/tags)
     q = (request.args.get("q") or "").strip()
@@ -2840,6 +3027,8 @@ def targets_view():
         owner_filter=owner_filter,
         manual_only=manual_only,
         manual_match_total=len(manual_path_match_summary()["matched_target_ids"]),
+        intro_status_filter=status_filter,
+        intro_status_meta=INTRO_STATUS_META,
         me=me_for_template,
     )
 
@@ -2856,6 +3045,23 @@ def accounts_view():
     if resolved_owner_id:
         owner_target_ids = db_target_ids_for_owner(resolved_owner_id)
         targets = [t for t in targets if t.get("id") in owner_target_ids]
+
+    # Intro-status filter — same semantics as targets_view (pseudo + real
+    # values). Filters AT THE TARGET LEVEL pre-grouping so accounts with
+    # zero surviving targets disappear.
+    status_filter = (request.args.get("intro_status") or "").strip()
+    if status_filter:
+        rollup = db_intro_status_rollup_map()
+        if status_filter == "any":
+            targets = [t for t in targets if rollup.get(t.get("id"))]
+        elif status_filter == "open":
+            targets = [t for t in targets if rollup.get(t.get("id")) in ("requested", "in_progress")]
+        elif status_filter == "none":
+            targets = [t for t in targets if not rollup.get(t.get("id"))]
+        elif status_filter in INTRO_STATUS_VALID:
+            targets = [t for t in targets if rollup.get(t.get("id")) == status_filter]
+        else:
+            status_filter = ""
 
     # Group by company name (case-insensitive key, preserve display case).
     # Use the manual-path metadata fallback so paste-mode-added targets with
@@ -2907,9 +3113,18 @@ def accounts_view():
     end = start + ACCOUNTS_PAGE_SIZE
     page_accounts = sorted_accounts[start:end]
 
-    # Sort each account's targets by score desc for nicer display when expanded
+    # Sort each account's targets by score desc + roll up the best intro
+    # status across them so the row gets a single funnel pill.
     for a in page_accounts:
         a["targets"].sort(key=lambda x: x["score"], reverse=True)
+        statuses = {t.get("intro_status") for t in a["targets"] if t.get("intro_status")}
+        a["intro_status"] = ""
+        a["intro_status_meta"] = None
+        for s in INTRO_STATUS_ORDER:
+            if s in statuses:
+                a["intro_status"] = s
+                a["intro_status_meta"] = INTRO_STATUS_META.get(s)
+                break
 
     # Auto-start background sync of per-target connections.
     maybe_auto_start_sync(targets)
@@ -2933,6 +3148,8 @@ def accounts_view():
         cache_age=cache_age_seconds(),
         owners_list=owners_list,
         owner_filter=owner_filter,
+        intro_status_filter=status_filter,
+        intro_status_meta=INTRO_STATUS_META,
         me=me_for_template,
     )
 
@@ -3060,8 +3277,8 @@ def target_drawer(target_id):
     # + template, so they're indistinguishable in the UI except for score=0.
     connections = list(connections) + manual_paths_for_target(target)
     connections.sort(key=lambda c: c.get("score") or 0, reverse=True)
-    requested_set = db_intro_requests_for_target(target_id)
-    enriched_conns = [_enrich_connection(target, c, requested_set) for c in connections]
+    status_map = db_intro_requests_status_map_for_target(target_id)
+    enriched_conns = [_enrich_connection(target, c, status_map) for c in connections]
 
     return render_template(
         "_drawer_target.html",
@@ -3078,8 +3295,8 @@ def _connectors_panel_for_target(target):
     connections, error = fetch_target_connections(target_id)
     connections = list(connections) + manual_paths_for_target(target)
     connections.sort(key=lambda c: c.get("score") or 0, reverse=True)
-    requested_set = db_intro_requests_for_target(target_id)
-    enriched = [_enrich_connection(target, c, requested_set) for c in connections]
+    status_map = db_intro_requests_status_map_for_target(target_id)
+    enriched = [_enrich_connection(target, c, status_map) for c in connections]
     return {
         "target": _enrich_target(target),
         "target_id": target_id,
@@ -3158,6 +3375,29 @@ def toggle_intro_request():
         return jsonify({"error": "missing target_id or connection_id"}), 400
     new_state = db_intro_request_toggle(target_id, connection_id)
     return jsonify({"requested": new_state})
+
+
+@app.route("/intro_requests/status", methods=["POST"])
+def set_intro_request_status():
+    """Set the status for an intro request. Empty status clears the row
+    (treats this like 'unmark requested'). Returns the persisted status
+    so the front-end can re-render the dropdown without a reload."""
+    sec_site = request.headers.get("Sec-Fetch-Site")
+    if sec_site and sec_site not in ("same-origin", "none"):
+        return jsonify({"error": "cross-site request blocked"}), 403
+    data = request.get_json(silent=True) or {}
+    target_id = data.get("target_id")
+    connection_id = data.get("connection_id")
+    status = (data.get("status") or "").strip()
+    if not target_id or not connection_id:
+        return jsonify({"error": "missing target_id or connection_id"}), 400
+    if not status:
+        cleared = db_intro_request_clear(target_id, connection_id)
+        return jsonify({"ok": True, "status": "", "cleared": cleared})
+    if status not in INTRO_STATUS_VALID:
+        return jsonify({"error": f"invalid status '{status}'"}), 400
+    persisted = db_intro_request_set_status(target_id, connection_id, status)
+    return jsonify({"ok": True, "status": persisted})
 
 
 @app.route("/connections", methods=["GET"])

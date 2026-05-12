@@ -89,6 +89,53 @@
     </ul>
   {% endif %}
 
+  {# Intro status control. Single dropdown: current status + options to
+     change/clear. Per-card persistent (saved on click). target_id comes
+     from the including page; c.id is the connection id. #}
+  {% if target_id and c.id %}
+    <div class="mb-3 relative inline-block" data-no-drawer data-status-control
+         data-target-id="{{ target_id }}" data-connection-id="{{ c.id }}">
+      <button type="button" onclick="toggleStatusMenu(event, this)"
+              data-status-trigger
+              class="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full border
+                     {% if c.intro_status_meta %}{{ c.intro_status_meta.badge_class }}{% else %}bg-slate-50 text-slate-500 border-slate-200 border-dashed hover:bg-slate-100{% endif %}">
+        {% if c.intro_status_meta %}
+          <span>{{ c.intro_status_meta.icon }}</span>
+          <span>{{ c.intro_status_meta.label }}</span>
+        {% else %}
+          <span>+ Mark status</span>
+        {% endif %}
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-2.5 h-2.5"><path d="M7 10l5 5 5-5z"/></svg>
+      </button>
+      <ul data-status-menu
+          class="hidden absolute left-0 mt-1 w-52 bg-white border border-slate-200 rounded-md shadow-lg z-30 py-1">
+        {% for key, meta in intro_status_meta_all.items() %}
+          <li>
+            <button type="button"
+                    onclick="setIntroStatus(this, '{{ key }}')"
+                    class="w-full text-left flex items-center gap-2 px-3 py-1.5 text-xs hover:bg-slate-50 {% if c.intro_status == key %}font-semibold{% endif %}">
+              <span class="inline-flex items-center justify-center w-4 h-4 rounded-full border {{ meta.badge_class }} text-[10px]">{{ meta.icon }}</span>
+              <span>{{ meta.label }}</span>
+              {% if c.intro_status == key %}
+                <span class="ml-auto text-[10px] text-slate-400">current</span>
+              {% endif %}
+            </button>
+          </li>
+        {% endfor %}
+        {% if c.intro_status %}
+          <li class="border-t border-slate-100 mt-1 pt-1">
+            <button type="button"
+                    onclick="setIntroStatus(this, '')"
+                    class="w-full text-left flex items-center gap-2 px-3 py-1.5 text-xs text-rose-700 hover:bg-rose-50">
+              <span>×</span>
+              <span>Clear status</span>
+            </button>
+          </li>
+        {% endif %}
+      </ul>
+    </div>
+  {% endif %}
+
   <details class="mt-2" data-draft="{{ c.draft_message }}">
     <summary class="text-xs text-indigo-600 cursor-pointer hover:underline select-none">
       Draft intro request message
