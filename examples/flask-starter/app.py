@@ -3073,6 +3073,11 @@ def _enrich_connection(target, connection, requested_set=None, my_user_id=None):
         "draft_plain_fallback": messages["plain_fallback"],
         "compose_subject": messages["subject"],
         "gmail_url": gmail_url,
+        # Surface the To: address as a separate field so the composeEmail JS
+        # can keep it when it rebuilds the URL (the JS calls preventDefault
+        # and constructs a fresh URL from the data-* attrs, which dropped
+        # the to= param baked into gmail_url before this field existed).
+        "compose_to": manual_to,
         "requested": is_requested,
         "intro_status": intro_status,
         "intro_status_meta": status_meta,

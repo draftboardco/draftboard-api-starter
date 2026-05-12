@@ -155,10 +155,14 @@
     var plainBody = link.getAttribute('data-plain-body') || '';
     var htmlBody = link.getAttribute('data-html-body') || '';
     var fallbackBody = link.getAttribute('data-fallback-body') || plainBody;
+    var toAddr = link.getAttribute('data-to') || '';
 
-    // Always open Gmail with the plain-text body in the URL.
+    // Always open Gmail with the plain-text body in the URL. Include the To:
+    // when the connection has an email plumbed through (manual-path rows
+    // carry the list owner's email as `_manual_list_email` → `compose_to`).
     var params = 'view=cm&fs=1&su=' + encodeURIComponent(subject) +
                  '&body=' + encodeURIComponent(fallbackBody);
+    if (toAddr) params += '&to=' + encodeURIComponent(toAddr);
     window.open('https://mail.google.com/mail/?' + params, '_blank');
 
     // Try to copy the HTML version to clipboard as an optional upgrade.
