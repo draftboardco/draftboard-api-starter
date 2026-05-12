@@ -813,6 +813,24 @@ def init_db():
                 error TEXT
             )
         """)
+
+        # Sample-data marker. Added idempotently across the tables our
+        # sample_data module populates. `_is_sample = 1` rows are scoped
+        # data the seeder owns; the clearer deletes them with WHERE
+        # _is_sample = 1 on the first real-API write to targets_cache.
+        # See sample_data.py for the full lifecycle.
+        for _t in (
+            "targets_cache", "connections", "connector_paths",
+            "discovered_paths", "manual_path_lists", "manual_path_connections",
+            "intro_requests", "target_tags",
+            "teammate_contacts", "linkedin_resolutions",
+        ):
+            try:
+                conn.execute(f"ALTER TABLE {_t} ADD COLUMN _is_sample INTEGER NOT NULL DEFAULT 0")
+            except sqlite3.OperationalError:
+                # Column already exists — fine on subsequent boots.
+                pass
+
         conn.commit()
 
 
@@ -1128,6 +1146,18 @@ def db_save_targets_cache(targets):
     tag IDs that weren't already in targets_cache."""
     if not targets:
         return
+    # First real-API write — clear sample data if it's still in the DB.
+    # We treat any successful save with at least one target as the signal
+    # the user has set up an API key and a real sync ran. Sample rows get
+    # surgically deleted (scoped WHERE _is_sample=1), then sample_data_cleared
+    # is set so the banner can render once on the next /targets render.
+    if db_app_state_get("sample_data_cleared") != "1":
+        try:
+            import sample_data as _sample_data
+            _sample_data.clear_sample_data(_db_connect, _db_lock, db_app_state_set)
+            print("[draftboard-starter] Cleared sample data after first real sync")
+        except Exception as _e:
+            print(f"[draftboard-starter] Sample data clear failed (continuing): {_e}")
     import datetime as _dt
     now = int(time.time())
     today_str = _dt.datetime.now().strftime("%Y-%m-%d")
@@ -1804,6 +1834,20 @@ def db_target_ids_with_upload_date(date_str: str) -> set:
 init_db()
 backfill_target_owners()
 backfill_connector_paths()
+
+# Sample data — on a fresh install (empty targets_cache, never seeded,
+# never cleared, env opt-out not set), populate the workspace with ~100
+# plausible targets + 40 connectors so first-run users have something to
+# explore. Cleared automatically the first time real API data lands.
+try:
+    import sample_data as _sample_data
+    if _sample_data.should_seed(_db_connect, _db_lock, db_app_state_get):
+        _inserted = _sample_data.load_sample_data(_db_connect, _db_lock, db_app_state_set)
+        print(f"[draftboard-starter] Loaded sample data: {_inserted}")
+except Exception as _e:
+    # Don't let a bug in the sample seeder break the boot. Log and
+    # continue with an empty workspace — that's a worse UX but not broken.
+    print(f"[draftboard-starter] Sample data load failed (continuing): {_e}")
 
 
 def _migrate_slack_channel_name_strip_hash():
@@ -3135,6 +3179,12 @@ def _enrich_connection(target, connection, requested_set=None, my_user_id=None):
         "requested": is_requested,
         "intro_status": intro_status,
         "intro_status_meta": status_meta,
+        # Sample-data passthrough. The connector card renders the SAMPLE
+        # watermark when this is True (CSS lives in _drawer_skeleton.html).
+        # `_manual_list_is_sample` is set by manual_paths_for_target when
+        # the matched list has _is_sample=1; for API connections we check
+        # the connector_paths row separately at the call site.
+        "is_sample": bool(connection.get("_manual_list_is_sample") or connection.get("_is_sample")),
     }
 
 
@@ -3384,6 +3434,19 @@ def targets_view():
         upload_date_filter=upload_date_filter,
         sort_by=sort_by,
         me=me_for_template,
+        # One-time banner state: shown after the sample data was cleared
+        # by the first real-API sync, until the user dismisses it.
+        show_sample_cleared_banner=(
+            db_app_state_get("sample_data_cleared") == "1"
+            and db_app_state_get("sample_clear_banner_dismissed") != "1"
+        ),
+        # Also let the template render an "is sample data" subtle indicator
+        # on the page header during the seeded phase so first-run users
+        # know what they're looking at.
+        sample_data_active=(
+            db_app_state_get("sample_data_seeded") == "1"
+            and db_app_state_get("sample_data_cleared") != "1"
+        ),
     )
 
 
@@ -5809,7 +5872,7 @@ def manual_paths_for_target(target: dict) -> list[dict]:
             "SELECT l.id, l.label, l.owner_first, l.owner_last, l.owner_email, "
             "       l.owner_title, l.owner_company, l.owner_linkedin, l.uploaded_at, "
             "       c.id, c.first_name, c.last_name, c.email, c.company, c.position, "
-            "       c.connected_on, c.linkedin_url "
+            "       c.connected_on, c.linkedin_url, l._is_sample "
             "FROM manual_path_connections c "
             "JOIN manual_path_lists l ON c.list_id = l.id "
             "WHERE c.linkedin_url_normalized = ?",
@@ -5817,7 +5880,8 @@ def manual_paths_for_target(target: dict) -> list[dict]:
         )
         for row in cur.fetchall():
             (lid, label, of, ol, oe, ot, oc, olu, uploaded_at,
-             cid, _cf, _cl, _ce, c_company, c_position, connected_on, _curl) = row
+             cid, _cf, _cl, _ce, c_company, c_position, connected_on, _curl,
+             list_is_sample) = row
             uploaded_str = time.strftime("%Y-%m-%d", time.localtime(uploaded_at)) if uploaded_at else ""
             details = []
             label_text = label or f"{of} {ol}".strip() or "your manual list"
@@ -5847,6 +5911,9 @@ def manual_paths_for_target(target: dict) -> list[dict]:
                 # not required by Connection schema but read by enricher.
                 "_manual_list_email": oe or "",
                 "_manual_list_id": lid,
+                # Sample-data flag from the list — propagates to is_sample on
+                # the enriched connection so the SAMPLE watermark renders.
+                "_manual_list_is_sample": bool(list_is_sample),
             })
     return out
 
@@ -7074,6 +7141,19 @@ def supporters_categorize_all():
         "by_category": by_category,
         "use_llm": use_llm,
     })
+
+
+@app.route("/sample-data/dismiss-banner", methods=["POST"])
+def sample_data_dismiss_banner():
+    """One-time: mark the "Your real Draftboard data is loaded" banner
+    dismissed. Renders on /targets after the sample data was auto-cleared
+    by the first real-API sync. Sec-Fetch-Site guarded like the other
+    state-mutating routes."""
+    sec_site = request.headers.get("Sec-Fetch-Site")
+    if sec_site and sec_site not in ("same-origin", "none"):
+        return jsonify({"error": "cross-site form submission blocked"}), 403
+    db_app_state_set("sample_clear_banner_dismissed", "1")
+    return redirect(url_for("targets_view"))
 
 
 @app.route("/candidates/status", methods=["POST"])

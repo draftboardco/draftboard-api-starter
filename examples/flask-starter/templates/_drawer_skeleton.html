@@ -1,3 +1,28 @@
+<style>
+  /* SAMPLE watermark — diagonal "SAMPLE" text behind any connector card
+     flagged is-sample (set by _enrich_connection when the underlying
+     connection row was inserted by the sample-data seeder). 7% opacity
+     so it's clearly visible without competing with the real card
+     content. CSS lives here so it's emitted once per page instead of
+     once per card include. */
+  article.is-sample { position: relative; overflow: hidden; }
+  article.is-sample::before {
+    content: "SAMPLE";
+    position: absolute;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%) rotate(-22deg);
+    font-size: 5rem;
+    font-weight: 800;
+    letter-spacing: 0.15em;
+    color: rgba(15, 23, 42, 0.07);
+    pointer-events: none;
+    z-index: 0;
+    white-space: nowrap;
+    text-transform: uppercase;
+  }
+  article.is-sample > * { position: relative; z-index: 1; }
+</style>
+
 <!-- Drawer + backdrop. Hidden by default; shown by openDrawer(url) JS. -->
 <div id="drawer-backdrop" class="hidden fixed inset-0 bg-black/30 z-40 transition-opacity"
      onclick="closeDrawer()"></div>
