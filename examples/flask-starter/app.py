@@ -1144,13 +1144,14 @@ def db_save_targets_cache(targets):
     'upload_date') so the Upload date filter has something to slice on.
     Re-saving an existing target preserves its original date — we only
     tag IDs that weren't already in targets_cache."""
-    if not targets:
-        return
     # First real-API write — clear sample data if it's still in the DB.
-    # We treat any successful save with at least one target as the signal
-    # the user has set up an API key and a real sync ran. Sample rows get
-    # surgically deleted (scoped WHERE _is_sample=1), then sample_data_cleared
-    # is set so the banner can render once on the next /targets render.
+    # The signal is "a successful API sync just happened", not "the sync
+    # returned ≥1 target" (a new Draftboard account with an empty workspace
+    # still needs the sample workspace cleared — otherwise they see fake
+    # data on top of their real-but-empty account and assume the kit is
+    # broken). Sample rows get surgically deleted (scoped WHERE
+    # _is_sample=1), then sample_data_cleared is set so the banner renders
+    # once on the next /targets render.
     if db_app_state_get("sample_data_cleared") != "1":
         try:
             import sample_data as _sample_data
@@ -1158,6 +1159,8 @@ def db_save_targets_cache(targets):
             print("[draftboard-starter] Cleared sample data after first real sync")
         except Exception as _e:
             print(f"[draftboard-starter] Sample data clear failed (continuing): {_e}")
+    if not targets:
+        return
     import datetime as _dt
     now = int(time.time())
     today_str = _dt.datetime.now().strftime("%Y-%m-%d")

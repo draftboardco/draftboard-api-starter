@@ -743,7 +743,11 @@ def should_seed(db_connect, db_lock, db_app_state_get) -> bool:
     4. `targets_cache` has zero rows (no real data).
     """
     import os
-    if os.environ.get("LOAD_SAMPLE_DATA") == "0":
+    # Accept any common falsy spelling, not just literal "0". A customer
+    # setting `LOAD_SAMPLE_DATA=false` (or `no` / `off` / `False`) on their
+    # public-internet VPS to skip the seed shouldn't get sample data
+    # because their env var didn't happen to match a single magic string.
+    if os.environ.get("LOAD_SAMPLE_DATA", "").strip().lower() in ("0", "false", "no", "off"):
         return False
     if db_app_state_get("sample_data_seeded") == "1":
         return False
