@@ -35,6 +35,7 @@
           {% if tag_filter %}<input type="hidden" name="tag" value="{{ tag_filter }}">{% endif %}
           {% if intro_status_filter %}<input type="hidden" name="intro_status" value="{{ intro_status_filter }}">{% endif %}
           {% if manual_only %}<input type="hidden" name="manual_only" value="1">{% endif %}
+          {% if supporters_only %}<input type="hidden" name="supporters_only" value="1">{% endif %}
           <label class="inline-flex items-center gap-2 text-xs">
             <span class="text-slate-500">Sort:</span>
             <select name="sort" onchange="this.form.submit()"
@@ -50,16 +51,34 @@
            stranded with a filter they can't clear via the UI). #}
         {% if manual_match_total or manual_only %}
           {% if manual_only %}
-            <a href="/{% if query %}?q={{ query|urlencode }}{% endif %}{% if owner_filter %}{{ '&' if query else '?' }}owner={{ owner_filter }}{% endif %}"
+            <a href="/{% if query %}?q={{ query|urlencode }}{% endif %}{% if owner_filter %}{{ '&' if query else '?' }}owner={{ owner_filter }}{% endif %}{% if supporters_only %}{{ '&' if (query or owner_filter) else '?' }}supporters_only=1{% endif %}"
                class="text-xs px-3 py-1.5 rounded-md bg-purple-600 text-white hover:bg-purple-700"
                title="Currently filtering to targets with manual-list matches. Click to clear.">
               ✓ Manual matches only ({{ manual_match_total }}) ✕
             </a>
           {% else %}
-            <a href="/?manual_only=1{% if query %}&q={{ query|urlencode }}{% endif %}{% if owner_filter %}&owner={{ owner_filter }}{% endif %}"
+            <a href="/?manual_only=1{% if query %}&q={{ query|urlencode }}{% endif %}{% if owner_filter %}&owner={{ owner_filter }}{% endif %}{% if supporters_only %}&supporters_only=1{% endif %}"
                class="text-xs px-3 py-1.5 rounded-md border border-purple-300 bg-purple-50 text-purple-800 hover:bg-purple-100"
                title="Show only targets with at least one manual-list match.">
               📇 Manual matches ({{ manual_match_total }})
+            </a>
+          {% endif %}
+        {% endif %}
+        {# "Supporters only" toggle — narrows to targets with at least one
+           path through a connector flagged as a Supporter (own scanner or
+           teammate scans). Same show-when-relevant rule as manual matches. #}
+        {% if supporter_match_total or supporters_only %}
+          {% if supporters_only %}
+            <a href="/{% if query %}?q={{ query|urlencode }}{% endif %}{% if owner_filter %}{{ '&' if query else '?' }}owner={{ owner_filter }}{% endif %}{% if manual_only %}{{ '&' if (query or owner_filter) else '?' }}manual_only=1{% endif %}"
+               class="text-xs px-3 py-1.5 rounded-md bg-amber-600 text-white hover:bg-amber-700"
+               title="Currently filtering to targets with supporter paths. Click to clear.">
+              ⭐ Supporters only ({{ supporter_match_total }}) ✕
+            </a>
+          {% else %}
+            <a href="/?supporters_only=1{% if query %}&q={{ query|urlencode }}{% endif %}{% if owner_filter %}&owner={{ owner_filter }}{% endif %}{% if manual_only %}&manual_only=1{% endif %}"
+               class="text-xs px-3 py-1.5 rounded-md border border-amber-300 bg-amber-50 text-amber-800 hover:bg-amber-100"
+               title="Show only targets with at least one path through a Supporter.">
+              ⭐ Supporters ({{ supporter_match_total }})
             </a>
           {% endif %}
         {% endif %}
@@ -68,7 +87,7 @@
             cached {{ cache_age }}s ago
           </span>
         {% endif %}
-        <a href="/?refresh=1{% if query %}&q={{ query|urlencode }}{% endif %}{% if owner_filter %}&owner={{ owner_filter }}{% endif %}{% if manual_only %}&manual_only=1{% endif %}"
+        <a href="/?refresh=1{% if query %}&q={{ query|urlencode }}{% endif %}{% if owner_filter %}&owner={{ owner_filter }}{% endif %}{% if manual_only %}&manual_only=1{% endif %}{% if supporters_only %}&supporters_only=1{% endif %}"
            class="text-xs px-3 py-1.5 rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">
           Refresh
         </a>

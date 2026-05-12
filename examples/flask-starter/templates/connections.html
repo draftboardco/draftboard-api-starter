@@ -31,12 +31,32 @@
         <input type="search" name="q" value="{{ query or '' }}"
                placeholder="Search connectors by name, title, or company..."
                class="w-full rounded-md border border-slate-300 bg-white px-3 py-2 pr-20 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500" />
+        {% if supporters_only %}<input type="hidden" name="supporters_only" value="1">{% endif %}
         <button type="submit"
                 class="absolute right-1 top-1 bottom-1 px-3 text-xs rounded bg-slate-900 text-white hover:bg-slate-700">
           Search
         </button>
       </div>
     </form>
+
+    {# "Supporters only" toggle — narrows to connectors flagged as Supporters
+       (own scanner or teammate scans). Same UX + color as the targets/
+       accounts page chip. #}
+    <div class="mb-4 flex items-center gap-3 flex-wrap">
+      {% if supporters_only %}
+        <a href="/connections{% if query %}?q={{ query|urlencode }}{% endif %}"
+           class="text-xs px-3 py-1.5 rounded-md bg-amber-600 text-white hover:bg-amber-700"
+           title="Currently filtering to Supporter connectors only. Click to clear.">
+          ⭐ Supporters only ✕
+        </a>
+      {% else %}
+        <a href="/connections?supporters_only=1{% if query %}&q={{ query|urlencode }}{% endif %}"
+           class="text-xs px-3 py-1.5 rounded-md border border-amber-300 bg-amber-50 text-amber-800 hover:bg-amber-100"
+           title="Show only connectors flagged as Supporters.">
+          ⭐ Supporters
+        </a>
+      {% endif %}
+    </div>
 
     {% if not api_key_set %}
       <div class="mb-6 rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
