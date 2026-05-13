@@ -4428,7 +4428,7 @@ def sync_stop():
 # user with email X granted access to client Y — standard OAuth telemetry.
 
 GOOGLE_SCOPES = [
-    "https://www.googleapis.com/auth/gmail.metadata",
+    "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/calendar.readonly",
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
@@ -4696,28 +4696,20 @@ def fetch_gmail_threads(creds, my_email, days=GOOGLE_HISTORY_DAYS, cap=GOOGLE_TH
     """Pull up to `cap` threads from the last `days` days, return per-contact stats."""
     service = _google_build("gmail", "v1", credentials=creds, cache_discovery=False)
     me = (my_email or "").lower()
-    cutoff_ts = int(time.time()) - days * 86400
 
-    # gmail.metadata scope rejects the `q` parameter, so we list by labelIds
-    # (INBOX + SENT covers all bidirectional + outbound activity) and apply the
-    # date cutoff client-side after fetching each thread's metadata.
     thread_ids = []
-    seen = set()
-    for label in ("INBOX", "SENT"):
-        page_token = None
-        while len(thread_ids) < cap:
-            page_size = min(500, cap - len(thread_ids))
-            resp = service.users().threads().list(
-                userId="me", labelIds=[label], maxResults=page_size, pageToken=page_token
-            ).execute()
-            for t in resp.get("threads", []) or []:
-                tid = t["id"]
-                if tid not in seen:
-                    seen.add(tid)
-                    thread_ids.append(tid)
-            page_token = resp.get("nextPageToken")
-            if not page_token:
-                break
+    page_token = None
+    q = f"newer_than:{days}d"
+    while len(thread_ids) < cap:
+        page_size = min(500, cap - len(thread_ids))
+        resp = service.users().threads().list(
+            userId="me", q=q, maxResults=page_size, pageToken=page_token
+        ).execute()
+        for t in resp.get("threads", []) or []:
+            thread_ids.append(t["id"])
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
 
     contacts = {}
     total = len(thread_ids)
@@ -4767,11 +4759,6 @@ def fetch_gmail_threads(creds, my_email, days=GOOGLE_HISTORY_DAYS, cap=GOOGLE_TH
                     rec["sent_by_me"] += 1
                 elif em == sender_email:
                     rec["replies"] += 1
-
-        if most_recent_ts < cutoff_ts:
-            if progress_cb and (i + 1) % 25 == 0:
-                progress_cb(i + 1, total)
-            continue
 
         for em, rec in thread_contacts.items():
             agg = contacts.setdefault(em, {
