@@ -3289,6 +3289,14 @@ def _enrich_target(t):
 
 @app.route("/", methods=["GET"])
 def targets_view():
+    # First-run wizard gate: brand-new install hits the welcome flow before
+    # anything else (the wizard orients the user, points them at the sample
+    # data, and funnels them through /setup as step 3). Once they've
+    # finished or skipped, welcome_wizard_done=1 and this redirect stops
+    # firing — the existing /setup behavior takes over for any later
+    # "no API key" states.
+    if db_app_state_get("welcome_wizard_done") != "1":
+        return redirect(url_for("welcome_view"))
     # First-run nudge: brand-new install with no API key gets bounced to
     # /setup so they have a paste field instead of an empty Targets page.
     # The "Continue" action on /setup writes setup_dismissed in app_state.
@@ -6369,6 +6377,11 @@ def setup_save_api_key():
         db_app_state_set("me_data", json.dumps(_flatten_me_payload(payload)))
     except (TypeError, ValueError):
         pass
+    # Wizard hand-off: if the API-key form was rendered from inside the
+    # welcome wizard, return the user to the wizard on step 4 (first sync)
+    # rather than the standalone /setup landing.
+    if request.form.get("from_wizard") == "1":
+        return redirect(url_for("welcome_view", step="4"))
     return redirect(url_for("setup_view"))
 
 
@@ -6435,6 +6448,119 @@ def setup_dismiss():
     time via the nav link to manage integrations."""
     db_app_state_set("setup_dismissed", str(int(time.time())))
     return redirect(url_for("targets_view"))
+
+
+# ---------------------------------------------------------------------------
+# Welcome wizard
+# ---------------------------------------------------------------------------
+# 4-step first-run flow that orients new users before they paste an API
+# key. Step 1: what the product does. Step 2: tour the sample data we
+# pre-loaded. Step 3: connect their Draftboard account (embeds the
+# /setup/api-key form with from_wizard=1). Step 4: trigger first sync.
+#
+# Persistence: welcome_wizard_done='1' set on completion OR skip.
+# welcome_wizard_step holds the last step (used to resume on revisit).
+# The targets_view redirects to /welcome when done is unset, so users
+# land in the wizard on first /  visit. Direct visits to /welcome at
+# any time re-show the wizard (e.g., from a Settings entry point later).
+
+_WELCOME_VALID_STEPS = ("1", "2", "3", "4")
+
+
+def _welcome_redirect_target() -> str:
+    """Where to send the user after the wizard ends. If an API key is
+    configured, go straight to / (real data). Otherwise still /, where
+    they'll see the sample workspace + setup nudges."""
+    return url_for("targets_view")
+
+
+@app.route("/welcome", methods=["GET"])
+def welcome_view():
+    """Render the wizard. `?step=N` overrides the persisted step. Defaults
+    to step 1 on first visit, or the saved step on resume."""
+    requested = (request.args.get("step") or "").strip()
+    if requested in _WELCOME_VALID_STEPS:
+        step = requested
+    else:
+        step = db_app_state_get("welcome_wizard_step") or "1"
+        if step not in _WELCOME_VALID_STEPS:
+            step = "1"
+    # Persist the step so a refresh / reopen drops back here.
+    db_app_state_set("welcome_wizard_step", step)
+    api_key_set = bool(_current_api_key())
+    sample_data_active = (
+        db_app_state_get("sample_data_seeded") == "1"
+        and db_app_state_get("sample_data_cleared") != "1"
+    )
+    return render_template(
+        "welcome.html",
+        step=step,
+        api_key_set=api_key_set,
+        sample_data_active=sample_data_active,
+        api_key_error=request.args.get("api_key_error", ""),
+        active="welcome",
+    )
+
+
+@app.route("/welcome/next", methods=["POST"])
+def welcome_next():
+    """Advance to the next step. Caps at 4."""
+    sec_site = request.headers.get("Sec-Fetch-Site")
+    if sec_site and sec_site not in ("same-origin", "none"):
+        return jsonify({"error": "cross-site form submission blocked"}), 403
+    cur = db_app_state_get("welcome_wizard_step") or "1"
+    try:
+        next_step = min(int(cur) + 1, 4)
+    except ValueError:
+        next_step = 2
+    db_app_state_set("welcome_wizard_step", str(next_step))
+    return redirect(url_for("welcome_view", step=str(next_step)))
+
+
+@app.route("/welcome/prev", methods=["POST"])
+def welcome_prev():
+    """Step backward. Floors at 1."""
+    sec_site = request.headers.get("Sec-Fetch-Site")
+    if sec_site and sec_site not in ("same-origin", "none"):
+        return jsonify({"error": "cross-site form submission blocked"}), 403
+    cur = db_app_state_get("welcome_wizard_step") or "1"
+    try:
+        prev_step = max(int(cur) - 1, 1)
+    except ValueError:
+        prev_step = 1
+    db_app_state_set("welcome_wizard_step", str(prev_step))
+    return redirect(url_for("welcome_view", step=str(prev_step)))
+
+
+@app.route("/welcome/finish", methods=["POST"])
+def welcome_finish():
+    """End the wizard — either via the explicit Done button on step 4 OR
+    via Skip on any step. The `skipped` form field distinguishes the two
+    so future analytics / re-prompts can tell the difference."""
+    sec_site = request.headers.get("Sec-Fetch-Site")
+    if sec_site and sec_site not in ("same-origin", "none"):
+        return jsonify({"error": "cross-site form submission blocked"}), 403
+    db_app_state_set("welcome_wizard_done", "1")
+    if request.form.get("skipped") == "1":
+        db_app_state_set("welcome_wizard_skipped", "1")
+    return redirect(_welcome_redirect_target())
+
+
+@app.route("/welcome/restart", methods=["POST"])
+def welcome_restart():
+    """Re-open the wizard from step 1. Clears the done / skipped flags so
+    the redirect from / fires again. Useful as a 'Tour again' entry
+    point from settings or a help menu."""
+    sec_site = request.headers.get("Sec-Fetch-Site")
+    if sec_site and sec_site not in ("same-origin", "none"):
+        return jsonify({"error": "cross-site form submission blocked"}), 403
+    with _db_lock, _db_connect() as conn:
+        conn.execute(
+            "DELETE FROM app_state WHERE key IN (?, ?, ?)",
+            ("welcome_wizard_done", "welcome_wizard_skipped", "welcome_wizard_step"),
+        )
+        conn.commit()
+    return redirect(url_for("welcome_view", step="1"))
 
 
 @app.route("/settings/google", methods=["GET"])
