@@ -4428,7 +4428,7 @@ def sync_stop():
 # user with email X granted access to client Y — standard OAuth telemetry.
 
 GOOGLE_SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.metadata",
     "https://www.googleapis.com/auth/calendar.readonly",
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
@@ -4696,20 +4696,28 @@ def fetch_gmail_threads(creds, my_email, days=GOOGLE_HISTORY_DAYS, cap=GOOGLE_TH
     """Pull up to `cap` threads from the last `days` days, return per-contact stats."""
     service = _google_build("gmail", "v1", credentials=creds, cache_discovery=False)
     me = (my_email or "").lower()
+    cutoff_ts = int(time.time()) - days * 86400
 
+    # gmail.metadata scope rejects the `q` parameter, so we list by labelIds
+    # (INBOX + SENT covers all bidirectional + outbound activity) and apply the
+    # date cutoff client-side after fetching each thread's metadata.
     thread_ids = []
-    page_token = None
-    q = f"newer_than:{days}d"
-    while len(thread_ids) < cap:
-        page_size = min(500, cap - len(thread_ids))
-        resp = service.users().threads().list(
-            userId="me", q=q, maxResults=page_size, pageToken=page_token
-        ).execute()
-        for t in resp.get("threads", []) or []:
-            thread_ids.append(t["id"])
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
+    seen = set()
+    for label in ("INBOX", "SENT"):
+        page_token = None
+        while len(thread_ids) < cap:
+            page_size = min(500, cap - len(thread_ids))
+            resp = service.users().threads().list(
+                userId="me", labelIds=[label], maxResults=page_size, pageToken=page_token
+            ).execute()
+            for t in resp.get("threads", []) or []:
+                tid = t["id"]
+                if tid not in seen:
+                    seen.add(tid)
+                    thread_ids.append(tid)
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
 
     contacts = {}
     total = len(thread_ids)
@@ -4759,6 +4767,11 @@ def fetch_gmail_threads(creds, my_email, days=GOOGLE_HISTORY_DAYS, cap=GOOGLE_TH
                     rec["sent_by_me"] += 1
                 elif em == sender_email:
                     rec["replies"] += 1
+
+        if most_recent_ts < cutoff_ts:
+            if progress_cb and (i + 1) % 25 == 0:
+                progress_cb(i + 1, total)
+            continue
 
         for em, rec in thread_contacts.items():
             agg = contacts.setdefault(em, {
@@ -6325,15 +6338,26 @@ def setup_save_api_key():
 
     pasted = (request.form.get("api_key") or "").strip()
     save_unverified = request.form.get("save_unverified") == "1"
+    from_wizard = request.form.get("from_wizard") == "1"
+
+    def _api_key_redirect(**kwargs):
+        """Mirror the success hand-off: errors that came from the wizard
+        form route back to /welcome?step=3 with the same query args the
+        wizard template already renders. Without this, every validation
+        error in setup_save_api_key dumps the user from the wizard onto
+        the standalone /setup page mid-flow."""
+        if from_wizard:
+            return redirect(url_for("welcome_view", step="3", **kwargs))
+        return redirect(url_for("setup_view", **kwargs))
 
     if not pasted:
-        return redirect(url_for("setup_view", api_key_error="empty"))
+        return _api_key_redirect(api_key_error="empty")
     if not pasted.startswith("db-api_"):
         # Cheap shape check — Draftboard keys all start with this prefix.
         # Saves a round-trip when the user pastes something obviously wrong.
-        return redirect(url_for("setup_view", api_key_error="bad_shape"))
+        return _api_key_redirect(api_key_error="bad_shape")
     if len(pasted) > 256:
-        return redirect(url_for("setup_view", api_key_error="too_long"))
+        return _api_key_redirect(api_key_error="too_long")
 
     def _persist_and_check_override(persist_key):
         """Write the key, refresh cache, then verify _load_api_key would
@@ -6350,27 +6374,27 @@ def setup_save_api_key():
         # Network failed earlier; user explicitly chose to save anyway.
         override = _persist_and_check_override(pasted)
         if override:
-            return redirect(url_for(
-                "setup_view", api_key_error="env_override",
+            return _api_key_redirect(
+                api_key_error="env_override",
                 api_key_override_source=override,
-            ))
-        return redirect(url_for("setup_view", api_key_unverified="1"))
+            )
+        return _api_key_redirect(api_key_unverified="1")
 
     ok, payload = _validate_api_key(pasted)
     if not ok:
         if payload == "network":
             # Don't persist — bounce back with a flag that lets the form show
             # a "save without verifying" follow-up button.
-            return redirect(url_for("setup_view", api_key_error="network"))
-        return redirect(url_for("setup_view", api_key_error=payload))
+            return _api_key_redirect(api_key_error="network")
+        return _api_key_redirect(api_key_error=payload)
 
     # 200 OK — persist and refresh the in-process cache.
     override = _persist_and_check_override(pasted)
     if override:
-        return redirect(url_for(
-            "setup_view", api_key_error="env_override",
+        return _api_key_redirect(
+            api_key_error="env_override",
             api_key_override_source=override,
-        ))
+        )
     # Cache the /me payload (FLATTENED to the same shape fetch_me writes —
     # owner-filter / greeting / slack-test-message all read flat keys).
     try:
@@ -6536,7 +6560,15 @@ def welcome_prev():
 def welcome_finish():
     """End the wizard — either via the explicit Done button on step 4 OR
     via Skip on any step. The `skipped` form field distinguishes the two
-    so future analytics / re-prompts can tell the difference."""
+    so future analytics / re-prompts can tell the difference.
+
+    Note: a user who skips without setting an API key still gets routed
+    to /setup on the next / visit, because the existing no-API-key
+    redirect explicitly wipes setup_dismissed when no key is present.
+    That's intentional pre-existing behavior — /setup IS the API-key
+    paste page, which is the genuine next step for them. The wizard
+    just gives them context before they get there.
+    """
     sec_site = request.headers.get("Sec-Fetch-Site")
     if sec_site and sec_site not in ("same-origin", "none"):
         return jsonify({"error": "cross-site form submission blocked"}), 403
