@@ -44,11 +44,13 @@
         <div class="mb-4 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">
           <p class="font-medium">Google blocked the connection.</p>
           <p class="mt-1 text-rose-800">
-            Your email isn't on the test-users allowlist for this Draftboard
-            OAuth app. Ask whoever set up your team's copy to add you in
-            <a href="https://console.cloud.google.com/apis/credentials/consent" target="_blank" rel="noopener" class="underline">Google Cloud → OAuth consent screen → Test users</a>,
-            then come back and click Connect again.
+            Your Google account isn't on the allowlist for this app yet.
+            Click below to email {{ kit_author_email }} and request access — you'll get a reply within a business day, then you can try connecting again.
           </p>
+          <button type="button" data-open-whitelist-modal
+                  class="mt-3 inline-flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-md bg-rose-600 text-white font-medium hover:bg-rose-700">
+            📧 Request access →
+          </button>
         </div>
       {% elif raw_err == 'access_cancelled' %}
         <div class="mb-4 rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
@@ -265,10 +267,10 @@
           </p>
 
           {% if status.libs_ready and status.client_configured %}
-            <a href="/auth/google/start"
-               class="mt-5 inline-flex items-center justify-center rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow hover:bg-indigo-700">
+            <button type="button" data-open-whitelist-modal
+                    class="mt-5 inline-flex items-center justify-center rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow hover:bg-indigo-700">
               Connect Google →
-            </a>
+            </button>
           {% else %}
             <button type="button" disabled
                     class="mt-5 inline-flex items-center justify-center rounded-md bg-slate-200 px-4 py-2 text-sm font-medium text-slate-400 cursor-not-allowed">
@@ -363,6 +365,144 @@
 
     poll();
     setTimeout(function () { poll(); startPolling(); }, 800);
+  })();
+  </script>
+
+  {# --- Whitelist-request modal ------------------------------------------- #}
+  {# Opens when the user clicks "Connect Google" (first-time flow) or the
+     "Request access" button in the access_blocked banner. Asks for the
+     Google email they'll connect with, then opens Gmail compose with a
+     pre-filled message to the kit author so the email lands with the exact
+     address to add to the allowlist. An escape hatch lets already-approved
+     users skip straight to the OAuth start endpoint. #}
+  <div id="whitelist-modal"
+       class="hidden fixed inset-0 z-50 bg-slate-900/40 px-4 py-10 overflow-y-auto"
+       role="dialog" aria-modal="true" aria-labelledby="whitelist-modal-title">
+    <div class="max-w-md mx-auto bg-white rounded-lg shadow-xl border border-slate-200">
+      <div class="p-5 border-b border-slate-100">
+        <div class="flex items-start justify-between gap-4">
+          <h2 id="whitelist-modal-title" class="text-base font-semibold text-slate-900">
+            Request access to Supporter Scanner
+          </h2>
+          <button type="button" data-close-whitelist-modal
+                  aria-label="Close"
+                  class="text-slate-400 hover:text-slate-700 text-xl leading-none -mt-1">×</button>
+        </div>
+        <p class="mt-2 text-sm text-slate-600">
+          This feature uses Google APIs and is currently in early access. Your Google account needs to be added to the allowlist before you can connect. Send a quick request — usually approved within a business day.
+        </p>
+      </div>
+
+      <div data-whitelist-step="form" class="p-5">
+        <label class="block">
+          <span class="text-[11px] uppercase tracking-wider text-slate-500">The Google email you'll connect with</span>
+          <input type="email" id="whitelist-email-input"
+                 placeholder="you@gmail.com"
+                 autocomplete="off" spellcheck="false"
+                 class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+        </label>
+        <p id="whitelist-email-error" class="mt-1 text-xs text-rose-700 hidden">
+          Enter a valid email address.
+        </p>
+
+        <button type="button" id="whitelist-send-btn"
+                class="mt-3 w-full inline-flex items-center justify-center gap-2 rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-700">
+          📧 Open pre-filled email in Gmail
+        </button>
+
+        <p class="mt-2 text-[11px] text-slate-500">
+          Opens Gmail compose in a new tab with the To: address, subject, and message already filled in — just hit send.
+        </p>
+
+        <div class="mt-5 pt-4 border-t border-slate-100">
+          <a href="/auth/google/start"
+             class="text-xs text-slate-600 hover:text-indigo-700 underline">
+            I've already been approved — connect now →
+          </a>
+        </div>
+      </div>
+
+      <div data-whitelist-step="sent" class="hidden p-5">
+        <div class="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-900">
+          ✓ Gmail opened in a new tab. Send the email — once you get the approval reply, come back here and click <strong>Connect Google</strong> again.
+        </div>
+        <button type="button" data-close-whitelist-modal
+                class="mt-4 w-full rounded-md border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">
+          Close
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+  (function () {
+    var modal = document.getElementById('whitelist-modal');
+    if (!modal) return;
+    var input = document.getElementById('whitelist-email-input');
+    var errEl = document.getElementById('whitelist-email-error');
+    var sendBtn = document.getElementById('whitelist-send-btn');
+    var stepForm = modal.querySelector('[data-whitelist-step="form"]');
+    var stepSent = modal.querySelector('[data-whitelist-step="sent"]');
+
+    // Pre-built subject + body from the server. `__EMAIL__` is a literal
+    // placeholder we replace with whatever the user types in the form.
+    var SUBJECT = {{ whitelist_request_subject|tojson }};
+    var BODY_TEMPLATE = {{ whitelist_request_body|tojson }};
+    var TO_EMAIL = {{ kit_author_email|tojson }};
+
+    function open() {
+      stepForm.classList.remove('hidden');
+      stepSent.classList.add('hidden');
+      errEl.classList.add('hidden');
+      input.value = '';
+      modal.classList.remove('hidden');
+      setTimeout(function () { input.focus(); }, 0);
+    }
+    function close() {
+      modal.classList.add('hidden');
+    }
+    function isValidEmail(v) {
+      // Loose check: something@something.something. Server doesn't validate
+      // — Zach reads the body and decides.
+      return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
+    }
+    function send() {
+      var email = (input.value || '').trim();
+      if (!isValidEmail(email)) {
+        errEl.classList.remove('hidden');
+        input.focus();
+        return;
+      }
+      errEl.classList.add('hidden');
+      var body = BODY_TEMPLATE.replace('__EMAIL__', email);
+      var params = 'view=cm&fs=1' +
+        '&to=' + encodeURIComponent(TO_EMAIL) +
+        '&su=' + encodeURIComponent(SUBJECT) +
+        '&body=' + encodeURIComponent(body);
+      window.open('https://mail.google.com/mail/?' + params, '_blank', 'noopener');
+      stepForm.classList.add('hidden');
+      stepSent.classList.remove('hidden');
+    }
+
+    document.querySelectorAll('[data-open-whitelist-modal]').forEach(function (el) {
+      el.addEventListener('click', open);
+    });
+    document.querySelectorAll('[data-close-whitelist-modal]').forEach(function (el) {
+      el.addEventListener('click', close);
+    });
+    // Click outside the inner panel closes the modal.
+    modal.addEventListener('click', function (e) {
+      if (e.target === modal) close();
+    });
+    // Escape key closes.
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' && !modal.classList.contains('hidden')) close();
+    });
+    sendBtn.addEventListener('click', send);
+    // Enter inside the email field submits.
+    input.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { e.preventDefault(); send(); }
+    });
   })();
   </script>
 </body>

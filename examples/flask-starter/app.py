@@ -6628,12 +6628,33 @@ def settings_google_view():
         f"?subject={quote(subject)}"
         f"&body={quote(chr(10).join(body_lines))}"
     )
+
+    # Second mailto: the whitelist-access request. The customer's Google
+    # email isn't known server-side (they haven't OAuthed yet), so the body
+    # carries a `__EMAIL__` placeholder that the client-side modal swaps in
+    # from a form field before opening Gmail compose. We hand the template
+    # the raw subject + body so JS can build either a Gmail compose URL or
+    # a mailto: fallback at click time.
+    whitelist_subject = "Draftboard Supporter Scanner — please add me to the allowlist"
+    whitelist_body_lines = [
+        "Hi Zach,",
+        "",
+        "I'd like to use the Supporter Scanner feature. Please add my Google account to the test-users allowlist so I can connect.",
+        "",
+        "Google email to add: __EMAIL__",
+        f"Draftboard customer: {customer_name or '(not loaded yet)'}",
+        f"My name on the account: {full_name or '(not loaded yet)'}",
+        "",
+        "Thanks!",
+    ]
     return render_template(
         "settings_google.html",
         status=status,
         sync_state=sync_state,
         request_credentials_mailto=mailto,
         kit_author_email=KIT_AUTHOR_EMAIL,
+        whitelist_request_subject=whitelist_subject,
+        whitelist_request_body=chr(10).join(whitelist_body_lines),
         configure_error=request.args.get("configure_error", ""),
         configure_saved=request.args.get("configure_saved") == "1",
         active="settings_google",
