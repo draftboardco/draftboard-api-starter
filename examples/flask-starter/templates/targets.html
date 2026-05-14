@@ -118,6 +118,39 @@
       </div>
     {% endif %}
 
+    {# Sample-data state banners — only ONE of these renders at a time. #}
+    {% if sample_data_active %}
+      <div class="mb-6 rounded-md border border-amber-200 bg-amber-50/60 px-4 py-3 text-sm text-amber-900 flex items-start gap-3">
+        <span class="text-base mt-0.5">🎯</span>
+        <div class="flex-1">
+          <strong>You're looking at sample data.</strong>
+          This workspace was pre-populated with ~100 fake targets and ~40 well-known
+          connectors so you can poke around the product before connecting your
+          Draftboard account. Each connector card has a faint <em>SAMPLE</em>
+          watermark to make the distinction clear.
+          <span class="text-xs text-amber-700 block mt-1">
+            Set <code class="font-mono">DRAFTBOARD_API_KEY</code> and trigger a sync to replace
+            this with your real data — the sample rows auto-clear on the first
+            successful sync.
+          </span>
+        </div>
+      </div>
+    {% elif show_sample_cleared_banner %}
+      <div class="mb-6 rounded-md border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-900 flex items-start gap-3">
+        <span class="text-base mt-0.5">✓</span>
+        <div class="flex-1">
+          <strong>Your real Draftboard data is loaded.</strong>
+          The sample workspace has been cleared. If you'd like to see the sample
+          again, reinstall the kit in a fresh folder.
+        </div>
+        <form method="POST" action="/sample-data/dismiss-banner" class="flex-shrink-0">
+          <button type="submit"
+                  class="text-xs px-2 py-1 rounded hover:bg-emerald-100 text-emerald-700"
+                  title="Dismiss">✕</button>
+        </form>
+      </div>
+    {% endif %}
+
     {% if error %}
       <div class="mb-6 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">
         <strong>Couldn't load targets:</strong> {{ error }}

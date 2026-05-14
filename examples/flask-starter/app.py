@@ -813,6 +813,24 @@ def init_db():
                 error TEXT
             )
         """)
+
+        # Sample-data marker. Added idempotently across the tables our
+        # sample_data module populates. `_is_sample = 1` rows are scoped
+        # data the seeder owns; the clearer deletes them with WHERE
+        # _is_sample = 1 on the first real-API write to targets_cache.
+        # See sample_data.py for the full lifecycle.
+        for _t in (
+            "targets_cache", "connections", "connector_paths",
+            "discovered_paths", "manual_path_lists", "manual_path_connections",
+            "intro_requests", "target_tags",
+            "teammate_contacts", "linkedin_resolutions",
+        ):
+            try:
+                conn.execute(f"ALTER TABLE {_t} ADD COLUMN _is_sample INTEGER NOT NULL DEFAULT 0")
+            except sqlite3.OperationalError:
+                # Column already exists — fine on subsequent boots.
+                pass
+
         conn.commit()
 
 
@@ -1126,6 +1144,21 @@ def db_save_targets_cache(targets):
     'upload_date') so the Upload date filter has something to slice on.
     Re-saving an existing target preserves its original date — we only
     tag IDs that weren't already in targets_cache."""
+    # First real-API write — clear sample data if it's still in the DB.
+    # The signal is "a successful API sync just happened", not "the sync
+    # returned ≥1 target" (a new Draftboard account with an empty workspace
+    # still needs the sample workspace cleared — otherwise they see fake
+    # data on top of their real-but-empty account and assume the kit is
+    # broken). Sample rows get surgically deleted (scoped WHERE
+    # _is_sample=1), then sample_data_cleared is set so the banner renders
+    # once on the next /targets render.
+    if db_app_state_get("sample_data_cleared") != "1":
+        try:
+            import sample_data as _sample_data
+            _sample_data.clear_sample_data(_db_connect, _db_lock, db_app_state_set)
+            print("[draftboard-starter] Cleared sample data after first real sync")
+        except Exception as _e:
+            print(f"[draftboard-starter] Sample data clear failed (continuing): {_e}")
     if not targets:
         return
     import datetime as _dt
@@ -1804,6 +1837,20 @@ def db_target_ids_with_upload_date(date_str: str) -> set:
 init_db()
 backfill_target_owners()
 backfill_connector_paths()
+
+# Sample data — on a fresh install (empty targets_cache, never seeded,
+# never cleared, env opt-out not set), populate the workspace with ~100
+# plausible targets + 40 connectors so first-run users have something to
+# explore. Cleared automatically the first time real API data lands.
+try:
+    import sample_data as _sample_data
+    if _sample_data.should_seed(_db_connect, _db_lock, db_app_state_get):
+        _inserted = _sample_data.load_sample_data(_db_connect, _db_lock, db_app_state_set)
+        print(f"[draftboard-starter] Loaded sample data: {_inserted}")
+except Exception as _e:
+    # Don't let a bug in the sample seeder break the boot. Log and
+    # continue with an empty workspace — that's a worse UX but not broken.
+    print(f"[draftboard-starter] Sample data load failed (continuing): {_e}")
 
 
 def _migrate_slack_channel_name_strip_hash():
@@ -3135,6 +3182,12 @@ def _enrich_connection(target, connection, requested_set=None, my_user_id=None):
         "requested": is_requested,
         "intro_status": intro_status,
         "intro_status_meta": status_meta,
+        # Sample-data passthrough. The connector card renders the SAMPLE
+        # watermark when this is True (CSS lives in _drawer_skeleton.html).
+        # `_manual_list_is_sample` is set by manual_paths_for_target when
+        # the matched list has _is_sample=1; for API connections we check
+        # the connector_paths row separately at the call site.
+        "is_sample": bool(connection.get("_manual_list_is_sample") or connection.get("_is_sample")),
     }
 
 
@@ -3236,6 +3289,14 @@ def _enrich_target(t):
 
 @app.route("/", methods=["GET"])
 def targets_view():
+    # First-run wizard gate: brand-new install hits the welcome flow before
+    # anything else (the wizard orients the user, points them at the sample
+    # data, and funnels them through /setup as step 3). Once they've
+    # finished or skipped, welcome_wizard_done=1 and this redirect stops
+    # firing — the existing /setup behavior takes over for any later
+    # "no API key" states.
+    if db_app_state_get("welcome_wizard_done") != "1":
+        return redirect(url_for("welcome_view"))
     # First-run nudge: brand-new install with no API key gets bounced to
     # /setup so they have a paste field instead of an empty Targets page.
     # The "Continue" action on /setup writes setup_dismissed in app_state.
@@ -3384,6 +3445,19 @@ def targets_view():
         upload_date_filter=upload_date_filter,
         sort_by=sort_by,
         me=me_for_template,
+        # One-time banner state: shown after the sample data was cleared
+        # by the first real-API sync, until the user dismisses it.
+        show_sample_cleared_banner=(
+            db_app_state_get("sample_data_cleared") == "1"
+            and db_app_state_get("sample_clear_banner_dismissed") != "1"
+        ),
+        # Also let the template render an "is sample data" subtle indicator
+        # on the page header during the seeded phase so first-run users
+        # know what they're looking at.
+        sample_data_active=(
+            db_app_state_get("sample_data_seeded") == "1"
+            and db_app_state_get("sample_data_cleared") != "1"
+        ),
     )
 
 
@@ -5809,7 +5883,7 @@ def manual_paths_for_target(target: dict) -> list[dict]:
             "SELECT l.id, l.label, l.owner_first, l.owner_last, l.owner_email, "
             "       l.owner_title, l.owner_company, l.owner_linkedin, l.uploaded_at, "
             "       c.id, c.first_name, c.last_name, c.email, c.company, c.position, "
-            "       c.connected_on, c.linkedin_url "
+            "       c.connected_on, c.linkedin_url, l._is_sample "
             "FROM manual_path_connections c "
             "JOIN manual_path_lists l ON c.list_id = l.id "
             "WHERE c.linkedin_url_normalized = ?",
@@ -5817,7 +5891,8 @@ def manual_paths_for_target(target: dict) -> list[dict]:
         )
         for row in cur.fetchall():
             (lid, label, of, ol, oe, ot, oc, olu, uploaded_at,
-             cid, _cf, _cl, _ce, c_company, c_position, connected_on, _curl) = row
+             cid, _cf, _cl, _ce, c_company, c_position, connected_on, _curl,
+             list_is_sample) = row
             uploaded_str = time.strftime("%Y-%m-%d", time.localtime(uploaded_at)) if uploaded_at else ""
             details = []
             label_text = label or f"{of} {ol}".strip() or "your manual list"
@@ -5847,6 +5922,9 @@ def manual_paths_for_target(target: dict) -> list[dict]:
                 # not required by Connection schema but read by enricher.
                 "_manual_list_email": oe or "",
                 "_manual_list_id": lid,
+                # Sample-data flag from the list — propagates to is_sample on
+                # the enriched connection so the SAMPLE watermark renders.
+                "_manual_list_is_sample": bool(list_is_sample),
             })
     return out
 
@@ -6247,15 +6325,26 @@ def setup_save_api_key():
 
     pasted = (request.form.get("api_key") or "").strip()
     save_unverified = request.form.get("save_unverified") == "1"
+    from_wizard = request.form.get("from_wizard") == "1"
+
+    def _api_key_redirect(**kwargs):
+        """Mirror the success hand-off: errors that came from the wizard
+        form route back to /welcome?step=3 with the same query args the
+        wizard template already renders. Without this, every validation
+        error in setup_save_api_key dumps the user from the wizard onto
+        the standalone /setup page mid-flow."""
+        if from_wizard:
+            return redirect(url_for("welcome_view", step="3", **kwargs))
+        return redirect(url_for("setup_view", **kwargs))
 
     if not pasted:
-        return redirect(url_for("setup_view", api_key_error="empty"))
+        return _api_key_redirect(api_key_error="empty")
     if not pasted.startswith("db-api_"):
         # Cheap shape check — Draftboard keys all start with this prefix.
         # Saves a round-trip when the user pastes something obviously wrong.
-        return redirect(url_for("setup_view", api_key_error="bad_shape"))
+        return _api_key_redirect(api_key_error="bad_shape")
     if len(pasted) > 256:
-        return redirect(url_for("setup_view", api_key_error="too_long"))
+        return _api_key_redirect(api_key_error="too_long")
 
     def _persist_and_check_override(persist_key):
         """Write the key, refresh cache, then verify _load_api_key would
@@ -6272,33 +6361,38 @@ def setup_save_api_key():
         # Network failed earlier; user explicitly chose to save anyway.
         override = _persist_and_check_override(pasted)
         if override:
-            return redirect(url_for(
-                "setup_view", api_key_error="env_override",
+            return _api_key_redirect(
+                api_key_error="env_override",
                 api_key_override_source=override,
-            ))
-        return redirect(url_for("setup_view", api_key_unverified="1"))
+            )
+        return _api_key_redirect(api_key_unverified="1")
 
     ok, payload = _validate_api_key(pasted)
     if not ok:
         if payload == "network":
             # Don't persist — bounce back with a flag that lets the form show
             # a "save without verifying" follow-up button.
-            return redirect(url_for("setup_view", api_key_error="network"))
-        return redirect(url_for("setup_view", api_key_error=payload))
+            return _api_key_redirect(api_key_error="network")
+        return _api_key_redirect(api_key_error=payload)
 
     # 200 OK — persist and refresh the in-process cache.
     override = _persist_and_check_override(pasted)
     if override:
-        return redirect(url_for(
-            "setup_view", api_key_error="env_override",
+        return _api_key_redirect(
+            api_key_error="env_override",
             api_key_override_source=override,
-        ))
+        )
     # Cache the /me payload (FLATTENED to the same shape fetch_me writes —
     # owner-filter / greeting / slack-test-message all read flat keys).
     try:
         db_app_state_set("me_data", json.dumps(_flatten_me_payload(payload)))
     except (TypeError, ValueError):
         pass
+    # Wizard hand-off: if the API-key form was rendered from inside the
+    # welcome wizard, return the user to the wizard on step 4 (first sync)
+    # rather than the standalone /setup landing.
+    if request.form.get("from_wizard") == "1":
+        return redirect(url_for("welcome_view", step="4"))
     return redirect(url_for("setup_view"))
 
 
@@ -6367,6 +6461,127 @@ def setup_dismiss():
     return redirect(url_for("targets_view"))
 
 
+# ---------------------------------------------------------------------------
+# Welcome wizard
+# ---------------------------------------------------------------------------
+# 4-step first-run flow that orients new users before they paste an API
+# key. Step 1: what the product does. Step 2: tour the sample data we
+# pre-loaded. Step 3: connect their Draftboard account (embeds the
+# /setup/api-key form with from_wizard=1). Step 4: trigger first sync.
+#
+# Persistence: welcome_wizard_done='1' set on completion OR skip.
+# welcome_wizard_step holds the last step (used to resume on revisit).
+# The targets_view redirects to /welcome when done is unset, so users
+# land in the wizard on first /  visit. Direct visits to /welcome at
+# any time re-show the wizard (e.g., from a Settings entry point later).
+
+_WELCOME_VALID_STEPS = ("1", "2", "3", "4")
+
+
+def _welcome_redirect_target() -> str:
+    """Where to send the user after the wizard ends. If an API key is
+    configured, go straight to / (real data). Otherwise still /, where
+    they'll see the sample workspace + setup nudges."""
+    return url_for("targets_view")
+
+
+@app.route("/welcome", methods=["GET"])
+def welcome_view():
+    """Render the wizard. `?step=N` overrides the persisted step. Defaults
+    to step 1 on first visit, or the saved step on resume."""
+    requested = (request.args.get("step") or "").strip()
+    if requested in _WELCOME_VALID_STEPS:
+        step = requested
+    else:
+        step = db_app_state_get("welcome_wizard_step") or "1"
+        if step not in _WELCOME_VALID_STEPS:
+            step = "1"
+    # Persist the step so a refresh / reopen drops back here.
+    db_app_state_set("welcome_wizard_step", step)
+    api_key_set = bool(_current_api_key())
+    sample_data_active = (
+        db_app_state_get("sample_data_seeded") == "1"
+        and db_app_state_get("sample_data_cleared") != "1"
+    )
+    return render_template(
+        "welcome.html",
+        step=step,
+        api_key_set=api_key_set,
+        sample_data_active=sample_data_active,
+        api_key_error=request.args.get("api_key_error", ""),
+        active="welcome",
+    )
+
+
+@app.route("/welcome/next", methods=["POST"])
+def welcome_next():
+    """Advance to the next step. Caps at 4."""
+    sec_site = request.headers.get("Sec-Fetch-Site")
+    if sec_site and sec_site not in ("same-origin", "none"):
+        return jsonify({"error": "cross-site form submission blocked"}), 403
+    cur = db_app_state_get("welcome_wizard_step") or "1"
+    try:
+        next_step = min(int(cur) + 1, 4)
+    except ValueError:
+        next_step = 2
+    db_app_state_set("welcome_wizard_step", str(next_step))
+    return redirect(url_for("welcome_view", step=str(next_step)))
+
+
+@app.route("/welcome/prev", methods=["POST"])
+def welcome_prev():
+    """Step backward. Floors at 1."""
+    sec_site = request.headers.get("Sec-Fetch-Site")
+    if sec_site and sec_site not in ("same-origin", "none"):
+        return jsonify({"error": "cross-site form submission blocked"}), 403
+    cur = db_app_state_get("welcome_wizard_step") or "1"
+    try:
+        prev_step = max(int(cur) - 1, 1)
+    except ValueError:
+        prev_step = 1
+    db_app_state_set("welcome_wizard_step", str(prev_step))
+    return redirect(url_for("welcome_view", step=str(prev_step)))
+
+
+@app.route("/welcome/finish", methods=["POST"])
+def welcome_finish():
+    """End the wizard — either via the explicit Done button on step 4 OR
+    via Skip on any step. The `skipped` form field distinguishes the two
+    so future analytics / re-prompts can tell the difference.
+
+    Note: a user who skips without setting an API key still gets routed
+    to /setup on the next / visit, because the existing no-API-key
+    redirect explicitly wipes setup_dismissed when no key is present.
+    That's intentional pre-existing behavior — /setup IS the API-key
+    paste page, which is the genuine next step for them. The wizard
+    just gives them context before they get there.
+    """
+    sec_site = request.headers.get("Sec-Fetch-Site")
+    if sec_site and sec_site not in ("same-origin", "none"):
+        return jsonify({"error": "cross-site form submission blocked"}), 403
+    db_app_state_set("welcome_wizard_done", "1")
+    if request.form.get("skipped") == "1":
+        db_app_state_set("welcome_wizard_skipped", "1")
+    return redirect(_welcome_redirect_target())
+
+
+@app.route("/welcome/restart", methods=["POST"])
+def welcome_restart():
+    """Re-open the wizard from step 1. Clears the done / skipped flags so
+    the redirect from / fires again. Useful as a 'Tour again' entry
+    point from settings or a help menu."""
+    sec_site = request.headers.get("Sec-Fetch-Site")
+    if sec_site and sec_site not in ("same-origin", "none"):
+        return jsonify({"error": "cross-site form submission blocked"}), 403
+    with _db_lock, _db_connect() as conn:
+        conn.execute(
+            "DELETE FROM app_state WHERE key IN (?, ?, ?)",
+            ("welcome_wizard_done", "welcome_wizard_skipped", "welcome_wizard_step"),
+        )
+        conn.commit()
+    return redirect(url_for("welcome_view", step="1"))
+
+
 @app.route("/settings/google", methods=["GET"])
 def settings_google_view():
     """Status page: 'Connect Google' button OR last-synced banner + Re-sync.
@@ -6413,12 +6628,33 @@ def settings_google_view():
         f"?subject={quote(subject)}"
         f"&body={quote(chr(10).join(body_lines))}"
     )
+
+    # Second mailto: the whitelist-access request. The customer's Google
+    # email isn't known server-side (they haven't OAuthed yet), so the body
+    # carries a `__EMAIL__` placeholder that the client-side modal swaps in
+    # from a form field before opening Gmail compose. We hand the template
+    # the raw subject + body so JS can build either a Gmail compose URL or
+    # a mailto: fallback at click time.
+    whitelist_subject = "Draftboard Supporter Scanner — please add me to the allowlist"
+    whitelist_body_lines = [
+        "Hi Zach,",
+        "",
+        "I'd like to use the Supporter Scanner feature. Please add my Google account to the test-users allowlist so I can connect.",
+        "",
+        "Google email to add: __EMAIL__",
+        f"Draftboard customer: {customer_name or '(not loaded yet)'}",
+        f"My name on the account: {full_name or '(not loaded yet)'}",
+        "",
+        "Thanks!",
+    ]
     return render_template(
         "settings_google.html",
         status=status,
         sync_state=sync_state,
         request_credentials_mailto=mailto,
         kit_author_email=KIT_AUTHOR_EMAIL,
+        whitelist_request_subject=whitelist_subject,
+        whitelist_request_body=chr(10).join(whitelist_body_lines),
         configure_error=request.args.get("configure_error", ""),
         configure_saved=request.args.get("configure_saved") == "1",
         active="settings_google",
@@ -7074,6 +7310,19 @@ def supporters_categorize_all():
         "by_category": by_category,
         "use_llm": use_llm,
     })
+
+
+@app.route("/sample-data/dismiss-banner", methods=["POST"])
+def sample_data_dismiss_banner():
+    """One-time: mark the "Your real Draftboard data is loaded" banner
+    dismissed. Renders on /targets after the sample data was auto-cleared
+    by the first real-API sync. Sec-Fetch-Site guarded like the other
+    state-mutating routes."""
+    sec_site = request.headers.get("Sec-Fetch-Site")
+    if sec_site and sec_site not in ("same-origin", "none"):
+        return jsonify({"error": "cross-site form submission blocked"}), 403
+    db_app_state_set("sample_clear_banner_dismissed", "1")
+    return redirect(url_for("targets_view"))
 
 
 @app.route("/candidates/status", methods=["POST"])

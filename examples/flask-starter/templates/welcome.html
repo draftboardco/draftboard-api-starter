@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Welcome — Draftboard API Starter</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+  <div class="max-w-2xl mx-auto px-6 py-10">
+
+    {# Progress bar #}
+    <div class="mb-8">
+      <div class="flex items-center justify-between mb-2 text-xs text-slate-500">
+        <span>Step {{ step }} of 4</span>
+        <form method="POST" action="/welcome/finish" class="inline">
+          <input type="hidden" name="skipped" value="1" />
+          <button type="submit" class="text-slate-500 hover:text-slate-700 underline underline-offset-2">
+            Skip tour
+          </button>
+        </form>
+      </div>
+      <div class="h-1.5 w-full bg-slate-200 rounded-full overflow-hidden">
+        <div class="h-full bg-indigo-600 transition-all"
+             style="width: {{ (step|int * 25) }}%;"></div>
+      </div>
+    </div>
+
+    {# ----- STEP 1: What is this? ----- #}
+    {% if step == "1" %}
+      <header class="mb-6">
+        <h1 class="text-2xl font-semibold tracking-tight">Welcome to the Draftboard API Starter</h1>
+        <p class="text-sm text-slate-600 mt-2">
+          A reference Flask app showing how to build on Draftboard's Integration API. Designed to fork and adapt.
+        </p>
+      </header>
+
+      <section class="bg-white border border-slate-200 rounded-lg shadow-sm p-6 mb-5">
+        <h2 class="text-base font-semibold text-slate-900 mb-3">What you can do with it</h2>
+        <ul class="space-y-3 text-sm text-slate-700">
+          <li class="flex gap-3">
+            <span class="flex-shrink-0 w-6 h-6 rounded-full bg-indigo-100 text-indigo-700 flex items-center justify-center text-xs font-semibold">1</span>
+            <div>
+              <strong class="text-slate-900">Find warm intro paths</strong> through your team's combined network into target prospects you care about.
+            </div>
+          </li>
+          <li class="flex gap-3">
+            <span class="flex-shrink-0 w-6 h-6 rounded-full bg-indigo-100 text-indigo-700 flex items-center justify-center text-xs font-semibold">2</span>
+            <div>
+              <strong class="text-slate-900">Score each path</strong> by relationship strength so you know which one to ask first.
+            </div>
+          </li>
+          <li class="flex gap-3">
+            <span class="flex-shrink-0 w-6 h-6 rounded-full bg-indigo-100 text-indigo-700 flex items-center justify-center text-xs font-semibold">3</span>
+            <div>
+              <strong class="text-slate-900">Track intro requests</strong> through the funnel from "asked" → "intro made" → "meeting booked".
+            </div>
+          </li>
+        </ul>
+      </section>
+
+      {% if sample_data_active %}
+        <div class="mb-5 rounded-md border border-amber-200 bg-amber-50/60 px-4 py-3 text-sm text-amber-900">
+          <strong>🎯 We've pre-loaded a sample workspace.</strong>
+          100 sample targets across 25 SaaS companies, 40 well-known connectors (Sarah Guo, Garry Tan, Lenny Rachitsky, etc.). You can poke around immediately — no API key needed.
+        </div>
+      {% endif %}
+
+      <div class="flex items-center justify-between">
+        <span></span>
+        <form method="POST" action="/welcome/next">
+          <button type="submit"
+                  class="rounded-md bg-indigo-600 text-white px-5 py-2 text-sm font-medium hover:bg-indigo-700">
+            Tour the sample data →
+          </button>
+        </form>
+      </div>
+
+    {# ----- STEP 2: Tour the views ----- #}
+    {% elif step == "2" %}
+      <header class="mb-6">
+        <h1 class="text-2xl font-semibold tracking-tight">Three views, same data</h1>
+        <p class="text-sm text-slate-600 mt-2">
+          Open each in a new tab. You can click any row to drill into a drawer with full path details.
+        </p>
+      </header>
+
+      <div class="grid grid-cols-1 gap-3 mb-6">
+        <a href="/" target="_blank" rel="noopener"
+           class="block bg-white border border-slate-200 rounded-lg p-4 hover:border-indigo-300 hover:shadow-sm transition">
+          <div class="flex items-center justify-between">
+            <div>
+              <h3 class="text-sm font-semibold text-slate-900">Targets →</h3>
+              <p class="text-xs text-slate-500 mt-0.5">
+                Every prospect with paths into their network. Click a row to see who can intro you.
+              </p>
+            </div>
+            <span class="text-slate-400 group-hover:text-indigo-600">↗</span>
+          </div>
+        </a>
+        <a href="/accounts" target="_blank" rel="noopener"
+           class="block bg-white border border-slate-200 rounded-lg p-4 hover:border-indigo-300 hover:shadow-sm transition">
+          <div class="flex items-center justify-between">
+            <div>
+              <h3 class="text-sm font-semibold text-slate-900">Accounts →</h3>
+              <p class="text-xs text-slate-500 mt-0.5">
+                Same prospects, grouped by company. Useful when you're targeting a specific account.
+              </p>
+            </div>
+            <span class="text-slate-400">↗</span>
+          </div>
+        </a>
+        <a href="/connections" target="_blank" rel="noopener"
+           class="block bg-white border border-slate-200 rounded-lg p-4 hover:border-indigo-300 hover:shadow-sm transition">
+          <div class="flex items-center justify-between">
+            <div>
+              <h3 class="text-sm font-semibold text-slate-900">Connections →</h3>
+              <p class="text-xs text-slate-500 mt-0.5">
+                Every connector who can make at least one intro. Click any row to see who they know.
+              </p>
+            </div>
+            <span class="text-slate-400">↗</span>
+          </div>
+        </a>
+      </div>
+
+      <p class="text-xs text-slate-500 mb-6">
+        Each connector card has a faint <em>SAMPLE</em> watermark to make the distinction clear. Real data won't have it.
+      </p>
+
+      <div class="flex items-center justify-between">
+        <form method="POST" action="/welcome/prev">
+          <button type="submit"
+                  class="text-sm text-slate-600 hover:text-slate-900 px-3 py-2">
+            ← Back
+          </button>
+        </form>
+        <form method="POST" action="/welcome/next">
+          <button type="submit"
+                  class="rounded-md bg-indigo-600 text-white px-5 py-2 text-sm font-medium hover:bg-indigo-700">
+            Connect your account →
+          </button>
+        </form>
+      </div>
+
+    {# ----- STEP 3: Connect Draftboard ----- #}
+    {% elif step == "3" %}
+      <header class="mb-6">
+        <h1 class="text-2xl font-semibold tracking-tight">Connect your Draftboard account</h1>
+        <p class="text-sm text-slate-600 mt-2">
+          Paste your Integration API key to swap the sample workspace for your real targets. Get the key from <a href="https://intros.draftboard.com" target="_blank" rel="noopener" class="text-indigo-600 hover:underline">intros.draftboard.com → Settings → API</a>.
+        </p>
+      </header>
+
+      <section class="bg-white border border-slate-200 rounded-lg shadow-sm p-5 mb-5">
+        {% if api_key_set %}
+          <div class="rounded-md bg-emerald-50 border border-emerald-200 px-3 py-2 text-sm text-emerald-900 mb-3">
+            ✓ API key is set. You can move to the next step.
+          </div>
+        {% endif %}
+
+        {% if api_key_error %}
+          <div class="rounded-md bg-rose-50 border border-rose-200 px-3 py-2 text-sm text-rose-900 mb-3">
+            {% if api_key_error == "empty" %}Paste the API key before submitting.
+            {% elif api_key_error == "bad_shape" %}That doesn't look like a Draftboard API key (should start with <code>db-api_</code>).
+            {% elif api_key_error == "too_long" %}That key is too long — copy just the key, not the surrounding context.
+            {% elif api_key_error == "401" or api_key_error == "403" %}The key was rejected by Draftboard. Double-check the value.
+            {% else %}Something went wrong: {{ api_key_error }}.
+            {% endif %}
+          </div>
+        {% endif %}
+
+        <form method="POST" action="/setup/api-key" class="space-y-3">
+          <input type="hidden" name="from_wizard" value="1" />
+          <label class="block">
+            <span class="text-[10px] uppercase tracking-wider text-slate-500 font-semibold">Draftboard API key</span>
+            <input type="password" name="api_key" placeholder="db-api_..." required maxlength="256"
+                   class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+          </label>
+          <button type="submit"
+                  class="rounded-md bg-indigo-600 text-white px-4 py-2 text-sm font-medium hover:bg-indigo-700">
+            Save and continue
+          </button>
+        </form>
+        <p class="text-[11px] text-slate-500 mt-3">
+          Stored in <code>~/.draftboard-secrets/draftboard-api-starter</code> (gitignored). Never committed to git, never sent anywhere except the Draftboard API.
+        </p>
+      </section>
+
+      <div class="flex items-center justify-between">
+        <form method="POST" action="/welcome/prev">
+          <button type="submit"
+                  class="text-sm text-slate-600 hover:text-slate-900 px-3 py-2">
+            ← Back
+          </button>
+        </form>
+        {% if api_key_set %}
+          <form method="POST" action="/welcome/next">
+            <button type="submit"
+                    class="rounded-md bg-indigo-600 text-white px-5 py-2 text-sm font-medium hover:bg-indigo-700">
+              Next: First sync →
+            </button>
+          </form>
+        {% else %}
+          <div class="flex items-center gap-2 text-xs text-slate-400 italic">
+            <span>Paste a key above to continue, or</span>
+            <form method="POST" action="/welcome/finish" class="inline">
+              <input type="hidden" name="skipped" value="1" />
+              <button type="submit" class="underline hover:text-slate-600">
+                skip the tour
+              </button>
+            </form>
+          </div>
+        {% endif %}
+      </div>
+
+    {# ----- STEP 4: First sync ----- #}
+    {% elif step == "4" %}
+      <header class="mb-6">
+        <h1 class="text-2xl font-semibold tracking-tight">Run your first sync</h1>
+        <p class="text-sm text-slate-600 mt-2">
+          Click <strong>Sync paths</strong> in the left sidebar to fetch your real targets and connections from Draftboard. The sample workspace clears automatically as soon as your real data lands.
+        </p>
+      </header>
+
+      <section class="bg-white border border-slate-200 rounded-lg shadow-sm p-5 mb-5">
+        <h2 class="text-sm font-semibold text-slate-900 mb-3">What happens next</h2>
+        <ul class="space-y-2 text-sm text-slate-700 mb-4">
+          <li>• Sync pulls your <code>/targets</code> list from Draftboard's API.</li>
+          <li>• Then per-target connections — usually a minute or two for a workspace with a few hundred targets.</li>
+          <li>• While syncing, the sidebar shows a live progress pill.</li>
+          <li>• When done, the sample data is replaced and you see your real workspace.</li>
+        </ul>
+        {% if api_key_set %}
+          <p class="text-xs text-slate-500">
+            You're ready to sync — close this tour and click <strong>Sync paths</strong> in the sidebar of the Targets page.
+          </p>
+        {% else %}
+          <p class="text-xs text-amber-700">
+            Heads up — no API key set yet. You can still close this tour and keep poking around the sample data. Come back to <a href="/setup" class="text-indigo-600 hover:underline">/setup</a> when you're ready.
+          </p>
+        {% endif %}
+      </section>
+
+      <div class="flex items-center justify-between">
+        <form method="POST" action="/welcome/prev">
+          <button type="submit"
+                  class="text-sm text-slate-600 hover:text-slate-900 px-3 py-2">
+            ← Back
+          </button>
+        </form>
+        <form method="POST" action="/welcome/finish">
+          <button type="submit"
+                  class="rounded-md bg-indigo-600 text-white px-5 py-2 text-sm font-medium hover:bg-indigo-700">
+            Done — close tour
+          </button>
+        </form>
+      </div>
+    {% endif %}
+
+    <footer class="mt-10 text-xs text-slate-400 text-center">
+      Draftboard API Starter · Welcome tour
+    </footer>
+  </div>
+</body>
+</html>
