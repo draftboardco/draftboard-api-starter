@@ -266,6 +266,12 @@
       titles.forEach(function (t) { fd.append('titles', t); });
       fd.append('domain', domain);
       fd.append('company_name', companyName || '');
+      // Optional persona attribution — bumps `last_used_at` server-side
+      // so the most-recently-applied persona surfaces higher in the
+      // dropdown next time. Read at submit time (not capture time).
+      if (window.__personaActiveId) {
+        fd.append('persona_id', String(window.__personaActiveId));
+      }
 
       fetch('/prospecting/account/' + encodeURIComponent(accountKey) + '/search', {
         method: 'POST',
@@ -482,7 +488,14 @@
           const body = resp.body || {};
           if (body.ok) {
             personasCache = []; // force a refetch next time
-            alert('Saved persona "' + name + '" (' + titles.length + ' titles).');
+            const p = body.persona || {};
+            const truncated = p.truncated_count || 0;
+            let msg = 'Saved persona "' + name + '" (' + (p.title_count || titles.length) + ' titles).';
+            if (truncated > 0) {
+              msg += '\n\nNote: ' + truncated + ' title' + (truncated === 1 ? '' : 's') +
+                ' dropped (over the 25-title cap, or duplicates of others in your set).';
+            }
+            alert(msg);
             return;
           }
           if (resp.status === 409 && body.error === 'exists') {
@@ -566,27 +579,18 @@
     // Pre-fetch personas on page load so the dropdown is responsive on first click.
     fetchPersonas();
 
-    // Expose activePersonaId for the search submit. We modify the existing
-    // FormData by intercepting the build — simplest: patch into the fetch
-    // call by wrapping runBtn click to append persona_id when present.
-    // Already attached above via closure; persona_id is read at submit
-    // time from the module-scoped activePersonaId variable.
-  })();
-
-  // Patch the search FormData to include persona_id if set. This sits
-  // outside the main IIFE so it can hook into the request flow without
-  // restructuring the existing event handler.
-  (function () {
-    const origFetch = window.fetch;
-    window.fetch = function (input, init) {
-      if (typeof input === 'string' && input.indexOf('/prospecting/account/') !== -1 && input.endsWith('/search') && init && init.body instanceof FormData) {
-        try {
-          const apid = (window.__personaActiveId || null);
-          if (apid) init.body.append('persona_id', String(apid));
-        } catch (e) { /* ignore */ }
+    // Clear active-persona attribution when the user edits chips manually
+    // (the chip set no longer matches a saved persona). Without this, the
+    // server would bump last_used_at on a persona that doesn't actually
+    // reflect what the user searched for.
+    chipsEl.addEventListener('click', function (e) {
+      if (e.target.closest('[data-remove-title]')) {
+        window.__personaActiveId = null;
       }
-      return origFetch.apply(this, arguments);
-    };
+    });
+    addForm.addEventListener('submit', function () {
+      window.__personaActiveId = null;
+    });
   })();
   </script>
 </body>
