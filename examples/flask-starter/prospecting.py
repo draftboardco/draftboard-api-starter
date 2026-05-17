@@ -22,6 +22,7 @@ import sys
 import requests
 
 APOLLO_SEARCH_URL = "https://api.apollo.io/api/v1/mixed_people/search"
+APOLLO_ORG_SEARCH_URL = "https://api.apollo.io/api/v1/mixed_companies/search"
 OPENAI_MODEL = "gpt-4o-mini"
 
 # How many adjacent titles to ask gpt-4o-mini for. Bigger = wider net but more
@@ -102,13 +103,60 @@ def generate_adjacent_titles(
         return [], f"openai error: {type(e).__name__}"
 
 
+def _apollo_find_org_id(company_name: str, apollo_key: str) -> tuple[str | None, str | None]:
+    """Look up Apollo's internal organization_id for a given company name.
+
+    Apollo's mixed_people/search filter parameter `q_organization_name` was
+    silently dropped from the API; the correct way to filter by company is
+    to pass `organization_ids[]`. We do a quick orgs lookup first to get
+    that id. Returns (org_id, error).
+    """
+    if not apollo_key or not company_name:
+        return None, "missing key or name"
+    body = {
+        "q_organization_name": company_name,
+        "page": 1,
+        "per_page": 1,
+    }
+    try:
+        r = requests.post(
+            APOLLO_ORG_SEARCH_URL,
+            headers={"Content-Type": "application/json", "x-api-key": apollo_key},
+            json=body,
+            timeout=15,
+        )
+    except requests.RequestException as e:
+        return None, f"apollo network error (org search): {type(e).__name__}"
+    if r.status_code == 401:
+        return None, "apollo auth failed (check APOLLO_API_KEY)"
+    if r.status_code == 429:
+        return None, "apollo rate-limited"
+    if r.status_code != 200:
+        _log(f"apollo org search HTTP {r.status_code}: {r.text[:300]}")
+        return None, f"apollo org search HTTP {r.status_code}"
+    try:
+        data = r.json()
+    except ValueError:
+        return None, "apollo org search returned non-JSON"
+
+    orgs = data.get("organizations") or data.get("accounts") or []
+    if not orgs:
+        return None, f"apollo found no organization matching '{company_name}'"
+    org = orgs[0]
+    org_id = org.get("id") or org.get("organization_id")
+    if not org_id:
+        return None, "apollo org match missing id field"
+    return org_id, None
+
+
 def apollo_search_people_at_account(
     company_name: str,
     titles: list[str],
     apollo_key: str,
     per_page: int = APOLLO_PER_PAGE,
 ) -> tuple[list[dict], str | None]:
-    """Hit Apollo's mixed_people/search filtered by org name + titles.
+    """Find Apollo's organization_id for the given company, then search
+    its people filtered by the provided titles.
 
     Returns (candidates, error). Each candidate dict has:
         first_name, last_name, name, title, linkedin_url,
@@ -121,8 +169,12 @@ def apollo_search_people_at_account(
     if not company_name:
         return [], "no company name"
 
+    org_id, org_err = _apollo_find_org_id(company_name, apollo_key)
+    if org_err:
+        return [], org_err
+
     body = {
-        "q_organization_name": company_name,
+        "organization_ids": [org_id],
         "person_titles": titles,
         "page": 1,
         "per_page": per_page,
@@ -142,7 +194,8 @@ def apollo_search_people_at_account(
     if r.status_code == 429:
         return [], "apollo rate-limited"
     if r.status_code != 200:
-        _log(f"apollo HTTP {r.status_code}: {r.text[:200]}")
+        # Log the response body so 4xx/5xx errors are debuggable next time.
+        _log(f"apollo people search HTTP {r.status_code}: {r.text[:500]}")
         return [], f"apollo HTTP {r.status_code}"
     try:
         data = r.json()
