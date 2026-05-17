@@ -114,6 +114,55 @@
     if (e.key === 'Escape') closeDrawer();
   });
 
+  // Delegated ★/☆ supporter-toggle handler. Works on /connections rows
+  // and inside any drawer that re-uses _connector_card.html. The server
+  // is idempotent: clicking toggles add/remove based on current state.
+  document.addEventListener('click', function (e) {
+    var btn = e.target.closest('[data-supporter-toggle]');
+    if (!btn) return;
+    e.preventDefault();
+    e.stopPropagation();
+    var url = btn.getAttribute('data-linkedin') || '';
+    var name = btn.getAttribute('data-name') || '';
+    if (!url) return;
+    btn.disabled = true;
+    var originalText = btn.textContent;
+    var fd = new FormData();
+    fd.append('linkedin_url', url);
+    if (name) fd.append('display_name', name);
+    fetch('/manual-supporters/toggle', { method: 'POST', body: fd })
+      .then(function (r) { return r.json(); })
+      .then(function (resp) {
+        btn.disabled = false;
+        if (!resp.ok) {
+          btn.textContent = originalText;
+          alert('Star failed: ' + (resp.error || 'unknown'));
+          return;
+        }
+        // Repaint every star button on the page that targets this URL —
+        // multiple cards can reference the same connector.
+        var sel = '[data-supporter-toggle][data-linkedin="' + url.replace(/"/g, '\\"') + '"]';
+        document.querySelectorAll(sel).forEach(function (b) {
+          if (resp.is_supporter) {
+            b.textContent = '★';
+            b.classList.remove('text-slate-300');
+            b.classList.add('text-amber-500');
+            b.title = 'Already marked as a supporter — click to unmark';
+          } else {
+            b.textContent = '☆';
+            b.classList.remove('text-amber-500');
+            b.classList.add('text-slate-300');
+            b.title = 'Mark as a supporter';
+          }
+        });
+      })
+      .catch(function (err) {
+        btn.disabled = false;
+        btn.textContent = originalText;
+        alert('Network error: ' + err);
+      });
+  });
+
   // Helper used by the drawer partials' Copy buttons
   window.copyText = function (btn) {
     var el = btn.closest('[data-draft]');

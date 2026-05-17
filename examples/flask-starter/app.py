@@ -713,6 +713,28 @@ def init_db():
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_candidate_status_status ON candidate_status(status)")
 
+        # Manually-flagged supporters. Two entry points:
+        #   1. ★ button on /connections rows and in path-drawer connector
+        #      cards — one-click toggle for the LinkedIn URL the user is
+        #      already looking at.
+        #   2. /supporters/import — paste a list of LinkedIn URLs from
+        #      outside the app (e.g. a teammate sent over a CSV).
+        # Folded into db_supporter_attribution_map() so the same ⭐ badge
+        # + "Supporters only" filter chip across the app pick them up.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS manual_supporters (
+                linkedin_url_norm TEXT PRIMARY KEY,
+                linkedin_url_raw TEXT NOT NULL,
+                display_name TEXT NOT NULL DEFAULT '',
+                teammate_email TEXT NOT NULL DEFAULT '',
+                teammate_name TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT 'star',
+                note TEXT NOT NULL DEFAULT '',
+                added_at INTEGER NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_manual_supporters_added_at ON manual_supporters(added_at DESC)")
+
         # Per-supporter relationship category (customer / investor / vendor /
         # friend / coworker / unclassified). Populated by the categorizer
         # which uses, in priority order: manual override > user-uploaded
@@ -3118,6 +3140,21 @@ def db_supporter_attribution_map():
             bucket = out.setdefault(key, [])
             if display not in bucket:
                 bucket.append(display)
+        # Fold in manually-flagged supporters (from the ★ button or the
+        # /supporters/import paste form). Each row contributes the
+        # teammate_name it was attributed to, or "you" if it's the
+        # current user's own star.
+        manual_cur = conn.execute(
+            "SELECT linkedin_url_norm, teammate_name, teammate_email "
+            "FROM manual_supporters"
+        )
+        for url_norm, t_name, t_email in manual_cur.fetchall():
+            if not url_norm:
+                continue
+            display = (t_name or "").strip() or (t_email or "").strip() or "you"
+            bucket = out.setdefault(url_norm, [])
+            if display not in bucket:
+                bucket.append(display)
     cache["data"] = out
     cache["fetched_at"] = now
     return out
@@ -3129,6 +3166,164 @@ def invalidate_supporter_attribution_cache():
     LinkedIn resolution. Cheap; the rebuild is one indexed JOIN."""
     _supporter_attribution_cache["data"] = None
     _supporter_attribution_cache["fetched_at"] = 0
+
+
+# ---------- Manual supporters (star + paste-URLs flows) ------------------
+
+def db_manual_supporter_get(linkedin_url_norm: str) -> dict | None:
+    """Returns the row for one normalized LinkedIn URL, or None."""
+    if not linkedin_url_norm:
+        return None
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT linkedin_url_norm, linkedin_url_raw, display_name, "
+            "teammate_email, teammate_name, source, note, added_at "
+            "FROM manual_supporters WHERE linkedin_url_norm = ?",
+            (linkedin_url_norm,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "linkedin_url_norm": row[0],
+        "linkedin_url_raw": row[1],
+        "display_name": row[2],
+        "teammate_email": row[3],
+        "teammate_name": row[4],
+        "source": row[5],
+        "note": row[6],
+        "added_at": row[7],
+    }
+
+
+def db_manual_supporter_urls_norm() -> set:
+    """Set of normalized LinkedIn URLs in manual_supporters. Cheap lookup
+    for the star button to know whether to render filled or outline."""
+    try:
+        from flask import g
+        cached = getattr(g, "_manual_supporter_urls_norm", None)
+    except RuntimeError:
+        cached = None
+        g = None
+    if cached is not None:
+        return cached
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute("SELECT linkedin_url_norm FROM manual_supporters")
+        urls = {row[0] for row in cur.fetchall() if row[0]}
+    if g is not None:
+        g._manual_supporter_urls_norm = urls
+    return urls
+
+
+def db_manual_supporter_upsert(
+    linkedin_url_raw: str,
+    display_name: str = "",
+    teammate_email: str = "",
+    teammate_name: str = "",
+    source: str = "star",
+    note: str = "",
+) -> tuple[bool, str | None]:
+    """Insert or update a manual supporter row. Returns (added_bool, error).
+    `added_bool` is True if the row is new, False if it already existed.
+    The 'star' source is upsert-only: a second star click should TOGGLE OFF,
+    handled by db_manual_supporter_toggle below, not this function.
+    """
+    norm = _normalize_linkedin(linkedin_url_raw or "")
+    if not norm:
+        return False, "invalid linkedin url"
+    now = int(time.time())
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT 1 FROM manual_supporters WHERE linkedin_url_norm = ?",
+            (norm,),
+        )
+        exists = cur.fetchone() is not None
+        if exists:
+            conn.execute(
+                "UPDATE manual_supporters SET linkedin_url_raw = ?, "
+                "display_name = COALESCE(NULLIF(?, ''), display_name), "
+                "teammate_email = COALESCE(NULLIF(?, ''), teammate_email), "
+                "teammate_name = COALESCE(NULLIF(?, ''), teammate_name), "
+                "source = ?, note = COALESCE(NULLIF(?, ''), note) "
+                "WHERE linkedin_url_norm = ?",
+                (linkedin_url_raw, display_name, teammate_email,
+                 teammate_name, source, note, norm),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO manual_supporters "
+                "(linkedin_url_norm, linkedin_url_raw, display_name, "
+                "teammate_email, teammate_name, source, note, added_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (norm, linkedin_url_raw, display_name, teammate_email,
+                 teammate_name, source, note, now),
+            )
+        conn.commit()
+    invalidate_supporter_attribution_cache()
+    return (not exists), None
+
+
+def db_manual_supporter_remove(linkedin_url_raw: str) -> bool:
+    """Delete a manual supporter by URL. Returns True if a row was removed."""
+    norm = _normalize_linkedin(linkedin_url_raw or "")
+    if not norm:
+        return False
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM manual_supporters WHERE linkedin_url_norm = ?",
+            (norm,),
+        )
+        removed = cur.rowcount
+        conn.commit()
+    if removed:
+        invalidate_supporter_attribution_cache()
+    return bool(removed)
+
+
+def db_manual_supporter_toggle(
+    linkedin_url_raw: str,
+    display_name: str = "",
+) -> tuple[bool, str | None]:
+    """Star toggle: if already a supporter, remove; otherwise add with
+    source='star'. Returns (is_supporter_now, error).
+    """
+    norm = _normalize_linkedin(linkedin_url_raw or "")
+    if not norm:
+        return False, "invalid linkedin url"
+    existing = db_manual_supporter_get(norm)
+    if existing:
+        db_manual_supporter_remove(linkedin_url_raw)
+        return False, None
+    _, err = db_manual_supporter_upsert(
+        linkedin_url_raw,
+        display_name=display_name,
+        source="star",
+    )
+    if err:
+        return False, err
+    return True, None
+
+
+def db_manual_supporters_recent(limit: int = 50) -> list[dict]:
+    """Recent additions for the /supporters/import confirmation panel."""
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT linkedin_url_norm, linkedin_url_raw, display_name, "
+            "teammate_email, teammate_name, source, note, added_at "
+            "FROM manual_supporters ORDER BY added_at DESC LIMIT ?",
+            (int(limit),),
+        )
+        rows = cur.fetchall()
+    return [{
+        "linkedin_url_norm": r[0],
+        "linkedin_url_raw": r[1],
+        "display_name": r[2],
+        "teammate_email": r[3],
+        "teammate_name": r[4],
+        "source": r[5],
+        "note": r[6],
+        "added_at": r[7],
+    } for r in rows]
 
 
 def _targets_with_supporter_paths() -> set:
@@ -3275,6 +3470,12 @@ def _enrich_connection(target, connection, requested_set=None, my_user_id=None):
     supporter_attributions = (
         db_supporter_attribution_map().get(norm_li, []) if norm_li else []
     )
+    # Independent of scan attribution: is this URL specifically in
+    # manual_supporters? Drives the ★/☆ toggle button state on
+    # /connections and connector cards.
+    is_manual_supporter = bool(
+        norm_li and norm_li in db_manual_supporter_urls_norm()
+    )
 
     return {
         "id": cid,
@@ -3298,6 +3499,8 @@ def _enrich_connection(target, connection, requested_set=None, my_user_id=None):
         "slack_configured": slack_on,
         "slack_channel_name": slack_channel,
         "supporter_attributions": supporter_attributions,
+        "is_manual_supporter": is_manual_supporter,
+        "linkedin_url_norm": norm_li,
         "draft_message": messages["plain"],
         "draft_html": messages["html"],
         "draft_plain_fallback": messages["plain_fallback"],
@@ -3762,16 +3965,83 @@ def import_form():
     )
 
 
-@app.route("/import/supporters", methods=["GET"])
-def import_supporters_stub():
-    """Stub page for the planned 'paste LinkedIn URLs of known supporters'
-    flow. The real feature isn't built yet — this just renders a
-    'Coming soon' card so the nav link doesn't dead-end. When the feature
-    ships, this route swaps to a real form + handler."""
+@app.route("/import/supporters", methods=["GET", "POST"])
+def import_supporters_view():
+    """Paste-URLs form for bulk-flagging supporters. On POST, normalizes the
+    pasted URLs and writes one manual_supporters row per URL with source='paste'.
+
+    Optional fields:
+      - teammate: owner_id of the team member this list "belongs to" (the
+        person whose network these supporters came from). Attribution
+        flows into db_supporter_attribution_map() so the existing ⭐ badge
+        shows the right teammate name on connector cards.
+      - note: free-text label preserved on each row.
+    """
+    owners = db_unique_owners()  # for the optional teammate dropdown
+
+    if request.method == "POST":
+        raw_urls = request.form.get("linkedin_urls", "")
+        teammate_owner_id = (request.form.get("teammate_owner_id") or "").strip()
+        note = (request.form.get("note") or "").strip()[:300]
+
+        # Reuse the existing URL normalizer used by /import to dedupe and
+        # canonicalize input. It splits on whitespace + commas, strips
+        # tracking params, and rejects non-LinkedIn URLs.
+        urls = normalize_linkedin_urls(raw_urls)
+
+        # Resolve teammate display name from owners list.
+        teammate_name = ""
+        teammate_email = ""
+        if teammate_owner_id:
+            matched = next((o for o in owners if o.get("id") == teammate_owner_id), None)
+            if matched:
+                teammate_name = (matched.get("name") or "").strip()
+            tm_map = db_all_team_members().get(teammate_owner_id) or {}
+            teammate_email = (tm_map.get("email") or "").strip()
+
+        added = 0
+        skipped_existing = 0
+        for url in urls:
+            norm = _normalize_linkedin(url)
+            if not norm:
+                continue
+            if db_manual_supporter_get(norm):
+                skipped_existing += 1
+                continue
+            added_bool, err = db_manual_supporter_upsert(
+                url,
+                teammate_email=teammate_email,
+                teammate_name=teammate_name,
+                source="paste",
+                note=note,
+            )
+            if err:
+                continue
+            if added_bool:
+                added += 1
+
+        return render_template(
+            "import_supporters.html",
+            owners=owners,
+            api_key_set=bool(API_KEY),
+            active="import_supporters",
+            result={
+                "submitted_count": len(urls),
+                "added": added,
+                "skipped_existing": skipped_existing,
+                "teammate_name": teammate_name,
+                "note": note,
+            },
+            recent=db_manual_supporters_recent(50),
+        )
+
     return render_template(
-        "import_supporters_stub.html",
+        "import_supporters.html",
+        owners=owners,
         api_key_set=bool(API_KEY),
         active="import_supporters",
+        result=None,
+        recent=db_manual_supporters_recent(50),
     )
 
 
@@ -4132,6 +4402,16 @@ def connections_view():
     if me_for_template:
         me_for_template = dict(me_for_template, owner_id=get_my_owner_id())
 
+    # Pre-fetch the manual-supporter set so the template can render each
+    # row's ★/☆ state without a per-row DB query. Mark each connector
+    # in-place so the template can just check `c.is_manual_supporter`
+    # instead of re-doing the normalization in Jinja.
+    manual_supporter_urls_norm = db_manual_supporter_urls_norm()
+    for c in connectors:
+        c["is_manual_supporter"] = (
+            _normalize_linkedin(c.get("linkedin") or "") in manual_supporter_urls_norm
+        )
+
     return render_template(
         "connections.html",
         connectors=connectors,
@@ -4142,10 +4422,28 @@ def connections_view():
         total_pages=total_pages,
         query=q,
         supporters_only=supporters_only,
+        manual_supporter_urls_norm=manual_supporter_urls_norm,
         me=me_for_template,
         api_key_set=bool(API_KEY),
         active="connections",
     )
+
+
+@app.route("/manual-supporters/toggle", methods=["POST"])
+def manual_supporters_toggle():
+    """Toggle a connector's manual-supporter state. Body params:
+        linkedin_url (required)
+        display_name (optional — pre-fills if creating)
+    Returns JSON {ok, is_supporter, error}.
+    """
+    linkedin_url = (request.form.get("linkedin_url") or "").strip()
+    display_name = (request.form.get("display_name") or "").strip()
+    if not linkedin_url:
+        return jsonify({"ok": False, "error": "missing linkedin_url"}), 400
+    is_supporter, err = db_manual_supporter_toggle(linkedin_url, display_name=display_name)
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    return jsonify({"ok": True, "is_supporter": is_supporter})
 
 
 @app.route("/connector/<path:connector_key>/drawer", methods=["GET"])
@@ -8165,19 +8463,32 @@ def _resolver_status(keys: dict) -> dict:
     }
 
 
-@app.route("/settings/linkedin-resolver", methods=["GET"])
-def linkedin_resolver_settings():
-    """Render the resolver-keys wizard. Shows which methods are currently
-    usable and a paste-and-save form for each key."""
+@app.route("/settings/api-keys", methods=["GET"])
+def api_keys_settings():
+    """Render the API-keys paste form. These keys power LinkedIn resolution,
+    Supporter Scanner enrichment, and Auto-Prospecting — anywhere the app
+    talks to Apollo, Google Custom Search, or OpenAI. Same template the
+    older /settings/linkedin-resolver route serves.
+    """
     keys = _load_resolver_keys()
     return render_template(
         "settings_linkedin_resolver.html",
         status=_resolver_status(keys),
         secrets_path=RESOLVER_SECRETS_PATH,
-        active="settings_linkedin_resolver",
+        active="settings_api_keys",
     )
 
 
+@app.route("/settings/linkedin-resolver", methods=["GET"])
+def linkedin_resolver_settings_legacy():
+    """Legacy URL — redirects to the new /settings/api-keys page. Kept so
+    existing links/bookmarks and in-page redirects (the wizard JS uses
+    `window.location.href = '/settings/linkedin-resolver'` after save)
+    keep working."""
+    return redirect(url_for("api_keys_settings"), code=302)
+
+
+@app.route("/settings/api-keys", methods=["POST"])
 @app.route("/settings/linkedin-resolver", methods=["POST"])
 def save_linkedin_resolver_settings():
     """Persist any non-empty resolver keys to the secrets JSON file. Empty
