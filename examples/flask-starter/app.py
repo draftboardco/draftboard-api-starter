@@ -3506,9 +3506,15 @@ def db_persona_upsert(name: str, titles: list, overwrite: bool = False) -> tuple
     name_norm = _normalize_persona_name(display_name)
     if not name_norm:
         return None, "empty name"
+    # Track how many titles got dropped by the limits (>PERSONA_MAX_TITLES
+    # or duplicates after lowercase-dedupe), so the route can surface it
+    # back to the user — silent truncation would hide that "I sent 30,
+    # got 25" outcome.
+    raw_input_count = sum(1 for t in (titles or []) if str(t).strip())
     cleaned_titles = _normalize_persona_titles(titles)
     if not cleaned_titles:
         return None, "no titles"
+    truncated_count = max(0, raw_input_count - len(cleaned_titles))
     titles_json = json.dumps(cleaned_titles)
     now = int(time.time())
     with _db_lock, _db_connect() as conn:
@@ -3549,6 +3555,7 @@ def db_persona_upsert(name: str, titles: list, overwrite: bool = False) -> tuple
         "name": row[1],
         "titles": json.loads(row[2] or "[]") or [],
         "title_count": len(cleaned_titles),
+        "truncated_count": truncated_count,
         "created_at": row[3],
         "updated_at": row[4],
         "last_used_at": row[5],
@@ -5403,7 +5410,15 @@ def personas_list():
     """Return all saved title personas as JSON, sorted by `last_used_at`
     desc (most-recently-applied first), then by `updated_at` desc.
 
-    Read-only — no cross-site check needed."""
+    Cross-site defense: persona names + titles are user-supplied strings
+    that could encode internal target-list info. A malicious page in
+    another tab could otherwise `fetch('http://localhost:5050/personas',
+    {credentials:'include'})` and enumerate them (GET application/json
+    is a CORS "simple request" — no preflight). Gating with the same
+    Sec-Fetch-Site check we use on the POST/DELETE."""
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
     return jsonify({"ok": True, "personas": db_personas_list()})
 
 
