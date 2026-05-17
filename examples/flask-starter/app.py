@@ -1459,6 +1459,24 @@ def db_unique_owners():
         ]
 
 
+def _reject_cross_site_form():
+    """Returns a Flask response when the incoming request was submitted from
+    a cross-origin tab, else None. Used to gate all POST endpoints that
+    write user state or call paid third-party APIs — a malicious page in
+    another browser tab could otherwise force-submit a hidden form against
+    localhost:5050 and drain Apollo/CSE quota, spam Draftboard imports, or
+    flip supporter state.
+
+    `same-origin` = real form submit from the app's own pages. `none` =
+    direct navigation / curl. Absent header = older browsers — allow
+    through (modern browsers all emit it).
+    """
+    sec_site = request.headers.get("Sec-Fetch-Site")
+    if sec_site and sec_site not in ("same-origin", "none"):
+        return jsonify({"ok": False, "error": "cross-site form submission blocked"}), 403
+    return None
+
+
 def _normalize_linkedin(url):
     """Canonicalize a LinkedIn URL for fuzzy match.
 
@@ -3986,6 +4004,10 @@ def import_supporters_view():
     owners = db_unique_owners()  # for the optional teammate dropdown
 
     if request.method == "POST":
+        # Cross-origin defense — see _reject_cross_site_form docstring.
+        sec_site = request.headers.get("Sec-Fetch-Site")
+        if sec_site and sec_site not in ("same-origin", "none"):
+            return ("cross-site form submission blocked", 403)
         raw_urls = request.form.get("linkedin_urls", "")
         teammate_owner_id = (request.form.get("teammate_owner_id") or "").strip()
         note = (request.form.get("note") or "").strip()[:300]
@@ -4438,15 +4460,25 @@ def connections_view():
 @app.route("/manual-supporters/toggle", methods=["POST"])
 def manual_supporters_toggle():
     """Toggle a connector's manual-supporter state. Body params:
-        linkedin_url (required)
+        linkedin_url (required — must be a real linkedin.com/in/<slug> URL)
         display_name (optional — pre-fills if creating)
     Returns JSON {ok, is_supporter, error}.
     """
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
     linkedin_url = (request.form.get("linkedin_url") or "").strip()
-    display_name = (request.form.get("display_name") or "").strip()
+    display_name = (request.form.get("display_name") or "").strip()[:200]
     if not linkedin_url:
         return jsonify({"ok": False, "error": "missing linkedin_url"}), 400
-    is_supporter, err = db_manual_supporter_toggle(linkedin_url, display_name=display_name)
+    # Strict validator: rejects javascript:, data:, mailto:, arbitrary host —
+    # only accepts canonical linkedin.com/in/<slug> URLs. Without this gate,
+    # the toggle could write hostile strings into linkedin_url_raw, which
+    # later renders as a clickable <a href> in import_supporters.html.
+    canonical = normalize_linkedin_urls(linkedin_url)
+    if not canonical:
+        return jsonify({"ok": False, "error": "not a valid LinkedIn profile URL"}), 400
+    is_supporter, err = db_manual_supporter_toggle(canonical[0], display_name=display_name)
     if err:
         return jsonify({"ok": False, "error": err}), 400
     return jsonify({"ok": True, "is_supporter": is_supporter})
@@ -4994,6 +5026,10 @@ def prospecting_account_search(account_key):
       domain         — resolved or user-overridden domain to scope the search
       company_name   — display name for fallback / candidate org_name
     """
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+
     seeds, display_name, _, _, existing_linkedin_norm = (
         _prospecting_collect_seeds(account_key)
     )
@@ -5011,6 +5047,16 @@ def prospecting_account_search(account_key):
             pass
     if not titles:
         return jsonify({"ok": False, "error": "at least one title required"}), 400
+
+    # Hard cap on titles to prevent a runaway loop draining CSE quota
+    # (free tier is 100 queries/day; one CSE call per title). 20 is well
+    # above any reasonable manual title set.
+    MAX_TITLES = 20
+    if len(titles) > MAX_TITLES:
+        return jsonify({
+            "ok": False,
+            "error": f"too many titles (got {len(titles)}, max {MAX_TITLES}) — each title costs one Google CSE query, so we cap to protect your daily quota",
+        }), 400
 
     domain = (request.form.get("domain") or "").strip().lower()
     company_name = (request.form.get("company_name") or display_name or "").strip()
@@ -5040,6 +5086,9 @@ def prospecting_add_suggestion():
     same Draftboard-API target creation path as a manual /import. Tags
     the new target as 'prospected' so it's findable later.
     """
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
     linkedin_url = (request.form.get("linkedin_url") or "").strip()
     if not linkedin_url:
         return jsonify({"ok": False, "error": "missing linkedin_url"}), 400
