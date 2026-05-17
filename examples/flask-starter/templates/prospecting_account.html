@@ -15,16 +15,11 @@
         <a href="/accounts" class="hover:underline">← All accounts</a>
       </div>
       <h1 class="text-2xl font-semibold tracking-tight">
-        Prospecting at <span class="text-indigo-700">{{ account_name }}</span>
+        Find lookalike targets at <span class="text-indigo-700">{{ account_name }}</span>
       </h1>
       <p class="text-sm text-slate-500 mt-1">
-        Generates a list of people at this account with titles adjacent to
-        your existing targets. AI expands the seed titles, then Apollo
-        searches the company for matches.
-        <span class="block mt-1 text-xs text-slate-400">
-          🚧 Prototype — re-runs the full pipeline on every page load. No
-          caching yet. Each load costs ~1 Apollo call + ~1 OpenAI call.
-        </span>
+        Suggest people at this account with titles similar to your existing targets.
+        Review and edit the title list + company domain below, then run the search.
       </p>
     </header>
 
@@ -57,78 +52,78 @@
       </section>
     {% endif %}
 
-    {# --- AI-expanded titles (transparency: show what we asked Apollo for) --- #}
-    {% if generated_titles %}
-      <section class="mb-6 rounded-lg bg-white border border-slate-200 p-5 shadow-sm">
-        <h2 class="text-sm font-semibold text-slate-900">
-          AI-expanded titles
-          <span class="ml-1 text-slate-400 font-normal">({{ generated_titles|length }})</span>
-        </h2>
-        <p class="mt-1 text-xs text-slate-500">
-          gpt-4o-mini's adjacent titles, derived from your seed titles.
-          We searched Apollo for people with these titles at <strong>{{ account_name }}</strong>.
+    {# --- Editor: titles + domain --- #}
+    {% if not error or generated_titles %}
+    <section class="mb-6 rounded-lg bg-white border border-slate-200 p-5 shadow-sm">
+      <h2 class="text-sm font-semibold text-slate-900 mb-1">Step 1 — Confirm the search</h2>
+      <p class="text-xs text-slate-500 mb-4">
+        We pre-filled adjacent titles (AI) and the company domain (Apollo).
+        Edit anything before running — each search costs one Google CSE call
+        per title (CSE free tier is 100/day).
+      </p>
+
+      <label class="block mb-4">
+        <span class="text-[11px] uppercase tracking-wider text-slate-500">Company domain</span>
+        <input id="prospect-domain" type="text" value="{{ resolved_domain }}"
+               placeholder="e.g. equals.com"
+               class="mt-1 w-full max-w-sm rounded-md border border-slate-300 px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+        <p class="mt-1 text-[11px] text-slate-500">
+          {% if resolved_domain %}
+            Resolved as <strong>{{ resolved_company_name or account_name }}</strong> via Apollo.
+            Wrong company? Override here.
+          {% else %}
+            Apollo didn't resolve a domain — paste the company's website (without https://).
+          {% endif %}
         </p>
-        <div class="mt-3 flex flex-wrap gap-1.5">
+      </label>
+
+      <div class="mb-3">
+        <div class="text-[11px] uppercase tracking-wider text-slate-500 mb-1.5">
+          Titles to search
+          (<span id="title-count">{{ generated_titles|length }}</span>)
+        </div>
+        <div id="title-chips" class="flex flex-wrap gap-1.5">
           {% for t in generated_titles %}
-            <span class="inline-block text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 border border-slate-200">
-              {{ t }}
+            <span class="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-full bg-slate-100 text-slate-800 border border-slate-200"
+                  data-title>
+              <span data-title-text>{{ t }}</span>
+              <button type="button" data-remove-title
+                      class="text-slate-400 hover:text-rose-600 leading-none px-0.5"
+                      aria-label="Remove">×</button>
             </span>
           {% endfor %}
         </div>
-      </section>
-    {% endif %}
-
-    {# --- Candidates from Apollo --- #}
-    <section class="rounded-lg bg-white border border-slate-200 p-5 shadow-sm">
-      <div class="flex items-center justify-between gap-3 mb-3">
-        <h2 class="text-sm font-semibold text-slate-900">
-          Suggested new targets
-          {% if candidates %}
-            <span class="ml-1 text-slate-400 font-normal">({{ candidates|length }})</span>
-          {% endif %}
-        </h2>
-        <a href="{{ request.path }}"
-           class="text-xs px-3 py-1 rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">
-          ↻ Re-run pipeline
-        </a>
+        <form id="add-title-form" class="mt-2 flex gap-2 max-w-md">
+          <input id="add-title-input" type="text" placeholder="Add a title…"
+                 class="flex-1 rounded-md border border-slate-300 px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+          <button type="submit"
+                  class="text-xs px-3 py-1.5 rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">
+            + Add
+          </button>
+        </form>
+        <p class="mt-1.5 text-[11px] text-slate-500">
+          Click <span class="font-mono">×</span> on any chip to remove it.
+          {# TODO: phase 2 — save current title set as a named persona for reuse on other accounts. #}
+        </p>
       </div>
 
-      {% if not candidates and not error %}
-        <div class="text-sm text-slate-500 py-8 text-center">
-          No new candidates found.
-          {% if generated_titles %}
-            Apollo returned 0 people at <strong>{{ account_name }}</strong> matching any of the AI-expanded titles
-            (after deduping against your existing targets).
-          {% endif %}
-        </div>
-      {% endif %}
+      <div class="mt-5 flex items-center gap-3">
+        <button type="button" id="prospect-run-btn"
+                class="inline-flex items-center justify-center rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed">
+          🔮 Find lookalike targets
+        </button>
+        <span id="prospect-run-status" class="text-xs text-slate-500"></span>
+      </div>
+    </section>
+    {% endif %}
 
-      {% if candidates %}
-        <ul class="divide-y divide-slate-200">
-          {% for c in candidates %}
-            <li class="py-3 flex items-start gap-3" data-candidate-row data-linkedin="{{ c.linkedin_url }}">
-              <div class="flex-shrink-0 w-9 h-9 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center text-xs font-semibold">
-                {{ (c.first_name[0] if c.first_name else '?') }}{{ (c.last_name[0] if c.last_name else '') }}
-              </div>
-              <div class="flex-1 min-w-0">
-                <div class="text-sm font-semibold text-slate-900">{{ c.name }}</div>
-                <div class="text-xs text-slate-600">{{ c.title }}</div>
-                <div class="mt-1 flex items-center gap-3 text-[11px] text-slate-500">
-                  <a href="{{ c.linkedin_url }}" target="_blank" rel="noopener"
-                     class="text-indigo-700 hover:underline">↗ LinkedIn</a>
-                  {% if c.email_status %}
-                    <span class="text-slate-400">email: {{ c.email_status }}</span>
-                  {% endif %}
-                </div>
-              </div>
-              <button type="button" data-add-btn data-linkedin="{{ c.linkedin_url }}"
-                      class="flex-shrink-0 inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md bg-indigo-600 text-white font-medium hover:bg-indigo-700">
-                + Add as target
-              </button>
-            </li>
-          {% endfor %}
-        </ul>
-      {% endif %}
+    {# --- Results --- #}
+    <section id="prospect-results" class="rounded-lg bg-white border border-slate-200 p-5 shadow-sm">
+      <h2 class="text-sm font-semibold text-slate-900">Suggested new targets</h2>
+      <p id="prospect-results-empty" class="mt-3 text-sm text-slate-500 py-8 text-center">
+        Run a search above to see suggestions.
+      </p>
+      <ul id="prospect-results-list" class="divide-y divide-slate-200 hidden"></ul>
     </section>
 
     <footer class="text-xs text-slate-400 text-center mt-12">
@@ -139,42 +134,170 @@
 
   <script>
   (function () {
-    document.querySelectorAll('[data-add-btn]').forEach(function (btn) {
-      btn.addEventListener('click', function () {
-        var url = btn.getAttribute('data-linkedin') || '';
+    const chipsEl = document.getElementById('title-chips');
+    const addForm = document.getElementById('add-title-form');
+    const addInput = document.getElementById('add-title-input');
+    const countEl = document.getElementById('title-count');
+    const domainInput = document.getElementById('prospect-domain');
+    const runBtn = document.getElementById('prospect-run-btn');
+    const runStatus = document.getElementById('prospect-run-status');
+    const resultsEmpty = document.getElementById('prospect-results-empty');
+    const resultsList = document.getElementById('prospect-results-list');
+    const accountKey = {{ (account_key or '')|tojson }};
+    const companyName = {{ (resolved_company_name or account_name or '')|tojson }};
+
+    function updateCount() {
+      if (countEl) countEl.textContent = chipsEl.querySelectorAll('[data-title]').length;
+    }
+
+    function makeChip(text) {
+      const span = document.createElement('span');
+      span.className = 'inline-flex items-center gap-1 text-xs px-2 py-1 rounded-full bg-slate-100 text-slate-800 border border-slate-200';
+      span.setAttribute('data-title', '');
+      span.innerHTML = '<span data-title-text></span><button type="button" data-remove-title class="text-slate-400 hover:text-rose-600 leading-none px-0.5" aria-label="Remove">×</button>';
+      span.querySelector('[data-title-text]').textContent = text;
+      return span;
+    }
+
+    function currentTitles() {
+      return Array.from(chipsEl.querySelectorAll('[data-title-text]'))
+        .map(function (el) { return (el.textContent || '').trim(); })
+        .filter(Boolean);
+    }
+
+    chipsEl && chipsEl.addEventListener('click', function (e) {
+      const btn = e.target.closest('[data-remove-title]');
+      if (!btn) return;
+      const chip = btn.closest('[data-title]');
+      if (chip) chip.remove();
+      updateCount();
+    });
+
+    addForm && addForm.addEventListener('submit', function (e) {
+      e.preventDefault();
+      const val = (addInput.value || '').trim();
+      if (!val) return;
+      const existing = currentTitles().map(function (t) { return t.toLowerCase(); });
+      if (existing.indexOf(val.toLowerCase()) >= 0) {
+        addInput.value = '';
+        return;
+      }
+      chipsEl.appendChild(makeChip(val));
+      addInput.value = '';
+      addInput.focus();
+      updateCount();
+    });
+
+    runBtn && runBtn.addEventListener('click', function () {
+      const titles = currentTitles();
+      const domain = (domainInput.value || '').trim();
+      if (titles.length === 0) {
+        runStatus.textContent = 'Add at least one title.';
+        return;
+      }
+      if (!domain) {
+        runStatus.textContent = 'Enter a company domain.';
+        return;
+      }
+      runBtn.disabled = true;
+      runStatus.textContent = 'Searching…';
+      resultsEmpty.classList.remove('hidden');
+      resultsEmpty.textContent = 'Searching Google for candidates at ' + domain + '…';
+      resultsList.classList.add('hidden');
+      resultsList.innerHTML = '';
+
+      const fd = new FormData();
+      titles.forEach(function (t) { fd.append('titles', t); });
+      fd.append('domain', domain);
+      fd.append('company_name', companyName || '');
+
+      fetch('/prospecting/account/' + encodeURIComponent(accountKey) + '/search', {
+        method: 'POST',
+        body: fd,
+      })
+        .then(function (r) { return r.json().then(function (j) { return {status: r.status, body: j}; }); })
+        .then(function (resp) {
+          runBtn.disabled = false;
+          const data = resp.body || {};
+          if (!data.ok) {
+            runStatus.textContent = '';
+            resultsEmpty.textContent = 'Search failed: ' + (data.error || ('HTTP ' + resp.status));
+            return;
+          }
+          const cands = data.candidates || [];
+          runStatus.textContent = (data.warning ? '(warning: ' + data.warning + ') ' : '') +
+            cands.length + ' candidate' + (cands.length === 1 ? '' : 's') + ' found';
+          if (cands.length === 0) {
+            resultsEmpty.textContent = 'No new candidates found. Try different titles or a different domain.';
+            return;
+          }
+          resultsEmpty.classList.add('hidden');
+          resultsList.classList.remove('hidden');
+          cands.forEach(function (c) { resultsList.appendChild(renderCandidate(c)); });
+        })
+        .catch(function (e) {
+          runBtn.disabled = false;
+          runStatus.textContent = '';
+          resultsEmpty.textContent = 'Network error: ' + e;
+        });
+    });
+
+    function renderCandidate(c) {
+      const li = document.createElement('li');
+      li.className = 'py-3 flex items-start gap-3';
+      li.setAttribute('data-linkedin', c.linkedin_url || '');
+      const initials = ((c.first_name || '?')[0] || '?') + ((c.last_name || '')[0] || '');
+      li.innerHTML = `
+        <div class="flex-shrink-0 w-9 h-9 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center text-xs font-semibold"></div>
+        <div class="flex-1 min-w-0">
+          <div class="text-sm font-semibold text-slate-900"></div>
+          <div class="text-xs text-slate-600" data-cand-title></div>
+          <div class="mt-1 flex items-center gap-3 text-[11px] text-slate-500">
+            <a target="_blank" rel="noopener" class="text-indigo-700 hover:underline" data-cand-link>↗ LinkedIn</a>
+          </div>
+        </div>
+        <button type="button" data-add-btn
+                class="flex-shrink-0 inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md bg-indigo-600 text-white font-medium hover:bg-indigo-700">
+          + Add as target
+        </button>
+      `;
+      li.querySelector('.bg-emerald-100').textContent = initials.toUpperCase();
+      li.querySelector('.text-sm.font-semibold').textContent = c.name || '(unknown)';
+      li.querySelector('[data-cand-title]').textContent = c.title || '';
+      const link = li.querySelector('[data-cand-link]');
+      link.href = c.linkedin_url || '#';
+
+      li.querySelector('[data-add-btn]').addEventListener('click', function (e) {
+        const btn = e.currentTarget;
+        const url = c.linkedin_url || '';
         if (!url) return;
         btn.disabled = true;
-        var originalText = btn.textContent;
+        const orig = btn.textContent;
         btn.textContent = 'Adding…';
-        var fd = new FormData();
-        fd.append('linkedin_url', url);
-        fetch('/prospecting/suggestion/add', {
-          method: 'POST',
-          body: fd,
-        })
+        const fd2 = new FormData();
+        fd2.append('linkedin_url', url);
+        fetch('/prospecting/suggestion/add', { method: 'POST', body: fd2 })
           .then(function (r) { return r.json().then(function (j) { return {status: r.status, body: j}; }); })
-          .then(function (resp) {
-            if (resp.body && resp.body.ok) {
+          .then(function (resp2) {
+            if (resp2.body && resp2.body.ok) {
               btn.textContent = '✓ Added';
               btn.classList.remove('bg-indigo-600', 'hover:bg-indigo-700');
               btn.classList.add('bg-emerald-600', 'cursor-default');
-              // Dim the whole row so the user moves on.
-              var row = btn.closest('[data-candidate-row]');
-              if (row) row.classList.add('opacity-60');
+              li.classList.add('opacity-60');
             } else {
               btn.disabled = false;
-              btn.textContent = originalText;
-              var msg = (resp.body && (resp.body.error || resp.body.detail)) || ('HTTP ' + resp.status);
-              alert('Add failed: ' + msg);
+              btn.textContent = orig;
+              alert('Add failed: ' + ((resp2.body && (resp2.body.error || resp2.body.detail)) || ('HTTP ' + resp2.status)));
             }
           })
-          .catch(function (e) {
+          .catch(function (err) {
             btn.disabled = false;
-            btn.textContent = originalText;
-            alert('Network error: ' + e);
+            btn.textContent = orig;
+            alert('Network error: ' + err);
           });
       });
-    });
+      return li;
+    }
   })();
   </script>
 </body>

@@ -33,7 +33,8 @@ import requests
 from linkedin_resolver import resolve_linkedin, is_cacheable as _resolver_is_cacheable
 from prospecting import (
     generate_adjacent_titles as _prospecting_generate_titles,
-    apollo_search_people_at_account as _prospecting_apollo_search,
+    apollo_find_org as _prospecting_find_org,
+    search_people_at_account as _prospecting_search_people,
     dedupe_against_existing as _prospecting_dedupe,
 )
 
@@ -4835,22 +4836,14 @@ def new_paths_view():
     )
 
 
-@app.route("/prospecting/account/<path:account_key>", methods=["GET"])
-def prospecting_account_view(account_key):
-    """Auto-prospecting prototype: given an account where the user already
-    has targets, find more candidates at the same account with adjacent
-    titles. Uses gpt-4o-mini to expand the seed titles + Apollo's
-    mixed_people/search to surface real candidates.
-
-    Pipeline runs synchronously on every page load — no caching yet, on
-    purpose, so it's easy to iterate on the prompt + Apollo filters.
-    Hit Refresh to re-run.
+def _prospecting_collect_seeds(account_key: str):
+    """Helper for both the editor + search routes: pulls all targets at the
+    given account_key bucket and returns
+        (seeds, display_name, seed_titles_ordered, company_linkedin,
+         existing_linkedin_norm).
     """
     targets_all, _ = fetch_all_targets()
     key_lower = (account_key or "").lower()
-
-    # Pull every target at this account so we know the seed titles and the
-    # LinkedIn-URL dedup set.
     seeds: list[dict] = []
     existing_linkedin_norm: set = set()
     for t in targets_all:
@@ -4860,26 +4853,10 @@ def prospecting_account_view(account_key):
         norm = _normalize_linkedin(t.get("linkedinUrl") or "")
         if norm:
             existing_linkedin_norm.add(norm)
-
-    if not seeds:
-        return render_template(
-            "prospecting_account.html",
-            account_name=account_key,
-            seeds=[],
-            seed_titles=[],
-            generated_titles=[],
-            candidates=[],
-            error="No existing targets at this account — prospecting needs at "
-                  "least one seed target so it knows what adjacent titles to look for.",
-            api_key_set=bool(API_KEY),
-            active="prospecting",
-        )
-
     display_name = (
-        _target_company_with_fallback(seeds[0]) or account_key
-    )
+        _target_company_with_fallback(seeds[0]) if seeds else account_key
+    ) or account_key
 
-    # Unique seed titles, case-insensitive, preserve display case of first hit.
     seed_titles_ordered: list[str] = []
     seen_lower: set = set()
     for t in seeds:
@@ -4892,25 +4869,80 @@ def prospecting_account_view(account_key):
         seen_lower.add(k)
         seed_titles_ordered.append(title)
 
+    company_linkedin = ""
+    for t in seeds:
+        pos = t.get("position") or {}
+        url = (pos.get("companyLinkedinUrl") or "").strip()
+        if url:
+            company_linkedin = url
+            break
+
+    return seeds, display_name, seed_titles_ordered, company_linkedin, existing_linkedin_norm
+
+
+@app.route("/prospecting/account/<path:account_key>", methods=["GET"])
+def prospecting_account_view(account_key):
+    """Editor step. Loads seed targets + AI-expanded titles + the resolved
+    Apollo company record, then renders an editable page where the user
+    can:
+
+      - Add/remove/edit titles before searching.
+      - Override the resolved domain inline.
+      - Click "Find lookalike targets" to POST → the /search endpoint.
+
+    The actual people-search runs on POST, not here — load time stays
+    cheap (one OpenAI title call + one Apollo company-search call).
+    """
+    seeds, display_name, seed_titles_ordered, company_linkedin, _ = (
+        _prospecting_collect_seeds(account_key)
+    )
+
+    if not seeds:
+        return render_template(
+            "prospecting_account.html",
+            account_name=account_key,
+            seeds=[],
+            seed_titles=[],
+            generated_titles=[],
+            resolved_domain="",
+            resolved_company_name="",
+            error="No existing targets at this account — prospecting needs at "
+                  "least one seed target so it knows what adjacent titles to look for.",
+            api_key_set=bool(API_KEY),
+            active="prospecting",
+        )
+
     keys = _load_resolver_keys()
     openai_key = (keys.get("openai_api_key") or "").strip()
     apollo_key = (keys.get("apollo_api_key") or "").strip()
+    cse_key = (keys.get("google_cse_api_key") or "").strip()
+    cse_id = (keys.get("google_cse_id") or "").strip()
+
+    missing = []
+    if not openai_key:
+        missing.append("OpenAI")
+    if not (cse_key and cse_id):
+        missing.append("Google CSE")
+    if not apollo_key:
+        # Apollo only needed for the domain resolution step. Soft-required.
+        missing.append("Apollo (for domain resolution)")
 
     error: str | None = None
     generated_titles: list[str] = []
-    candidates: list[dict] = []
+    resolved_domain = ""
+    resolved_company_name = display_name
 
-    if not openai_key or not apollo_key:
-        missing = []
-        if not openai_key:
-            missing.append("OPENAI_API_KEY")
-        if not apollo_key:
-            missing.append("APOLLO_API_KEY")
+    if not openai_key:
         error = (
-            f"Prospecting needs {' + '.join(missing)} configured. "
-            f"Set the env var(s) and restart, or paste them at "
-            f"<a class='underline' href='/settings/linkedin-resolver'>"
-            f"/settings/linkedin-resolver</a>."
+            "Prospecting needs an OpenAI key for title expansion. "
+            "Paste one at <a class='underline' href='/settings/api-keys'>"
+            "/settings/api-keys</a>."
+        )
+    elif not (cse_key and cse_id):
+        error = (
+            "Prospecting needs Google Custom Search keys to find people. "
+            "Paste them at <a class='underline' href='/settings/api-keys'>"
+            "/settings/api-keys</a>."
         )
     elif not seed_titles_ordered:
         error = (
@@ -4918,32 +4950,87 @@ def prospecting_account_view(account_key):
             "extrapolate adjacent titles without seed data."
         )
     else:
+        # 1. Resolve canonical company + domain via Apollo (if available).
+        if apollo_key:
+            org, _org_err = _prospecting_find_org(
+                display_name, apollo_key, company_linkedin_url=company_linkedin,
+            )
+            if org:
+                resolved_domain = org.get("primary_domain") or ""
+                resolved_company_name = org.get("name") or display_name
+        # 2. Expand titles via gpt-4o-mini.
         titles, title_err = _prospecting_generate_titles(
-            seed_titles_ordered, display_name, openai_key,
+            seed_titles_ordered, resolved_company_name, openai_key,
         )
         if title_err:
             error = f"Title-generation failed: {title_err}"
         else:
             generated_titles = titles
-            cands, apollo_err = _prospecting_apollo_search(
-                display_name, titles, apollo_key,
-            )
-            if apollo_err:
-                error = f"Apollo search failed: {apollo_err}"
-            else:
-                candidates = _prospecting_dedupe(cands, existing_linkedin_norm)
 
     return render_template(
         "prospecting_account.html",
         account_name=display_name,
+        account_key=account_key,
         seeds=[_enrich_target(t) for t in seeds],
         seed_titles=seed_titles_ordered,
         generated_titles=generated_titles,
-        candidates=candidates,
+        resolved_domain=resolved_domain,
+        resolved_company_name=resolved_company_name,
+        company_linkedin_url=company_linkedin,
         error=error,
         api_key_set=bool(API_KEY),
         active="prospecting",
     )
+
+
+@app.route("/prospecting/account/<path:account_key>/search", methods=["POST"])
+def prospecting_account_search(account_key):
+    """Search step. Takes the final title list + domain (both editable in
+    the UI) and runs the CSE people-search. Returns JSON the page swaps
+    into the results section.
+
+    Body params:
+      titles[]       — final title list (may differ from AI suggestions)
+      domain         — resolved or user-overridden domain to scope the search
+      company_name   — display name for fallback / candidate org_name
+    """
+    seeds, display_name, _, _, existing_linkedin_norm = (
+        _prospecting_collect_seeds(account_key)
+    )
+    if not seeds:
+        return jsonify({"ok": False, "error": "no seed targets at this account"}), 404
+
+    titles = [t.strip() for t in (request.form.getlist("titles") or []) if t.strip()]
+    if not titles:
+        # Also accept JSON-style body for ergonomics from a fetch() with
+        # form-encoded array.
+        try:
+            j = request.get_json(silent=True) or {}
+            titles = [t.strip() for t in (j.get("titles") or []) if t and t.strip()]
+        except Exception:  # noqa: BLE001
+            pass
+    if not titles:
+        return jsonify({"ok": False, "error": "at least one title required"}), 400
+
+    domain = (request.form.get("domain") or "").strip().lower()
+    company_name = (request.form.get("company_name") or display_name or "").strip()
+    if not domain and not company_name:
+        return jsonify({"ok": False, "error": "domain or company_name required"}), 400
+
+    keys = _load_resolver_keys()
+    cands, err = _prospecting_search_people(company_name, titles, domain, keys)
+    if err and not cands:
+        return jsonify({"ok": False, "error": err}), 502
+
+    cands = _prospecting_dedupe(cands, existing_linkedin_norm)
+    return jsonify({
+        "ok": True,
+        "candidates": cands,
+        "count": len(cands),
+        "warning": err,  # may be set even when we have partial results
+        "titles_searched": titles,
+        "domain_searched": domain,
+    })
 
 
 @app.route("/prospecting/suggestion/add", methods=["POST"])
