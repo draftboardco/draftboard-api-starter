@@ -31,6 +31,11 @@ from flask import Flask, render_template, request, jsonify, redirect, url_for
 import requests
 
 from linkedin_resolver import resolve_linkedin, is_cacheable as _resolver_is_cacheable
+from prospecting import (
+    generate_adjacent_titles as _prospecting_generate_titles,
+    apollo_search_people_at_account as _prospecting_apollo_search,
+    dedupe_against_existing as _prospecting_dedupe,
+)
 
 API_BASE = "https://intros.draftboard.com/api/v1/integration"
 
@@ -4828,6 +4833,164 @@ def new_paths_view():
         active="new_paths",
         api_key_set=bool(API_KEY),
     )
+
+
+@app.route("/prospecting/account/<path:account_key>", methods=["GET"])
+def prospecting_account_view(account_key):
+    """Auto-prospecting prototype: given an account where the user already
+    has targets, find more candidates at the same account with adjacent
+    titles. Uses gpt-4o-mini to expand the seed titles + Apollo's
+    mixed_people/search to surface real candidates.
+
+    Pipeline runs synchronously on every page load — no caching yet, on
+    purpose, so it's easy to iterate on the prompt + Apollo filters.
+    Hit Refresh to re-run.
+    """
+    targets_all, _ = fetch_all_targets()
+    key_lower = (account_key or "").lower()
+
+    # Pull every target at this account so we know the seed titles and the
+    # LinkedIn-URL dedup set.
+    seeds: list[dict] = []
+    existing_linkedin_norm: set = set()
+    for t in targets_all:
+        company = (_target_company_with_fallback(t) or "").lower()
+        if company == key_lower:
+            seeds.append(t)
+        norm = _normalize_linkedin(t.get("linkedinUrl") or "")
+        if norm:
+            existing_linkedin_norm.add(norm)
+
+    if not seeds:
+        return render_template(
+            "prospecting_account.html",
+            account_name=account_key,
+            seeds=[],
+            seed_titles=[],
+            generated_titles=[],
+            candidates=[],
+            error="No existing targets at this account — prospecting needs at "
+                  "least one seed target so it knows what adjacent titles to look for.",
+            api_key_set=bool(API_KEY),
+            active="prospecting",
+        )
+
+    display_name = (
+        _target_company_with_fallback(seeds[0]) or account_key
+    )
+
+    # Unique seed titles, case-insensitive, preserve display case of first hit.
+    seed_titles_ordered: list[str] = []
+    seen_lower: set = set()
+    for t in seeds:
+        title = ((t.get("position") or {}).get("title") or "").strip()
+        if not title:
+            continue
+        k = title.lower()
+        if k in seen_lower:
+            continue
+        seen_lower.add(k)
+        seed_titles_ordered.append(title)
+
+    keys = _load_resolver_keys()
+    openai_key = (keys.get("openai_api_key") or "").strip()
+    apollo_key = (keys.get("apollo_api_key") or "").strip()
+
+    error: str | None = None
+    generated_titles: list[str] = []
+    candidates: list[dict] = []
+
+    if not openai_key or not apollo_key:
+        missing = []
+        if not openai_key:
+            missing.append("OPENAI_API_KEY")
+        if not apollo_key:
+            missing.append("APOLLO_API_KEY")
+        error = (
+            f"Prospecting needs {' + '.join(missing)} configured. "
+            f"Set the env var(s) and restart, or paste them at "
+            f"<a class='underline' href='/settings/linkedin-resolver'>"
+            f"/settings/linkedin-resolver</a>."
+        )
+    elif not seed_titles_ordered:
+        error = (
+            "No titles on the existing targets at this account — can't "
+            "extrapolate adjacent titles without seed data."
+        )
+    else:
+        titles, title_err = _prospecting_generate_titles(
+            seed_titles_ordered, display_name, openai_key,
+        )
+        if title_err:
+            error = f"Title-generation failed: {title_err}"
+        else:
+            generated_titles = titles
+            cands, apollo_err = _prospecting_apollo_search(
+                display_name, titles, apollo_key,
+            )
+            if apollo_err:
+                error = f"Apollo search failed: {apollo_err}"
+            else:
+                candidates = _prospecting_dedupe(cands, existing_linkedin_norm)
+
+    return render_template(
+        "prospecting_account.html",
+        account_name=display_name,
+        seeds=[_enrich_target(t) for t in seeds],
+        seed_titles=seed_titles_ordered,
+        generated_titles=generated_titles,
+        candidates=candidates,
+        error=error,
+        api_key_set=bool(API_KEY),
+        active="prospecting",
+    )
+
+
+@app.route("/prospecting/suggestion/add", methods=["POST"])
+def prospecting_add_suggestion():
+    """Add a prospected suggestion as a real target. Reuses the existing
+    /import POST endpoint internally so the candidate flows through the
+    same Draftboard-API target creation path as a manual /import. Tags
+    the new target as 'prospected' so it's findable later.
+    """
+    linkedin_url = (request.form.get("linkedin_url") or "").strip()
+    if not linkedin_url:
+        return jsonify({"ok": False, "error": "missing linkedin_url"}), 400
+
+    urls = normalize_linkedin_urls(linkedin_url)
+    if not urls:
+        return jsonify({"ok": False, "error": "invalid linkedin_url"}), 400
+
+    # Build a minimal request body matching what /import POST expects,
+    # then hand off to the Draftboard /targets/import API call by calling
+    # the same import core function the form handler uses.
+    if not API_KEY:
+        return jsonify({"ok": False, "error": "DRAFTBOARD_API_KEY not set"}), 400
+
+    payload = {
+        "linkedinUrls": urls,
+        "tags": ["prospected"],
+    }
+    try:
+        r = requests.post(
+            f"{API_BASE}/targets/import",
+            headers=_auth_headers(),
+            json=payload,
+            timeout=20,
+        )
+    except requests.RequestException as e:
+        return jsonify({"ok": False, "error": f"network: {type(e).__name__}"}), 502
+    if r.status_code not in (200, 201, 202):
+        return jsonify({
+            "ok": False,
+            "error": f"draftboard {r.status_code}",
+            "detail": r.text[:300],
+        }), r.status_code
+    try:
+        data = r.json()
+    except ValueError:
+        data = {}
+    return jsonify({"ok": True, "imported": data})
 
 
 @app.route("/sync/status", methods=["GET"])
