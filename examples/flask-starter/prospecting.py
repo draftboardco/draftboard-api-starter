@@ -39,13 +39,147 @@ OPENAI_MODEL = "gpt-4o-mini"
 DEFAULT_TITLE_COUNT = 12
 APOLLO_PER_PAGE = 20
 
-# CSE returns up to 10 results per query. We do one query per title, so
-# `results_per_title` caps how many LinkedIn URLs we ask for per title.
-CSE_RESULTS_PER_TITLE = 5
+# CSE returns up to 10 results per query. With AI re-rank downstream we
+# can afford to cast a wider net per query — the AI filter throws out
+# false positives reliably enough that higher recall is the bigger win.
+CSE_RESULTS_PER_TITLE = 10
 
 
 def _log(msg: str) -> None:
     print(f"[prospecting] {msg}", file=sys.stderr, flush=True)
+
+
+# ---------- AI re-rank (the 90/10 accuracy lever) ------------------------
+
+def ai_filter_candidates_at_company(
+    candidates: list[dict],
+    company_name: str,
+    openai_key: str,
+    company_linkedin_url: str = "",
+    domain: str = "",
+) -> tuple[list[dict], str | None]:
+    """Single batch call to gpt-4o-mini: which candidates are CURRENTLY at
+    `company_name`?
+
+    CSE search by company-name keyword returns lots of false positives —
+    people who once worked there, people whose profile mentions the company
+    in unrelated context, sister-company employees (e.g., "Equals Money"
+    when searching "Equals FP&A"). A text heuristic can catch the obvious
+    cases (`"VP Sales @ OtherCo"`) but misses subtler ones.
+
+    The AI sees the company's full identity (name + LinkedIn URL + domain),
+    plus each candidate's parsed name/title/snippet, and returns a list of
+    indexes to KEEP along with a per-candidate confidence score (0-1) and
+    a one-line reason. Single call — cheap (~$0.0005 per search).
+
+    Returns (kept_candidates, error). Each kept candidate is annotated with
+    `ai_confidence` (float) and `ai_reason` (str). Sorted by confidence
+    desc so the most-likely-good results render first.
+    """
+    if not openai_key:
+        return candidates, "openai key not configured — skipping AI re-rank"
+    if not candidates:
+        return [], None
+    try:
+        from openai import OpenAI
+    except ImportError:
+        return candidates, "openai package not installed — skipping AI re-rank"
+
+    # Build a numbered list of candidates for the prompt. Cap at 50 to keep
+    # the prompt small + the response parseable; a single CSE pass rarely
+    # returns more anyway.
+    cap = candidates[:50]
+    lines = []
+    for i, c in enumerate(cap):
+        snippet = (c.get("snippet") or "").strip()
+        if len(snippet) > 200:
+            snippet = snippet[:200] + "…"
+        lines.append(
+            f"{i}. {c.get('name') or '(unknown)'} — {c.get('title') or '(no title)'} "
+            f"| snippet: {snippet}"
+        )
+    candidates_block = "\n".join(lines)
+
+    li_hint = f"\n- LinkedIn URL: {company_linkedin_url}" if company_linkedin_url else ""
+    domain_hint = f"\n- Domain: {domain}" if domain else ""
+
+    prompt = (
+        f"You're filtering Google search results for a B2B sales prospecting tool. "
+        f"You are SKEPTICAL by default — false positives hurt the user more than "
+        f"false negatives.\n\n"
+        f"TARGET COMPANY:\n"
+        f"- Name: {company_name}{li_hint}{domain_hint}\n\n"
+        f"For each candidate below, decide if they are CURRENTLY working at THIS "
+        f"specific company. Reject if any of these apply:\n"
+        f"- The title text mentions a DIFFERENT company (e.g. 'VP Sales @ Attio' "
+        f"  when the target is Stripe → REJECT; the search engine returned this "
+        f"  because the person's bio mentions Stripe elsewhere, not because they "
+        f"  work there).\n"
+        f"- The title text is generic (e.g. 'Operator | Advisor | Board') with no "
+        f"  current-company anchor → confidence ≤ 0.30.\n"
+        f"- The company name shown is a similar but distinct company (e.g. 'Equals "
+        f"  Money' vs 'Equals' / 'Stripe Identity LLC' vs 'Stripe Inc'). When in "
+        f"  doubt about which one is the target, look at the LinkedIn URL hint and "
+        f"  the domain — they unambiguously identify the right company.\n"
+        f"- Former employee (snippet uses past tense, 'ex-Stripe', etc.) → REJECT.\n\n"
+        f"CANDIDATES:\n{candidates_block}\n\n"
+        f"Return per-candidate confidence (0.0–1.0) and a one-line reason. Score:\n"
+        f"- 0.85+: title TEXT EXPLICITLY names this exact company in a current-tense, "
+        f"  current-role way (e.g. 'Sales Manager at {company_name}')\n"
+        f"- 0.55–0.84: title role is plausible AND no contradicting signal (no "
+        f"  '@ OtherCo', no 'ex-...', no sister-company hint)\n"
+        f"- 0.20–0.54: ambiguous — weak company signal\n"
+        f"- below 0.20: clearly at a different company OR no current-work signal\n\n"
+        f"DO NOT give 0.85+ unless the candidate's title TEXT explicitly contains "
+        f"the company name (or a clear, unambiguous variant). Generic titles like "
+        f"'Operator' or 'Advisor' should not score above 0.40 regardless of how "
+        f"plausible the role sounds.\n\n"
+        f'Output JSON: {{"results": [{{"index": 0, "confidence": 0.0, "reason": "..."}}, ...]}}'
+    )
+
+    try:
+        client = OpenAI(api_key=openai_key)
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a B2B sales prospecting research assistant. Output only valid JSON."},
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.1,
+        )
+        content = resp.choices[0].message.content or ""
+        data = json.loads(content)
+    except json.JSONDecodeError as e:
+        _log(f"AI re-rank returned non-JSON: {e}")
+        return candidates, "AI re-rank returned non-JSON"
+    except Exception as e:  # noqa: BLE001
+        _log(f"AI re-rank error: {type(e).__name__}: {e}")
+        return candidates, f"AI re-rank error: {type(e).__name__}"
+
+    # Default min-confidence: keep anything 0.45+. Borderline rows still
+    # appear but get sorted to the bottom. Below 0.45 is "obviously wrong"
+    # territory per our prompt's bucket guidance.
+    MIN_CONFIDENCE = 0.45
+    annotated: list[tuple[float, dict]] = []
+    seen_indexes: set = set()
+    for row in (data.get("results") or []):
+        try:
+            idx = int(row.get("index"))
+            conf = float(row.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if idx in seen_indexes or idx < 0 or idx >= len(cap):
+            continue
+        seen_indexes.add(idx)
+        if conf < MIN_CONFIDENCE:
+            continue
+        c = dict(cap[idx])
+        c["ai_confidence"] = round(conf, 2)
+        c["ai_reason"] = (row.get("reason") or "").strip()[:200]
+        annotated.append((conf, c))
+    annotated.sort(key=lambda x: x[0], reverse=True)
+    return [c for _, c in annotated], None
 
 
 # ---------- Title generation ---------------------------------------------
@@ -494,10 +628,13 @@ def cse_search_people_at_company(
             found_title = parts[1] if len(parts) >= 2 else ""
             found_org = parts[2] if len(parts) >= 3 else (company_name or "")
 
-            # Drop candidates that the CSE-parsed title strongly suggests
-            # are at a DIFFERENT company. CSE search is loose; many
-            # results are "people who mention {company} in their profile"
-            # rather than "current employees of {company}".
+            # Two-layer filter: cheap text heuristic first (drops obvious
+            # off-target like "VP Sales @ Attio" when searching Stripe),
+            # then AI re-rank in `search_people_at_account` handles the
+            # subtler judgment. The heuristic alone misses things like
+            # "Stripe" appearing in a former-employee's bio, but it's
+            # nearly free and catches the most common false positives
+            # that the AI would otherwise charitably pass through.
             if not _candidate_at_company(full_name, raw_title, company_name):
                 continue
 
@@ -523,42 +660,74 @@ def search_people_at_account(
     domain: str,
     keys: dict,
     apollo_first: bool = False,
+    company_linkedin_url: str = "",
+    skip_ai_rerank: bool = False,
 ) -> tuple[list[dict], str | None]:
-    """High-level prospector: CSE-first (default), Apollo-fallback. Returns
-    `(candidates, error)`.
+    """High-level prospector: CSE-first (default), Apollo-fallback,
+    AI-re-ranked. Returns `(candidates, error)`.
+
+    Pipeline:
+      1. CSE (or Apollo fallback) returns raw candidates.
+      2. AI re-rank (gpt-4o-mini) filters to candidates the model believes
+         are CURRENTLY at the target company — single batch call. Each
+         survivor is annotated with `ai_confidence` (0-1) and `ai_reason`.
+      3. Results are sorted by confidence desc.
+
+    The AI step is the 90/10-accuracy lever for CSE results (text-keyword
+    search is loose; AI filters out sister-companies, former employees,
+    incidental mentions). Skippable via `skip_ai_rerank=True` for the
+    rare case where the caller doesn't have an OpenAI key.
 
     `keys` is a dict with `google_cse_api_key`, `google_cse_id`,
-    `apollo_api_key` (any subset). We prefer CSE because most users on
-    Apollo's free/starter tier get `linkedin_url: None` back from Apollo's
-    people search — making those rows useless for /import handoff.
+    `apollo_api_key`, `openai_api_key` (any subset).
     """
     cse_key = (keys.get("google_cse_api_key") or "").strip()
     cse_id = (keys.get("google_cse_id") or "").strip()
     apollo_key = (keys.get("apollo_api_key") or "").strip()
+    openai_key = (keys.get("openai_api_key") or "").strip()
 
     use_cse = bool(cse_key and cse_id)
     use_apollo = bool(apollo_key)
+
+    raw: list[dict] = []
+    err: str | None = None
 
     if apollo_first and use_apollo:
         cands, err = apollo_search_people_at_account(
             domain or "", titles, apollo_key, company_name=company_name,
         )
-        # Apollo candidates with linkedin_url=None are useless — filter.
         cands = [c for c in cands if c.get("linkedin_url")]
         if cands:
-            return cands, None
+            raw = cands
+            err = None
         # Apollo returned nothing usable; fall through to CSE.
 
-    if use_cse:
-        return cse_search_people_at_company(
+    if not raw and use_cse:
+        raw, err = cse_search_people_at_company(
             company_name, titles, cse_key, cse_id, domain=domain,
         )
 
-    if use_apollo:
-        cands, err = apollo_search_people_at_account(
+    if not raw and use_apollo and not apollo_first:
+        cands, ap_err = apollo_search_people_at_account(
             domain or "", titles, apollo_key, company_name=company_name,
         )
-        cands = [c for c in cands if c.get("linkedin_url")]
-        return cands, err
+        raw = [c for c in cands if c.get("linkedin_url")]
+        if ap_err and not raw:
+            err = ap_err
 
-    return [], "no search engine configured (need Google CSE keys OR Apollo key)"
+    if not raw and not use_cse and not use_apollo:
+        return [], "no search engine configured (need Google CSE keys OR Apollo key)"
+
+    # AI re-rank — the big quality lever. Returns candidates annotated
+    # with `ai_confidence` + `ai_reason`, sorted by confidence desc.
+    if raw and not skip_ai_rerank and openai_key:
+        filtered, ai_err = ai_filter_candidates_at_company(
+            raw, company_name, openai_key,
+            company_linkedin_url=company_linkedin_url, domain=domain,
+        )
+        if ai_err and filtered == raw:
+            # AI step failed but we have raw results — return them, with
+            # the AI error as a soft warning so the UI can surface it.
+            return raw, ai_err
+        return filtered, err
+    return raw, err

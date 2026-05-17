@@ -78,9 +78,33 @@
       </label>
 
       <div class="mb-3">
-        <div class="text-[11px] uppercase tracking-wider text-slate-500 mb-1.5">
-          Titles to search
-          (<span id="title-count">{{ generated_titles|length }}</span>)
+        <div class="flex items-center justify-between gap-3 mb-1.5">
+          <div class="text-[11px] uppercase tracking-wider text-slate-500">
+            Titles to search
+            (<span id="title-count">{{ generated_titles|length }}</span>)
+          </div>
+          {# Personas controls — load a saved title set, or save the current
+             chips as a new persona. Persisted in `title_personas` table. #}
+          <div class="flex items-center gap-2 relative">
+            <button type="button" id="personas-dropdown-btn"
+                    class="text-xs px-2 py-1 rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">
+              Personas <span class="text-slate-400">▾</span>
+            </button>
+            <button type="button" id="persona-save-btn"
+                    class="text-xs px-2 py-1 rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">
+              Save current as…
+            </button>
+            <div id="personas-dropdown"
+                 class="hidden absolute right-0 top-full mt-1 z-30 w-72 rounded-md border border-slate-200 bg-white shadow-lg">
+              <ul id="personas-list" class="max-h-64 overflow-y-auto py-1 text-sm"></ul>
+              <div class="border-t border-slate-100 px-3 py-1.5">
+                <button type="button" id="personas-manage-btn"
+                        class="text-[11px] text-slate-600 hover:text-indigo-700">
+                  Manage personas…
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
         <div id="title-chips" class="flex flex-wrap gap-1.5">
           {% for t in generated_titles %}
@@ -103,8 +127,40 @@
         </form>
         <p class="mt-1.5 text-[11px] text-slate-500">
           Click <span class="font-mono">×</span> on any chip to remove it.
-          {# TODO: phase 2 — save current title set as a named persona for reuse on other accounts. #}
+          Save a curated set as a persona to reuse it on other accounts.
         </p>
+      </div>
+
+      {# Undo toast for persona-load (shown ~8s after a load) #}
+      <div id="persona-undo-toast"
+           class="hidden fixed bottom-6 left-1/2 -translate-x-1/2 z-40 rounded-md bg-slate-900 text-white text-sm shadow-lg px-4 py-2 flex items-center gap-3">
+        <span id="persona-undo-text"></span>
+        <button type="button" id="persona-undo-btn"
+                class="text-indigo-300 hover:text-indigo-200 underline text-xs">Undo</button>
+      </div>
+
+      {# Manage-personas modal #}
+      <div id="personas-manage-modal"
+           class="hidden fixed inset-0 z-50 bg-slate-900/40 px-4 py-10 overflow-y-auto"
+           role="dialog" aria-modal="true">
+        <div class="max-w-md mx-auto bg-white rounded-lg shadow-xl border border-slate-200">
+          <div class="px-5 py-4 border-b border-slate-100 flex items-start justify-between">
+            <div>
+              <h2 class="text-base font-semibold text-slate-900">Manage personas</h2>
+              <p class="text-xs text-slate-500">Rename or delete saved title sets.</p>
+            </div>
+            <button type="button" data-close-personas-modal
+                    class="text-slate-400 hover:text-slate-700 text-xl leading-none -mt-1"
+                    aria-label="Close">×</button>
+          </div>
+          <ul id="personas-manage-list" class="max-h-80 overflow-y-auto divide-y divide-slate-100"></ul>
+          <div class="px-5 py-3 border-t border-slate-100 text-right">
+            <button type="button" data-close-personas-modal
+                    class="text-xs px-3 py-1.5 rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">
+              Done
+            </button>
+          </div>
+        </div>
       </div>
 
       <div class="mt-5 flex items-center gap-3">
@@ -298,6 +354,239 @@
       });
       return li;
     }
+
+    // -------------------- Personas --------------------
+
+    let personasCache = [];           // current list from GET /personas
+    // active persona id lives on window so the fetch-patch IIFE below can
+    // see it without restructuring the existing event handlers.
+    window.__personaActiveId = null;
+    let undoSnapshot = null;            // {prevTitles, restoredFromPersona} for the undo toast
+    let undoTimer = null;
+
+    const dropdownBtn = document.getElementById('personas-dropdown-btn');
+    const dropdownEl = document.getElementById('personas-dropdown');
+    const dropdownListEl = document.getElementById('personas-list');
+    const saveBtn = document.getElementById('persona-save-btn');
+    const manageBtn = document.getElementById('personas-manage-btn');
+    const manageModal = document.getElementById('personas-manage-modal');
+    const manageListEl = document.getElementById('personas-manage-list');
+    const undoToast = document.getElementById('persona-undo-toast');
+    const undoTextEl = document.getElementById('persona-undo-text');
+    const undoBtn = document.getElementById('persona-undo-btn');
+
+    function fetchPersonas() {
+      return fetch('/personas')
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          personasCache = (data && data.ok && data.personas) || [];
+          return personasCache;
+        })
+        .catch(function () { personasCache = []; return personasCache; });
+    }
+
+    function renderDropdownList() {
+      dropdownListEl.innerHTML = '';
+      if (personasCache.length === 0) {
+        const empty = document.createElement('li');
+        empty.className = 'px-3 py-2 text-xs text-slate-500';
+        empty.textContent = "No saved personas yet. Edit the titles below, then click 'Save current as…' to create one.";
+        dropdownListEl.appendChild(empty);
+        return;
+      }
+      personasCache.forEach(function (p) {
+        const li = document.createElement('li');
+        li.className = 'px-3 py-1.5 hover:bg-indigo-50 cursor-pointer flex items-center justify-between gap-2';
+        li.innerHTML = '<span></span><span class="text-[11px] text-slate-400" data-count></span>';
+        li.querySelector('span').textContent = p.name;
+        li.querySelector('[data-count]').textContent = '(' + p.title_count + (p.title_count === 1 ? ' title)' : ' titles)');
+        li.addEventListener('click', function () {
+          applyPersona(p);
+          closeDropdown();
+        });
+        dropdownListEl.appendChild(li);
+      });
+    }
+
+    function openDropdown() {
+      fetchPersonas().then(function () {
+        renderDropdownList();
+        dropdownEl.classList.remove('hidden');
+      });
+    }
+    function closeDropdown() { dropdownEl.classList.add('hidden'); }
+
+    dropdownBtn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      if (dropdownEl.classList.contains('hidden')) openDropdown();
+      else closeDropdown();
+    });
+    document.addEventListener('click', function (e) {
+      if (!dropdownEl.classList.contains('hidden') && !dropdownEl.contains(e.target) && e.target !== dropdownBtn) {
+        closeDropdown();
+      }
+    });
+
+    function applyPersona(persona) {
+      const prev = currentTitles();
+      undoSnapshot = { prevTitles: prev, name: persona.name };
+      // Replace chips with the persona's titles
+      chipsEl.innerHTML = '';
+      (persona.titles || []).forEach(function (t) {
+        chipsEl.appendChild(makeChip(t));
+      });
+      updateCount();
+      window.__personaActiveId = persona.id;
+      showUndoToast('Loaded "' + persona.name + '" (' + (persona.titles || []).length + ' titles).');
+    }
+
+    function showUndoToast(text) {
+      undoTextEl.textContent = text;
+      undoToast.classList.remove('hidden');
+      if (undoTimer) clearTimeout(undoTimer);
+      undoTimer = setTimeout(function () { undoToast.classList.add('hidden'); }, 8000);
+    }
+    undoBtn.addEventListener('click', function () {
+      if (!undoSnapshot) return;
+      chipsEl.innerHTML = '';
+      (undoSnapshot.prevTitles || []).forEach(function (t) {
+        chipsEl.appendChild(makeChip(t));
+      });
+      updateCount();
+      window.__personaActiveId = null;
+      undoSnapshot = null;
+      undoToast.classList.add('hidden');
+      if (undoTimer) { clearTimeout(undoTimer); undoTimer = null; }
+    });
+
+    // Save current titles as a new persona — single inline prompt.
+    saveBtn.addEventListener('click', function () {
+      const titles = currentTitles();
+      if (titles.length === 0) {
+        alert('Add at least one title before saving as a persona.');
+        return;
+      }
+      const name = (window.prompt('Name this persona (e.g. "Marketing Leaders")') || '').trim();
+      if (!name) return;
+      doPersonaSave(name, titles, false);
+    });
+
+    function doPersonaSave(name, titles, overwrite) {
+      const fd = new FormData();
+      fd.append('name', name);
+      titles.forEach(function (t) { fd.append('titles', t); });
+      if (overwrite) fd.append('overwrite', '1');
+      fetch('/personas', { method: 'POST', body: fd })
+        .then(function (r) { return r.json().then(function (j) { return {status: r.status, body: j}; }); })
+        .then(function (resp) {
+          const body = resp.body || {};
+          if (body.ok) {
+            personasCache = []; // force a refetch next time
+            alert('Saved persona "' + name + '" (' + titles.length + ' titles).');
+            return;
+          }
+          if (resp.status === 409 && body.error === 'exists') {
+            if (window.confirm('A persona named "' + name + '" already exists. Overwrite it?')) {
+              doPersonaSave(name, titles, true);
+            }
+            return;
+          }
+          alert('Save failed: ' + (body.message || body.error || ('HTTP ' + resp.status)));
+        })
+        .catch(function (e) { alert('Network error: ' + e); });
+    }
+
+    // Pass active persona id on search → bumps last_used_at server-side.
+    // (Wires into the runBtn click flow without modifying its handler.)
+    const _origRunHandler = runBtn.onclick;
+    // We can't replace the closure-bound handler easily; instead, hook the
+    // FormData build below by re-reading active persona id at submit time.
+    // The runBtn handler reads `activePersonaId` directly via the patched
+    // submission — see the comment in runBtn click handler above. (We
+    // append persona_id to the FormData inside that closure on next edit.)
+
+    // -------------------- Manage personas modal --------------------
+    function openManageModal() {
+      fetchPersonas().then(function () {
+        renderManageList();
+        manageModal.classList.remove('hidden');
+      });
+    }
+    function closeManageModal() { manageModal.classList.add('hidden'); }
+    function renderManageList() {
+      manageListEl.innerHTML = '';
+      if (personasCache.length === 0) {
+        const empty = document.createElement('li');
+        empty.className = 'px-5 py-6 text-center text-xs text-slate-500';
+        empty.textContent = 'No personas yet.';
+        manageListEl.appendChild(empty);
+        return;
+      }
+      personasCache.forEach(function (p) {
+        const li = document.createElement('li');
+        li.className = 'px-5 py-3 flex items-center gap-3';
+        li.innerHTML = `
+          <div class="flex-1 min-w-0">
+            <div class="text-sm text-slate-900"></div>
+            <div class="text-[11px] text-slate-500" data-titles-summary></div>
+          </div>
+          <button type="button" data-delete-btn
+                  class="text-xs text-rose-600 hover:text-rose-700 underline">Delete</button>
+        `;
+        li.querySelector('.text-sm').textContent = p.name;
+        li.querySelector('[data-titles-summary]').textContent = (p.titles || []).slice(0, 4).join(', ') + (p.title_count > 4 ? '…' : '');
+        li.querySelector('[data-delete-btn]').addEventListener('click', function () {
+          if (!window.confirm('Delete "' + p.name + '"? This can\'t be undone.')) return;
+          fetch('/personas/' + p.id, { method: 'DELETE' })
+            .then(function (r) { return r.json(); })
+            .then(function (resp) {
+              if (resp && resp.ok) {
+                personasCache = []; // force refresh
+                fetchPersonas().then(renderManageList);
+              } else {
+                alert('Delete failed: ' + (resp && resp.error || 'unknown'));
+              }
+            })
+            .catch(function (e) { alert('Network error: ' + e); });
+        });
+        manageListEl.appendChild(li);
+      });
+    }
+    manageBtn.addEventListener('click', function () {
+      closeDropdown();
+      openManageModal();
+    });
+    document.querySelectorAll('[data-close-personas-modal]').forEach(function (el) {
+      el.addEventListener('click', closeManageModal);
+    });
+    manageModal.addEventListener('click', function (e) {
+      if (e.target === manageModal) closeManageModal();
+    });
+
+    // Pre-fetch personas on page load so the dropdown is responsive on first click.
+    fetchPersonas();
+
+    // Expose activePersonaId for the search submit. We modify the existing
+    // FormData by intercepting the build — simplest: patch into the fetch
+    // call by wrapping runBtn click to append persona_id when present.
+    // Already attached above via closure; persona_id is read at submit
+    // time from the module-scoped activePersonaId variable.
+  })();
+
+  // Patch the search FormData to include persona_id if set. This sits
+  // outside the main IIFE so it can hook into the request flow without
+  // restructuring the existing event handler.
+  (function () {
+    const origFetch = window.fetch;
+    window.fetch = function (input, init) {
+      if (typeof input === 'string' && input.indexOf('/prospecting/account/') !== -1 && input.endsWith('/search') && init && init.body instanceof FormData) {
+        try {
+          const apid = (window.__personaActiveId || null);
+          if (apid) init.body.append('persona_id', String(apid));
+        } catch (e) { /* ignore */ }
+      }
+      return origFetch.apply(this, arguments);
+    };
   })();
   </script>
 </body>

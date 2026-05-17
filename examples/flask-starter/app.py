@@ -741,6 +741,28 @@ def init_db():
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_manual_supporters_added_at ON manual_supporters(added_at DESC)")
 
+        # Saved title personas for the auto-prospecting feature. A persona is
+        # a named, reusable set of job titles (e.g. "Executive Leadership" =
+        # CEO, COO, Founder; "Marketing Leaders" = CMO, VP Marketing,
+        # Director of Demand Gen). The user picks one on the prospecting
+        # editor page to pre-fill the title chips, then can edit before
+        # running a search. Stored as a single denormalized table — titles
+        # live as a JSON array. name_norm (lowercased + collapsed whitespace)
+        # has a UNIQUE constraint so saves with the same display name
+        # overwrite the existing row.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS title_personas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                name_norm TEXT NOT NULL UNIQUE,
+                titles_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                last_used_at INTEGER
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_title_personas_last_used_at ON title_personas(last_used_at DESC)")
+
         # Per-supporter relationship category (customer / investor / vendor /
         # friend / coworker / unclassified). Populated by the categorizer
         # which uses, in priority order: manual override > user-uploaded
@@ -3310,21 +3332,40 @@ def db_manual_supporter_toggle(
 ) -> tuple[bool, str | None]:
     """Star toggle: if already a supporter, remove; otherwise add with
     source='star'. Returns (is_supporter_now, error).
+
+    Atomic: read + write happen inside a single `_db_lock` + `_db_connect`
+    context so a rapid double-click can't race. Without this, two concurrent
+    toggles could BOTH see the row missing on SELECT and BOTH try to INSERT
+    (one wins, the other no-ops via OR REPLACE) — which silently flips state
+    back to "on" when the user expected "off".
     """
     norm = _normalize_linkedin(linkedin_url_raw or "")
     if not norm:
         return False, "invalid linkedin url"
-    existing = db_manual_supporter_get(norm)
-    if existing:
-        db_manual_supporter_remove(linkedin_url_raw)
-        return False, None
-    _, err = db_manual_supporter_upsert(
-        linkedin_url_raw,
-        display_name=display_name,
-        source="star",
-    )
-    if err:
-        return False, err
+    now = int(time.time())
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT 1 FROM manual_supporters WHERE linkedin_url_norm = ?",
+            (norm,),
+        )
+        exists = cur.fetchone() is not None
+        if exists:
+            conn.execute(
+                "DELETE FROM manual_supporters WHERE linkedin_url_norm = ?",
+                (norm,),
+            )
+            conn.commit()
+            invalidate_supporter_attribution_cache()
+            return False, None
+        conn.execute(
+            "INSERT INTO manual_supporters "
+            "(linkedin_url_norm, linkedin_url_raw, display_name, "
+            "teammate_email, teammate_name, source, note, added_at) "
+            "VALUES (?, ?, ?, '', '', 'star', '', ?)",
+            (norm, linkedin_url_raw, display_name, now),
+        )
+        conn.commit()
+    invalidate_supporter_attribution_cache()
     return True, None
 
 
@@ -3348,6 +3389,200 @@ def db_manual_supporters_recent(limit: int = 50) -> list[dict]:
         "note": r[6],
         "added_at": r[7],
     } for r in rows]
+
+
+# ---------- Title personas (saved title sets for prospecting) ------------
+
+# Server-side limits — UX spec defaults. Generous enough that no honest
+# user hits them; tight enough to bound the DB and CSE-quota footprints.
+PERSONAS_MAX_COUNT = 50
+PERSONA_MAX_TITLES = 25
+PERSONA_MAX_NAME_LEN = 60
+PERSONA_MAX_TITLE_LEN = 120
+
+
+def _normalize_persona_name(name: str) -> str:
+    """Lowercase, collapse internal whitespace, strip outer whitespace.
+    Used for the UNIQUE constraint key — so "Marketing Leaders",
+    "marketing  leaders ", and "Marketing\tLeaders" all dedupe to the
+    same persona row."""
+    if not name:
+        return ""
+    parts = (name or "").lower().split()
+    return " ".join(parts)
+
+
+def _normalize_persona_titles(raw_titles) -> list[str]:
+    """Strip + dedupe (case-insensitive) + cap at PERSONA_MAX_TITLES.
+    Order is preserved; the first-seen casing wins."""
+    out: list[str] = []
+    seen: set = set()
+    for t in (raw_titles or []):
+        s = str(t).strip()[:PERSONA_MAX_TITLE_LEN]
+        if not s:
+            continue
+        k = s.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(s)
+        if len(out) >= PERSONA_MAX_TITLES:
+            break
+    return out
+
+
+def db_personas_list() -> list[dict]:
+    """All personas, sorted by `last_used_at DESC NULLS LAST` then by
+    `updated_at DESC`. Powers the dropdown on the prospecting editor.
+    Cheap — bounded by PERSONAS_MAX_COUNT rows."""
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT id, name, titles_json, created_at, updated_at, last_used_at "
+            "FROM title_personas "
+            "ORDER BY (last_used_at IS NULL) ASC, last_used_at DESC, updated_at DESC"
+        )
+        rows = cur.fetchall()
+    out: list[dict] = []
+    for r in rows:
+        try:
+            titles = json.loads(r[2] or "[]") or []
+        except (ValueError, TypeError):
+            titles = []
+        out.append({
+            "id": r[0],
+            "name": r[1],
+            "titles": titles,
+            "title_count": len(titles),
+            "created_at": r[3],
+            "updated_at": r[4],
+            "last_used_at": r[5],
+        })
+    return out
+
+
+def db_persona_get(persona_id: int) -> dict | None:
+    """One persona by id. Returns None if missing."""
+    try:
+        pid = int(persona_id)
+    except (TypeError, ValueError):
+        return None
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT id, name, titles_json, created_at, updated_at, last_used_at "
+            "FROM title_personas WHERE id = ?",
+            (pid,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    try:
+        titles = json.loads(row[2] or "[]") or []
+    except (ValueError, TypeError):
+        titles = []
+    return {
+        "id": row[0],
+        "name": row[1],
+        "titles": titles,
+        "title_count": len(titles),
+        "created_at": row[3],
+        "updated_at": row[4],
+        "last_used_at": row[5],
+    }
+
+
+def db_persona_upsert(name: str, titles: list, overwrite: bool = False) -> tuple[dict | None, str | None]:
+    """Create a persona, or overwrite an existing one with the same
+    normalized name when `overwrite=True`. Returns (persona, error).
+
+    Errors (returned as string, never raised):
+      - "empty name"
+      - "no titles"
+      - "max personas reached" (when creating a new row would exceed PERSONAS_MAX_COUNT)
+      - "exists" (when name_norm collides and overwrite=False — caller should re-ask)
+    """
+    display_name = (name or "").strip()[:PERSONA_MAX_NAME_LEN]
+    if not display_name:
+        return None, "empty name"
+    name_norm = _normalize_persona_name(display_name)
+    if not name_norm:
+        return None, "empty name"
+    cleaned_titles = _normalize_persona_titles(titles)
+    if not cleaned_titles:
+        return None, "no titles"
+    titles_json = json.dumps(cleaned_titles)
+    now = int(time.time())
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT id FROM title_personas WHERE name_norm = ?",
+            (name_norm,),
+        )
+        existing = cur.fetchone()
+        if existing and not overwrite:
+            return None, "exists"
+        if not existing:
+            # Enforce the count cap on CREATE only (overwrites are free).
+            cur = conn.execute("SELECT COUNT(*) FROM title_personas")
+            if cur.fetchone()[0] >= PERSONAS_MAX_COUNT:
+                return None, "max personas reached"
+            conn.execute(
+                "INSERT INTO title_personas "
+                "(name, name_norm, titles_json, created_at, updated_at, last_used_at) "
+                "VALUES (?, ?, ?, ?, ?, NULL)",
+                (display_name, name_norm, titles_json, now, now),
+            )
+        else:
+            conn.execute(
+                "UPDATE title_personas "
+                "SET name = ?, titles_json = ?, updated_at = ? "
+                "WHERE name_norm = ?",
+                (display_name, titles_json, now, name_norm),
+            )
+        conn.commit()
+        cur = conn.execute(
+            "SELECT id, name, titles_json, created_at, updated_at, last_used_at "
+            "FROM title_personas WHERE name_norm = ?",
+            (name_norm,),
+        )
+        row = cur.fetchone()
+    return {
+        "id": row[0],
+        "name": row[1],
+        "titles": json.loads(row[2] or "[]") or [],
+        "title_count": len(cleaned_titles),
+        "created_at": row[3],
+        "updated_at": row[4],
+        "last_used_at": row[5],
+    }, None
+
+
+def db_persona_delete(persona_id) -> bool:
+    """Delete a persona by id. Returns True if a row was removed."""
+    try:
+        pid = int(persona_id)
+    except (TypeError, ValueError):
+        return False
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute("DELETE FROM title_personas WHERE id = ?", (pid,))
+        removed = cur.rowcount
+        conn.commit()
+    return bool(removed)
+
+
+def db_persona_mark_used(persona_id) -> None:
+    """Bump `last_used_at` on a persona so the dropdown sorts it higher.
+    Silently no-ops on bad id — this is best-effort telemetry, not a
+    user-visible action."""
+    try:
+        pid = int(persona_id)
+    except (TypeError, ValueError):
+        return
+    now = int(time.time())
+    with _db_lock, _db_connect() as conn:
+        conn.execute(
+            "UPDATE title_personas SET last_used_at = ? WHERE id = ?",
+            (now, pid),
+        )
+        conn.commit()
 
 
 def _targets_with_supporter_paths() -> set:
@@ -4925,6 +5160,29 @@ def prospecting_account_view(account_key):
     The actual people-search runs on POST, not here — load time stays
     cheap (one OpenAI title call + one Apollo company-search call).
     """
+    # "(unknown company)" is the sentinel bucket the kit uses for targets
+    # whose position.companyName is empty. Prospecting at "(unknown
+    # company)" is meaningless — there's no real company to search at.
+    # Render a friendly empty state instead of attempting the pipeline.
+    if (account_key or "").strip().startswith("("):
+        return render_template(
+            "prospecting_account.html",
+            account_name=account_key,
+            account_key=account_key,
+            seeds=[],
+            seed_titles=[],
+            generated_titles=[],
+            resolved_domain="",
+            resolved_company_name="",
+            error="Prospecting only works on real accounts. The "
+                  "&ldquo;(unknown company)&rdquo; bucket holds targets whose "
+                  "company name wasn't set when they were imported — open one "
+                  "of those targets, fix the company on its profile, then "
+                  "come back.",
+            api_key_set=bool(API_KEY),
+            active="prospecting",
+        )
+
     seeds, display_name, seed_titles_ordered, company_linkedin, _ = (
         _prospecting_collect_seeds(account_key)
     )
@@ -4933,6 +5191,7 @@ def prospecting_account_view(account_key):
         return render_template(
             "prospecting_account.html",
             account_name=account_key,
+            account_key=account_key,
             seeds=[],
             seed_titles=[],
             generated_titles=[],
@@ -5030,7 +5289,7 @@ def prospecting_account_search(account_key):
     if blocked is not None:
         return blocked
 
-    seeds, display_name, _, _, existing_linkedin_norm = (
+    seeds, display_name, _, company_linkedin, existing_linkedin_norm = (
         _prospecting_collect_seeds(account_key)
     )
     if not seeds:
@@ -5048,6 +5307,13 @@ def prospecting_account_search(account_key):
     if not titles:
         return jsonify({"ok": False, "error": "at least one title required"}), 400
 
+    # Optional persona attribution — bump last_used_at so the dropdown
+    # surfaces this persona higher next time. Best-effort; bad id silently
+    # no-ops via db_persona_mark_used.
+    persona_id = request.form.get("persona_id") or ""
+    if persona_id:
+        db_persona_mark_used(persona_id)
+
     # Hard cap on titles to prevent a runaway loop draining CSE quota
     # (free tier is 100 queries/day; one CSE call per title). 20 is well
     # above any reasonable manual title set.
@@ -5064,7 +5330,10 @@ def prospecting_account_search(account_key):
         return jsonify({"ok": False, "error": "domain or company_name required"}), 400
 
     keys = _load_resolver_keys()
-    cands, err = _prospecting_search_people(company_name, titles, domain, keys)
+    cands, err = _prospecting_search_people(
+        company_name, titles, domain, keys,
+        company_linkedin_url=company_linkedin,
+    )
     if err and not cands:
         return jsonify({"ok": False, "error": err}), 502
 
@@ -5127,6 +5396,71 @@ def prospecting_add_suggestion():
     except ValueError:
         data = {}
     return jsonify({"ok": True, "imported": data})
+
+
+@app.route("/personas", methods=["GET"])
+def personas_list():
+    """Return all saved title personas as JSON, sorted by `last_used_at`
+    desc (most-recently-applied first), then by `updated_at` desc.
+
+    Read-only — no cross-site check needed."""
+    return jsonify({"ok": True, "personas": db_personas_list()})
+
+
+@app.route("/personas", methods=["POST"])
+def personas_create_or_overwrite():
+    """Create a persona, or overwrite an existing one with the same
+    (case-insensitive, whitespace-collapsed) name.
+
+    Body params:
+      name        — display name (max 60 chars)
+      titles[]    — title strings (max 25, each max 120 chars)
+      overwrite   — '1' or 'true' to force-overwrite a name collision
+                    (without this, returns 409 so the client can confirm)
+
+    Returns JSON {ok, persona, error}.
+    """
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+    # Accept both form-encoded and JSON bodies for ergonomics.
+    body = request.get_json(silent=True) or {}
+    name = (request.form.get("name") or body.get("name") or "").strip()
+    titles = request.form.getlist("titles") or body.get("titles") or []
+    overwrite = (
+        request.form.get("overwrite") in ("1", "true", "yes")
+        or bool(body.get("overwrite"))
+    )
+
+    persona, err = db_persona_upsert(name, titles, overwrite=overwrite)
+    if err == "exists":
+        # 409 Conflict — the client can re-POST with overwrite=1 to confirm.
+        return jsonify({
+            "ok": False,
+            "error": "exists",
+            "message": f"A persona named '{name}' already exists. Re-submit with overwrite=1 to replace it.",
+        }), 409
+    if err == "max personas reached":
+        return jsonify({
+            "ok": False,
+            "error": "max personas reached",
+            "message": f"You already have {PERSONAS_MAX_COUNT} personas (the limit). Delete one before saving another.",
+        }), 400
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    return jsonify({"ok": True, "persona": persona})
+
+
+@app.route("/personas/<int:persona_id>", methods=["DELETE"])
+def personas_delete(persona_id):
+    """Delete one persona by id. Returns 404 if not found, else 200 ok."""
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+    removed = db_persona_delete(persona_id)
+    if not removed:
+        return jsonify({"ok": False, "error": "not found"}), 404
+    return jsonify({"ok": True})
 
 
 @app.route("/sync/status", methods=["GET"])
