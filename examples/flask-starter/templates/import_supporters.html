@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Draftboard — Import supporters</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    {% include "_nav.html" %}
+
+    <header class="mb-6">
+      <h1 class="text-2xl font-semibold tracking-tight">Import supporters</h1>
+      <p class="text-sm text-slate-500 mt-1">
+        Paste LinkedIn URLs of people you've already identified as supporters.
+        They'll appear with the ⭐ badge on connector cards across Targets,
+        Accounts, and Connections — and the "Supporters only" filter will
+        include them.
+      </p>
+    </header>
+
+    {% if result %}
+      <div class="mb-6 rounded-md border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
+        <strong>Imported {{ result.added }}</strong>
+        of {{ result.submitted_count }} URL{{ '' if result.submitted_count == 1 else 's' }}
+        {% if result.teammate_name %}
+          attributed to <strong>{{ result.teammate_name }}</strong>
+        {% endif %}.
+        {% if result.skipped_existing %}
+          <span class="text-emerald-700">({{ result.skipped_existing }} already in your supporters list — skipped.)</span>
+        {% endif %}
+      </div>
+    {% endif %}
+
+    <section class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm">
+      <form method="POST" action="/import/supporters" class="space-y-4">
+        <label class="block">
+          <span class="text-xs uppercase tracking-wider text-slate-500">LinkedIn URLs</span>
+          <textarea name="linkedin_urls" rows="8" required
+                    placeholder="https://www.linkedin.com/in/somesupporter/&#10;https://linkedin.com/in/another-supporter&#10;..."
+                    class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500"></textarea>
+          <p class="mt-1 text-xs text-slate-500">
+            One URL per line, or comma-separated. Other text on the line is ignored.
+          </p>
+        </label>
+
+        {% if owners %}
+          <label class="block">
+            <span class="text-xs uppercase tracking-wider text-slate-500">Attribute to teammate (optional)</span>
+            <select name="teammate_owner_id"
+                    class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500">
+              <option value="">— Your own list (no specific teammate) —</option>
+              {% for o in owners %}
+                <option value="{{ o.id }}">{{ o.name }}</option>
+              {% endfor %}
+            </select>
+            <p class="mt-1 text-xs text-slate-500">
+              Picks the teammate whose network these supporters came from. Shows up in the ⭐ badge tooltip on connector cards.
+            </p>
+          </label>
+        {% endif %}
+
+        <label class="block">
+          <span class="text-xs uppercase tracking-wider text-slate-500">Note (optional)</span>
+          <input type="text" name="note" maxlength="300"
+                 placeholder='e.g. "From the Q1 portfolio CEO list"'
+                 class="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+        </label>
+
+        <button type="submit"
+                class="inline-flex items-center justify-center rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow hover:bg-indigo-700">
+          Import supporters
+        </button>
+      </form>
+    </section>
+
+    {% if recent %}
+      <section class="mt-8 bg-white border border-slate-200 rounded-lg p-5 shadow-sm">
+        <h2 class="text-sm font-semibold text-slate-900">
+          Recently imported
+          <span class="ml-1 text-slate-400 font-normal">({{ recent|length }})</span>
+        </h2>
+        <ul class="mt-3 divide-y divide-slate-100">
+          {% for r in recent %}
+            <li class="py-2 flex items-start gap-3 text-sm">
+              <span class="text-amber-500 text-base leading-none">★</span>
+              <div class="flex-1 min-w-0">
+                <a href="{{ r.linkedin_url_raw }}" target="_blank" rel="noopener"
+                   class="text-indigo-700 hover:underline truncate block">
+                  {{ r.display_name or r.linkedin_url_raw }}
+                </a>
+                <div class="text-xs text-slate-500">
+                  {% if r.teammate_name %}attributed to <strong>{{ r.teammate_name }}</strong> · {% endif %}
+                  via {{ 'paste form' if r.source == 'paste' else 'star button' }}
+                  {% if r.note %} · "{{ r.note }}"{% endif %}
+                </div>
+              </div>
+            </li>
+          {% endfor %}
+        </ul>
+      </section>
+    {% endif %}
+
+    <footer class="mt-10 text-xs text-slate-400 text-center">
+      Draftboard API starter · Import supporters
+    </footer>
+  </div>
+</body>
+</html>

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Draftboard — LinkedIn resolver setup</title>
+  <title>Draftboard — API keys</title>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-50 text-slate-900 min-h-screen">
@@ -11,9 +11,11 @@
     {% include "_nav.html" %}
 
     <header class="mb-8">
-      <h1 class="text-2xl font-semibold tracking-tight">LinkedIn resolver setup</h1>
+      <h1 class="text-2xl font-semibold tracking-tight">API keys</h1>
       <p class="text-sm text-slate-500 mt-1">
-        Look up the LinkedIn profile of any person you have a name + email for, so you can import them as a Target with one click.
+        Paste your Apollo, Google Custom Search, and OpenAI keys here. The
+        app uses them in three places: LinkedIn resolution (Supporters page),
+        Supporter Scanner LinkedIn enrichment, and Auto-Prospecting.
       </p>
     </header>
 
@@ -21,17 +23,23 @@
 
     <!-- What this does -->
     <section class="mb-6 rounded-lg border border-slate-200 bg-white p-6 shadow-sm">
-      <h2 class="text-lg font-semibold mb-2">What this does</h2>
+      <h2 class="text-lg font-semibold mb-2">What these keys power</h2>
       <p class="text-sm text-slate-700 mb-3">
-        When you connect Gmail + Calendar (separate setup), the app finds high-engagement contacts and shows them on the Supporters page. To import any of them as a Draftboard Target, we need their LinkedIn URL. This page configures how we find that URL automatically.
+        Three features share the same keys, so configuring them here lights up everything at once:
       </p>
+      <ul class="list-disc list-inside text-sm text-slate-700 space-y-1 mb-3">
+        <li><strong>LinkedIn resolver</strong> — turns an email into a LinkedIn URL so you can import a contact as a Target with one click.</li>
+        <li><strong>Supporter Scanner enrichment</strong> — resolves Gmail/Calendar contacts so their connector-card badges line up across teammates.</li>
+        <li><strong>Auto-Prospecting</strong> — uses gpt-4o-mini to expand titles + Apollo's people search to surface lookalikes at an account.</li>
+      </ul>
       <p class="text-sm text-slate-700 mb-3">
-        We try two methods, in order:
+        For LinkedIn resolution specifically we try two methods, in order:
       </p>
       <ol class="list-decimal list-inside text-sm text-slate-700 space-y-1 mb-3">
         <li><strong>Apollo</strong> — fastest. One API call, returns the LinkedIn URL directly when Apollo knows the person. Hits 50–70% of business contacts.</li>
         <li><strong>Google search + AI ranking</strong> — fallback. Searches the web for "{first name} {company} linkedin", then asks gpt-4o-mini to pick the right profile. Slower but cheap.</li>
       </ol>
+      <p class="text-sm text-slate-700">
       <p class="text-sm text-slate-700">
         All three keys are <strong>optional</strong>. Leave any blank and we just skip that method. If neither method finds the URL, the row stays usable — you can paste a LinkedIn URL manually before importing.
       </p>
@@ -261,7 +269,7 @@
         }
         saveBtn.disabled = true;
         saveBtn.textContent = 'Saving...';
-        fetch('/settings/linkedin-resolver', {
+        fetch('/settings/api-keys', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
@@ -273,7 +281,7 @@
               return;
             }
             // Reload to refresh the masked-input placeholders + status pills.
-            window.location.href = '/settings/linkedin-resolver';
+            window.location.href = '/settings/api-keys';
           })
           .catch(function (err) {
             saveBanner.innerHTML = '<div class="mb-6 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">' + escapeHtml(err.message || 'Network error') + '</div>';
