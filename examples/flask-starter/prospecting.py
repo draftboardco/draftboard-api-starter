@@ -21,7 +21,11 @@ import sys
 
 import requests
 
-APOLLO_SEARCH_URL = "https://api.apollo.io/api/v1/mixed_people/search"
+# Apollo deprecated /mixed_people/search for API callers — it now returns 422
+# with a "use the new mixed_people/api_search endpoint" message. The /api_search
+# variant is the documented replacement.
+# Ref: https://docs.apollo.io/reference/people-api-search
+APOLLO_SEARCH_URL = "https://api.apollo.io/api/v1/mixed_people/api_search"
 APOLLO_ORG_SEARCH_URL = "https://api.apollo.io/api/v1/mixed_companies/search"
 OPENAI_MODEL = "gpt-4o-mini"
 
@@ -103,13 +107,16 @@ def generate_adjacent_titles(
         return [], f"openai error: {type(e).__name__}"
 
 
-def _apollo_find_org_id(company_name: str, apollo_key: str) -> tuple[str | None, str | None]:
-    """Look up Apollo's internal organization_id for a given company name.
+def _apollo_find_org_domain(company_name: str, apollo_key: str) -> tuple[str | None, str | None]:
+    """Look up Apollo's known primary domain for a given company name.
 
-    Apollo's mixed_people/search filter parameter `q_organization_name` was
-    silently dropped from the API; the correct way to filter by company is
-    to pass `organization_ids[]`. We do a quick orgs lookup first to get
-    that id. Returns (org_id, error).
+    We filter the people search by `q_organization_domains_list` (the
+    Apollo-documented preferred way to scope a search to a company),
+    NOT by `organization_ids`. Apollo's internal IDs returned from
+    mixed_companies/search aren't always the "master organization IDs"
+    the people-search endpoint accepts — passing them gets HTTP 422.
+
+    Returns (domain, error).
     """
     if not apollo_key or not company_name:
         return None, "missing key or name"
@@ -132,8 +139,9 @@ def _apollo_find_org_id(company_name: str, apollo_key: str) -> tuple[str | None,
     if r.status_code == 429:
         return None, "apollo rate-limited"
     if r.status_code != 200:
-        _log(f"apollo org search HTTP {r.status_code}: {r.text[:300]}")
-        return None, f"apollo org search HTTP {r.status_code}"
+        body_snip = (r.text or "").strip()[:300]
+        _log(f"apollo org search HTTP {r.status_code}: {body_snip}")
+        return None, f"apollo org search HTTP {r.status_code} — {body_snip or '(no body)'}"
     try:
         data = r.json()
     except ValueError:
@@ -143,10 +151,14 @@ def _apollo_find_org_id(company_name: str, apollo_key: str) -> tuple[str | None,
     if not orgs:
         return None, f"apollo found no organization matching '{company_name}'"
     org = orgs[0]
-    org_id = org.get("id") or org.get("organization_id")
-    if not org_id:
-        return None, "apollo org match missing id field"
-    return org_id, None
+    domain = (
+        (org.get("primary_domain") or "").strip().lower()
+        or (org.get("website_url") or "").strip().lower().replace("https://", "").replace("http://", "").rstrip("/")
+        or ""
+    )
+    if not domain:
+        return None, f"apollo matched '{org.get('name')}' but the row has no domain — try a more specific account name"
+    return domain, None
 
 
 def apollo_search_people_at_account(
@@ -169,12 +181,12 @@ def apollo_search_people_at_account(
     if not company_name:
         return [], "no company name"
 
-    org_id, org_err = _apollo_find_org_id(company_name, apollo_key)
+    domain, org_err = _apollo_find_org_domain(company_name, apollo_key)
     if org_err:
         return [], org_err
 
     body = {
-        "organization_ids": [org_id],
+        "q_organization_domains_list": [domain],
         "person_titles": titles,
         "page": 1,
         "per_page": per_page,
@@ -194,9 +206,11 @@ def apollo_search_people_at_account(
     if r.status_code == 429:
         return [], "apollo rate-limited"
     if r.status_code != 200:
-        # Log the response body so 4xx/5xx errors are debuggable next time.
-        _log(f"apollo people search HTTP {r.status_code}: {r.text[:500]}")
-        return [], f"apollo HTTP {r.status_code}"
+        # Surface Apollo's actual response body in the user-facing error
+        # (and the server log) so future 4xx/5xx don't need a terminal dive.
+        body_snip = (r.text or "").strip()[:400]
+        _log(f"apollo people search HTTP {r.status_code}: {body_snip}")
+        return [], f"apollo people search HTTP {r.status_code} — {body_snip or '(no body)'}"
     try:
         data = r.json()
     except ValueError:
