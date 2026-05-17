@@ -1556,6 +1556,12 @@ INTRO_STATUS_META = {
                             "active": False},
 }
 
+# Statuses that mean "we're already engaged at this account" — so other targets
+# at the same account get suppressed from outreach surfaces (don't double-ping
+# a company already in motion). Excludes the failure states (no_reply, *_rejected)
+# so a closed avenue doesn't permanently block the rest of the account.
+INTRO_ENGAGED_STATUSES = frozenset({"requested", "in_progress", "intro_made"})
+
 
 def db_intro_request_toggle(target_id, connection_id):
     """Toggle existence of an intro request. Adds with status='requested'
@@ -1674,6 +1680,129 @@ def db_intro_status_rollup_map() -> dict:
     if g is not None:
         g._intro_status_rollup = out
     return out
+
+
+def db_engaged_account_keys() -> set:
+    """Returns lowercase account keys (company-name buckets) that have at
+    least one target whose rollup status is in INTRO_ENGAGED_STATUSES.
+
+    Used by list views (Targets / Accounts / New paths) to suppress or tag
+    other targets at the same account when an intro is already in motion.
+    Per-request cached via flask.g.
+    """
+    try:
+        from flask import g
+        cached = getattr(g, "_engaged_account_keys", None)
+    except RuntimeError:
+        cached = None
+        g = None
+    if cached is not None:
+        return cached
+
+    rollup = db_intro_status_rollup_map()
+    engaged_target_ids = {tid for tid, st in rollup.items() if st in INTRO_ENGAGED_STATUSES}
+    if not engaged_target_ids:
+        result: set = set()
+        if g is not None:
+            g._engaged_account_keys = result
+        return result
+
+    targets_all, _ = fetch_all_targets()
+    result = set()
+    for t in targets_all:
+        if t.get("id") in engaged_target_ids:
+            key = (_target_company_with_fallback(t) or "").lower().strip()
+            if key:
+                result.add(key)
+    if g is not None:
+        g._engaged_account_keys = result
+    return result
+
+
+def db_engaged_intro_for_account(account_key_lower: str) -> dict | None:
+    """For one account-key bucket, return the EARLIEST engaged intro_request
+    metadata (for the account drawer banner). Returns:
+
+        {target_id, target_name, connection_id, connector_name, status,
+         requested_at, last_updated_at, status_meta}
+
+    Or None if no engaged intro at this account.
+    """
+    if not account_key_lower:
+        return None
+    targets_all, _ = fetch_all_targets()
+    target_id_to_name: dict = {}
+    for t in targets_all:
+        key = (_target_company_with_fallback(t) or "").lower().strip()
+        if key == account_key_lower:
+            tid = t.get("id")
+            if tid:
+                name = (f"{t.get('firstName') or ''} {t.get('lastName') or ''}").strip()
+                target_id_to_name[tid] = name or "(no name)"
+    if not target_id_to_name:
+        return None
+
+    target_ids = list(target_id_to_name.keys())
+    engaged_list = list(INTRO_ENGAGED_STATUSES)
+    tid_placeholders = ",".join("?" * len(target_ids))
+    status_placeholders = ",".join("?" * len(engaged_list))
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            f"SELECT target_id, connection_id, status, requested_at, last_updated_at "
+            f"FROM intro_requests "
+            f"WHERE target_id IN ({tid_placeholders}) "
+            f"  AND status IN ({status_placeholders}) "
+            f"ORDER BY requested_at ASC LIMIT 1",
+            tuple(target_ids) + tuple(engaged_list),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+
+    target_id, connection_id, status, requested_at, last_updated_at = row
+
+    # Resolve the connector's display name by pulling that target's
+    # connections cache. Best-effort: if the cache hasn't been populated
+    # yet for this target, fall back to "your connector".
+    connector_name = "your connector"
+    try:
+        connections, _ = fetch_target_connections(target_id)
+        for c in (list(connections) + manual_paths_for_target(
+            next((t for t in targets_all if t.get("id") == target_id), {})
+        )):
+            if c.get("id") == connection_id:
+                first = (c.get("firstName") or "").strip()
+                last = (c.get("lastName") or "").strip()
+                full = f"{first} {last}".strip()
+                if full:
+                    connector_name = full
+                break
+    except Exception:
+        pass
+
+    # Pre-format the timestamp server-side: the drawer is loaded as an HTML
+    # fragment, so the page-level rel-ts hydration JS doesn't re-run for it.
+    requested_at_display = ""
+    if requested_at:
+        import datetime as _dt
+        try:
+            requested_at_display = _dt.datetime.fromtimestamp(
+                int(requested_at), tz=_dt.timezone.utc
+            ).astimezone().strftime("%-m/%-d/%y")
+        except (TypeError, ValueError):
+            requested_at_display = ""
+
+    return {
+        "target_id": target_id,
+        "target_name": target_id_to_name.get(target_id, "(unknown)"),
+        "connection_id": connection_id,
+        "connector_name": connector_name,
+        "status": status,
+        "requested_at": requested_at,
+        "requested_at_display": requested_at_display,
+        "last_updated_at": last_updated_at,
+        "status_meta": INTRO_STATUS_META.get(status),
+    }
 
 
 # Per-target tag helpers. Tags are normalized to lowercase + length-capped
@@ -3254,6 +3383,16 @@ def _enrich_target(t):
     tid = t.get("id") or ""
     rollup_status = db_intro_status_rollup_map().get(tid, "")
     rollup_meta = INTRO_STATUS_META.get(rollup_status) if rollup_status else None
+    # "Engaged elsewhere" — another target at the same account already has
+    # an intro request in motion or made. Drives the suppression pill on
+    # Targets/Accounts list rows and the hide-from-/new-paths filter.
+    company_key_lower = (_target_company_with_fallback(t) or "").lower().strip()
+    self_engaged = rollup_status in INTRO_ENGAGED_STATUSES
+    engaged_elsewhere = (
+        bool(company_key_lower)
+        and company_key_lower in db_engaged_account_keys()
+        and not self_engaged
+    )
     # Merge Draftboard-API tags (read-only) with locally-added user tags
     # from target_tags. Dedup case-insensitively so an API "Investor" tag
     # doesn't double-up with a local "investor".
@@ -3284,6 +3423,8 @@ def _enrich_target(t):
         "updated_at": t.get("updatedAt") or "",
         "intro_status": rollup_status,
         "intro_status_meta": rollup_meta,
+        "engaged_elsewhere": engaged_elsewhere,
+        "account_key_lower": company_key_lower,
     }
 
 
@@ -3793,6 +3934,12 @@ def account_drawer(account_key):
 
     display_name = _target_company_with_fallback(matching[0]) or "(unknown company)"
 
+    # Engagement banner data: if any target at this account has an active /
+    # made intro_request, surface it at the top of the drawer and grey out
+    # the other target rows. Other paths stay clickable — user can still
+    # see + act on them if they choose, just visually de-emphasized.
+    engaged_intro = db_engaged_intro_for_account(key_lower)
+
     return render_template(
         "_drawer_account.html",
         account_name=display_name,
@@ -3800,6 +3947,7 @@ def account_drawer(account_key):
         selected_target_id=selected_id,
         initial_panel=initial_panel,
         total_target_count=len(matching),
+        engaged_intro=engaged_intro,
     )
 
 
@@ -4344,6 +4492,18 @@ def new_paths_view():
         reverse=True,
     )
 
+    # Suppress paths whose target is at an account that's already engaged
+    # via another target's intro_request. New paths is the kit's
+    # outreach-recommendation surface; double-pinging a company already in
+    # motion is bad form. The other views (Targets / Accounts / drawer)
+    # still show these rows but tag them so the user knows why.
+    suppressed_engaged_count = sum(
+        1 for p in enriched_paths if p["target"].get("engaged_elsewhere")
+    )
+    enriched_paths = [
+        p for p in enriched_paths if not p["target"].get("engaged_elsewhere")
+    ]
+
     me_for_template, _ = fetch_me()
     if me_for_template:
         me_for_template = dict(me_for_template, owner_id=me_id)
@@ -4359,6 +4519,7 @@ def new_paths_view():
         "new_paths.html",
         paths=enriched_paths,
         total=len(enriched_paths),
+        suppressed_engaged_count=suppressed_engaged_count,
         since=since_param,
         since_label=since_label,
         min_score=min_score,

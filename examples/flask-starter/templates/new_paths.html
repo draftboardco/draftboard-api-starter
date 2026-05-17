@@ -78,6 +78,12 @@
 
       <div class="ml-auto text-xs text-slate-500">
         Showing <strong>{{ total }}</strong> path{{ '' if total == 1 else 's' }} (top 200)
+        {% if suppressed_engaged_count and suppressed_engaged_count > 0 %}
+          · <span class="text-amber-700"
+                  title="These paths are at accounts where another target already has an intro request in motion. View them on the Targets page or the account drawer.">
+              {{ suppressed_engaged_count }} hidden ⓘ
+            </span>
+        {% endif %}
       </div>
     </form>
 

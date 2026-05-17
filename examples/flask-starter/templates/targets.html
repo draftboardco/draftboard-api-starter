@@ -204,6 +204,12 @@
                     <span>{{ t.intro_status_meta.icon }}</span>
                     <span>{{ t.intro_status_meta.label }}</span>
                   </span>
+                {% elif t.engaged_elsewhere %}
+                  <span class="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full border bg-amber-50 text-amber-800 border-amber-200"
+                        title="Another target at this account already has an active or completed intro request — open the account drawer to see which one">
+                    <span>⏳</span>
+                    <span>intro pending at this account</span>
+                  </span>
                 {% endif %}
               </div>
               <div class="text-xs text-slate-500 truncate">
