@@ -41,12 +41,12 @@ from prospecting import (
 API_BASE = "https://intros.draftboard.com/api/v1/integration"
 
 # Where the kit mints triage pages. Defaults to the production draftboard.com
-# /api/triage/generate endpoint. Override with TRIAGE_API_URL when testing
+# /api/shortlist/generate endpoint. Override with TRIAGE_API_URL when testing
 # against a Vercel preview deploy (e.g.,
 # https://draftboard-landing-<hash>-draftboard-727a852b.vercel.app/api/triage/generate).
 TRIAGE_API_URL = os.environ.get(
     "TRIAGE_API_URL",
-    "https://www.draftboard.com/api/triage/generate",
+    "https://www.draftboard.com/api/shortlist/generate",
 ).strip()
 
 # Where the LinkedIn resolver wizard saves the customer's Apollo / Google CSE /
