@@ -4562,9 +4562,17 @@ def import_triage_responses_view():
         # Anything else (legacy 'maybe') is treated as 'no' since the
         # v2 product decision was that maybe isn't a customer-actionable
         # answer.
+        # Cache the connector's first name once — used in the email body
+        # template below. Handles "Tim Smith" → "Tim", "Tim" → "Tim",
+        # "" → "there" (fallback so the salutation reads naturally).
+        connector_display = (session_meta.get("connectorName") or "").strip()
+        connector_first = connector_display.split()[0] if connector_display else "there"
+        customer_display = (session_meta.get("customerName") or "").strip()
+
         yes_added = 0
         no_added = 0
         skipped_no_connection_id = 0
+        compose_drafts: list[dict] = []
         for r in responses:
             if not isinstance(r, dict):
                 continue
@@ -4585,9 +4593,40 @@ def import_triage_responses_view():
                 if not connection_id:
                     skipped_no_connection_id += 1
                     continue
-                _, err = db_intro_request_set_status(target_id, connection_id, "requested")
-                if not err:
+                persisted = db_intro_request_set_status(target_id, connection_id, "requested")
+                if persisted == "requested":
                     yes_added += 1
+                    # Build a one-click "open in Gmail" compose draft for
+                    # this yes-target. The user follows up with the
+                    # connector to actually kick off the intro — no
+                    # auto-send, just pre-populated. They can edit the
+                    # body in Gmail before sending. To: is empty because
+                    # we don't have the connector's email; the user
+                    # fills it in (most connectors are in their contacts
+                    # already, so Gmail will autocomplete).
+                    target_name = (r.get("targetName") or "").strip() or "(this person)"
+                    subject = f"Following up on intro to {target_name}"
+                    body_lines = [
+                        f"Hey {connector_first},",
+                        "",
+                        f"Thanks for offering to ping {target_name} about what we're doing. "
+                        f"We'd love to chat with them — we think our product would be a great fit.",
+                        "",
+                        f"Let me know if they're open to chatting.",
+                        "",
+                        "All the best,",
+                        customer_display or "[your name]",
+                    ]
+                    body = "\n".join(body_lines)
+                    compose_drafts.append({
+                        "target_id": target_id,
+                        "target_name": target_name,
+                        "target_linkedin_url": (r.get("targetLinkedinUrl") or "").strip(),
+                        "connector_note": note,
+                        "subject": subject,
+                        "body": body,
+                        "gmail_url": _gmail_compose_url(subject, body),
+                    })
             else:
                 # Treat 'no' (and anything else, e.g. stale 'maybe') as
                 # a path-deprioritization signal.
@@ -4606,11 +4645,13 @@ def import_triage_responses_view():
             active="import_triage_responses",
             result={
                 "connector_name": session_meta.get("connectorName") or "(connector)",
+                "connector_first": connector_first,
                 "list_label": session_meta.get("listLabel") or "",
                 "yes_added": yes_added,
                 "no_added": no_added,
                 "skipped_no_connection_id": skipped_no_connection_id,
             },
+            compose_drafts=compose_drafts,
             recent_overrides=_recent_connector_overrides_for_display(),
         )
 
@@ -4620,6 +4661,7 @@ def import_triage_responses_view():
         api_key_set=bool(API_KEY),
         active="import_triage_responses",
         result=None,
+        compose_drafts=[],
         recent_overrides=_recent_connector_overrides_for_display(),
     )
 

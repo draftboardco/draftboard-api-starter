@@ -37,6 +37,53 @@
       </div>
     {% endif %}
 
+    {# After a successful import: surface the natural-next-step CTA for
+       each yes-target — open a pre-populated Gmail compose to the
+       connector saying "thanks, please ping them." User clicks one
+       button per target; the To: field is empty (we don't know the
+       connector's email) and the subject + body are pre-filled. #}
+    {% if compose_drafts %}
+      <section class="mb-6 rounded-lg bg-white border border-indigo-200 p-5 shadow-sm">
+        <header class="mb-3">
+          <h2 class="text-sm font-semibold text-slate-900">
+            📧 Follow up with {{ result.connector_first or result.connector_name }} on
+            {{ compose_drafts|length }} {{ 'intro' if compose_drafts|length == 1 else 'intros' }}
+          </h2>
+          <p class="mt-1 text-xs text-slate-500">
+            One pre-drafted email per yes-target. Click any &ldquo;Open in Gmail&rdquo; button → Gmail compose opens with subject + body filled in. You add the To: address ({{ result.connector_first or 'the connector' }}&rsquo;s email) and hit send. Edit the body if you want.
+          </p>
+        </header>
+        <ul class="divide-y divide-slate-100">
+          {% for d in compose_drafts %}
+            <li class="py-3 flex items-start gap-3">
+              <div class="flex-shrink-0 w-8 h-8 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center text-[10px] font-semibold">
+                ✓
+              </div>
+              <div class="flex-1 min-w-0">
+                <div class="text-sm font-semibold text-slate-900 truncate">{{ d.target_name }}</div>
+                <div class="text-xs text-slate-500 truncate">
+                  Subject: <span class="font-mono">{{ d.subject }}</span>
+                </div>
+                {% if d.connector_note %}
+                  <div class="mt-1 px-2 py-1 bg-slate-50 border border-slate-200 rounded text-xs text-slate-700">
+                    <span class="font-semibold">{{ result.connector_first or 'Connector' }}&rsquo;s note:</span> {{ d.connector_note }}
+                  </div>
+                {% endif %}
+                <details class="mt-1.5">
+                  <summary class="text-[11px] text-slate-500 cursor-pointer hover:text-indigo-700">Preview body</summary>
+                  <pre class="mt-1.5 whitespace-pre-wrap text-[11px] text-slate-700 bg-slate-50 border border-slate-200 rounded p-2 font-sans">{{ d.body }}</pre>
+                </details>
+              </div>
+              <a href="{{ d.gmail_url }}" target="_blank" rel="noopener"
+                 class="flex-shrink-0 inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md bg-indigo-600 text-white font-medium hover:bg-indigo-700">
+                📧 Open in Gmail
+              </a>
+            </li>
+          {% endfor %}
+        </ul>
+      </section>
+    {% endif %}
+
     <section class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm">
       <form method="POST" action="/import/triage-responses" enctype="multipart/form-data" class="space-y-4">
         <label class="block">
