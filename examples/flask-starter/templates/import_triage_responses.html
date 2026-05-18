@@ -33,7 +33,8 @@
       <div class="mb-6 rounded-md border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
         <strong>Imported from {{ result.connector_name }}{% if result.list_label %} ({{ result.list_label }}){% endif %}:</strong>
         {{ result.yes_added }} target{{ '' if result.yes_added == 1 else 's' }} marked as <strong>intro requested</strong>,
-        {{ result.no_added }} {{ 'path' if result.no_added == 1 else 'paths' }} <strong>zeroed out</strong>.
+        {{ result.no_added }} {{ 'path' if result.no_added == 1 else 'paths' }} <strong>zeroed out</strong>{% if result.unanswered_skipped %},
+        {{ result.unanswered_skipped }} <strong>left unanswered</strong> (eligible to be re-asked on the next mint to this connector){% endif %}.
         {% if result.skipped_no_connection_id %}
           <span class="block mt-1 text-emerald-800/80">
             ({{ result.skipped_no_connection_id }} yes-response{{ '' if result.skipped_no_connection_id == 1 else 's' }} skipped — couldn&rsquo;t find the local connection_id;

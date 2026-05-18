@@ -4650,6 +4650,7 @@ def import_triage_responses_view():
 
         yes_added = 0
         no_added = 0
+        unanswered_skipped = 0
         skipped_no_connection_id = 0
         compose_drafts: list[dict] = []
         for r in responses:
@@ -4700,9 +4701,17 @@ def import_triage_responses_view():
                         "body": body,
                         "gmail_url": _gmail_compose_url(subject, body),
                     })
+            elif verdict == "unanswered":
+                # Connector skipped this target — neither a yes nor a
+                # final no. We MUST NOT write a connector_overrides row
+                # here, because the mint filter excludes targets that
+                # already have one, and an "unanswered" target should
+                # be eligible to be re-asked on the next mint to this
+                # connector. Just track the count for the result banner.
+                unanswered_skipped += 1
             else:
-                # Treat 'no' (and anything else, e.g. stale 'maybe') as
-                # a path-deprioritization signal.
+                # 'no' or anything legacy (e.g. stale 'maybe' from a v1
+                # session) — treat as a path-deprioritization signal.
                 db_connector_override_upsert(
                     connector_key=connector_key,
                     target_id=target_id,
@@ -4722,6 +4731,7 @@ def import_triage_responses_view():
                 "list_label": session_meta.get("listLabel") or "",
                 "yes_added": yes_added,
                 "no_added": no_added,
+                "unanswered_skipped": unanswered_skipped,
                 "skipped_no_connection_id": skipped_no_connection_id,
             },
             compose_drafts=compose_drafts,
@@ -4844,6 +4854,10 @@ def triage_mint_for_connector():
     )
     if isinstance(raw_target_ids, str):
         raw_target_ids = [raw_target_ids]
+    if not isinstance(raw_target_ids, list):
+        # Malformed JSON body (e.g. target_ids: 5 or {"foo":"bar"}). Treat
+        # as "no filter" rather than 500-ing.
+        raw_target_ids = []
     allowed_subset = {tid.strip() for tid in raw_target_ids if tid and isinstance(tid, str)}
 
     # Resolve connector identity + targets from kit state.
@@ -5034,7 +5048,7 @@ def triage_mint_for_connector():
     connector_url = data.get("connectorUrl") or ""
     view_url = data.get("viewUrl") or ""
     connector_first = (connector_info["name"].split(" ", 1) or ["there"])[0]
-    share_subject = "Quick favor — would you yes/no a short list?"
+    share_subject = "Quick favor - would you yes/no a short shortlist?"
     share_body_lines = [
         f"Hi {connector_first},",
         "",

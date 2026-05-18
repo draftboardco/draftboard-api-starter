@@ -662,7 +662,7 @@
 
     fetch('/triage/mint', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Sec-Fetch-Site': 'same-origin' },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         connector_key: connectorKey,
         target_ids: checked,
