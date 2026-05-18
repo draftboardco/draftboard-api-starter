@@ -2881,6 +2881,75 @@ def _gmail_compose_url(subject, body, to=None):
     return "".join(parts)
 
 
+# Default global template used when the user hasn't saved a custom one.
+# Placeholders: {connector_first}, {target_name}, {customer_name}. We use
+# str.format so unknown placeholders raise — better to fail loudly than
+# silently leak literal "{foo}" into outgoing emails.
+DEFAULT_SHORTLIST_EMAIL_SUBJECT = "Following up on intro to {target_name}"
+DEFAULT_SHORTLIST_EMAIL_BODY = (
+    "Hey {connector_first},\n"
+    "\n"
+    "Thanks for offering to ping {target_name} about what we're doing. "
+    "We'd love to chat with them — we think our product would be a great fit.\n"
+    "\n"
+    "Let me know if they're open to chatting.\n"
+    "\n"
+    "All the best,\n"
+    "{customer_name}"
+)
+
+
+def db_get_shortlist_template() -> dict:
+    """Return the saved global shortlist email template, falling back to
+    the defaults if none is saved. Always returns dict with `subject` +
+    `body` strings."""
+    raw = db_app_state_get("shortlist_email_template")
+    if raw:
+        try:
+            data = json.loads(raw)
+            subject = (data.get("subject") or "").strip()
+            body = data.get("body") or ""
+            if subject and body:
+                return {"subject": subject, "body": body}
+        except (ValueError, TypeError):
+            pass
+    return {
+        "subject": DEFAULT_SHORTLIST_EMAIL_SUBJECT,
+        "body": DEFAULT_SHORTLIST_EMAIL_BODY,
+    }
+
+
+def db_set_shortlist_template(subject: str, body: str) -> None:
+    db_app_state_set(
+        "shortlist_email_template",
+        json.dumps({"subject": subject, "body": body}),
+    )
+
+
+def _render_shortlist_template(subject: str, body: str, *, connector_first: str,
+                               target_name: str, customer_name: str) -> tuple[str, str]:
+    """Substitute placeholders in (subject, body). Tolerates user-saved
+    templates that omit placeholders — missing braces just pass through
+    unchanged. Unknown placeholders are left as literal text so the user
+    sees what they typed."""
+    ctx = {
+        "connector_first": connector_first or "there",
+        "target_name": target_name or "(this person)",
+        "customer_name": customer_name or "",
+    }
+    def _safe(fmt: str) -> str:
+        try:
+            return fmt.format(**ctx)
+        except (KeyError, IndexError, ValueError):
+            # User typed an unknown placeholder like {whoever}. Render
+            # all known ones and leave the rest as-is.
+            out = fmt
+            for k, v in ctx.items():
+                out = out.replace("{" + k + "}", v)
+            return out
+    return _safe(subject), _safe(body)
+
+
 def _name_from_linkedin_url(url: str) -> str:
     """Pull a human-readable name from a LinkedIn profile URL slug. Used as a
     display fallback for paste-mode targets that don't have first/last
@@ -4492,7 +4561,7 @@ def import_triage_responses_view():
                 "import_triage_responses.html",
                 api_key_set=bool(API_KEY),
                 active="import_triage_responses",
-                result={"error": "No file uploaded. Pick the JSON file you downloaded from the triage view page."},
+                result={"error": "No file uploaded. Pick the JSON file you downloaded from the shortlist view page."},
                 recent_overrides=_recent_connector_overrides_for_display(),
             )
 
@@ -4518,7 +4587,7 @@ def import_triage_responses_view():
                 "import_triage_responses.html",
                 api_key_set=bool(API_KEY),
                 active="import_triage_responses",
-                result={"error": f"Not valid JSON: {type(e).__name__}. Was this the file you downloaded from the triage page?"},
+                result={"error": f"Not valid JSON: {type(e).__name__}. Was this the file you downloaded from the shortlist page?"},
                 recent_overrides=_recent_connector_overrides_for_display(),
             )
 
@@ -4528,7 +4597,7 @@ def import_triage_responses_view():
                 "import_triage_responses.html",
                 api_key_set=bool(API_KEY),
                 active="import_triage_responses",
-                result={"error": "Unrecognized file shape. Expected `{version: 2, session, responses}` from draftboard.com/triage."},
+                result={"error": "Unrecognized file shape. Expected `{version: 2, session, responses}` from draftboard.com/shortlist (or /triage on older mints)."},
                 recent_overrides=_recent_connector_overrides_for_display(),
             )
         session_meta = data.get("session") or {}
@@ -4552,7 +4621,7 @@ def import_triage_responses_view():
                 "import_triage_responses.html",
                 api_key_set=bool(API_KEY),
                 active="import_triage_responses",
-                result={"error": "Connector LinkedIn URL missing from the upload. Generate a new triage page from inside Draftboard so the connector's LinkedIn URL is included."},
+                result={"error": "Connector LinkedIn URL missing from the upload. Generate a new shortlist page from inside Draftboard so the connector's LinkedIn URL is included."},
                 recent_overrides=_recent_connector_overrides_for_display(),
             )
         connector_norm = _normalize_linkedin(connector_linkedin)
@@ -4577,6 +4646,7 @@ def import_triage_responses_view():
         connector_display = (session_meta.get("connectorName") or "").strip()
         connector_first = connector_display.split()[0] if connector_display else "there"
         customer_display = (session_meta.get("customerName") or "").strip()
+        template = db_get_shortlist_template()
 
         yes_added = 0
         no_added = 0
@@ -4614,19 +4684,13 @@ def import_triage_responses_view():
                     # fills it in (most connectors are in their contacts
                     # already, so Gmail will autocomplete).
                     target_name = (r.get("targetName") or "").strip() or "(this person)"
-                    subject = f"Following up on intro to {target_name}"
-                    body_lines = [
-                        f"Hey {connector_first},",
-                        "",
-                        f"Thanks for offering to ping {target_name} about what we're doing. "
-                        f"We'd love to chat with them — we think our product would be a great fit.",
-                        "",
-                        f"Let me know if they're open to chatting.",
-                        "",
-                        "All the best,",
-                        customer_display or "[your name]",
-                    ]
-                    body = "\n".join(body_lines)
+                    subject, body = _render_shortlist_template(
+                        template["subject"],
+                        template["body"],
+                        connector_first=connector_first,
+                        target_name=target_name,
+                        customer_name=customer_display or "[your name]",
+                    )
                     compose_drafts.append({
                         "target_id": target_id,
                         "target_name": target_name,
@@ -4662,6 +4726,11 @@ def import_triage_responses_view():
             },
             compose_drafts=compose_drafts,
             recent_overrides=_recent_connector_overrides_for_display(),
+            shortlist_template=template,
+            shortlist_template_defaults={
+                "subject": DEFAULT_SHORTLIST_EMAIL_SUBJECT,
+                "body": DEFAULT_SHORTLIST_EMAIL_BODY,
+            },
         )
 
     # GET — empty form
@@ -4672,7 +4741,56 @@ def import_triage_responses_view():
         result=None,
         compose_drafts=[],
         recent_overrides=_recent_connector_overrides_for_display(),
+        shortlist_template=db_get_shortlist_template(),
+        shortlist_template_defaults={
+            "subject": DEFAULT_SHORTLIST_EMAIL_SUBJECT,
+            "body": DEFAULT_SHORTLIST_EMAIL_BODY,
+        },
     )
+
+
+@app.route("/settings/shortlist-template", methods=["GET", "POST"])
+def shortlist_template_settings():
+    """Get or set the global shortlist email template.
+
+    GET → JSON {subject, body, defaults: {subject, body}}
+    POST JSON {subject, body} → save and return JSON {ok, subject, body}
+
+    Placeholders supported in subject + body:
+      {connector_first}  — first name of the connector being emailed
+      {target_name}      — full name of the target they're introing to
+      {customer_name}    — the kit user's own display name
+    """
+    if request.method == "GET":
+        tpl = db_get_shortlist_template()
+        return jsonify({
+            "ok": True,
+            "subject": tpl["subject"],
+            "body": tpl["body"],
+            "defaults": {
+                "subject": DEFAULT_SHORTLIST_EMAIL_SUBJECT,
+                "body": DEFAULT_SHORTLIST_EMAIL_BODY,
+            },
+        })
+
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+
+    body_json = request.get_json(silent=True) or {}
+    subject = (body_json.get("subject") or "").strip()
+    body = body_json.get("body") or ""
+    if not subject:
+        return jsonify({"ok": False, "error": "subject required"}), 400
+    if not body.strip():
+        return jsonify({"ok": False, "error": "body required"}), 400
+    if len(subject) > 300:
+        return jsonify({"ok": False, "error": "subject too long (max 300 chars)"}), 400
+    if len(body) > 10000:
+        return jsonify({"ok": False, "error": "body too long (max 10000 chars)"}), 400
+
+    db_set_shortlist_template(subject, body)
+    return jsonify({"ok": True, "subject": subject, "body": body})
 
 
 @app.route("/triage/mint", methods=["POST"])
@@ -4713,6 +4831,21 @@ def triage_mint_for_connector():
     if not connector_key:
         return jsonify({"ok": False, "error": "connector_key required"}), 400
 
+    # Optional subset filter: caller can pass `target_ids` to mint a
+    # shortlist for only those specific targets. The bulk-bar in the
+    # connector drawer uses this so the user can hand-pick which targets
+    # to send to the connector. We intersect — only target_ids that are
+    # already in this connector's path list survive, so a malicious
+    # caller can't smuggle in arbitrary targets.
+    raw_target_ids = (
+        request.form.getlist("target_ids")
+        or body_json.get("target_ids")
+        or []
+    )
+    if isinstance(raw_target_ids, str):
+        raw_target_ids = [raw_target_ids]
+    allowed_subset = {tid.strip() for tid in raw_target_ids if tid and isinstance(tid, str)}
+
     # Resolve connector identity + targets from kit state.
     paths = db_targets_for_connector(connector_key)
     if not paths:
@@ -4720,13 +4853,54 @@ def triage_mint_for_connector():
             "ok": False,
             "error": "no paths found for this connector_key in the local cache",
         }), 404
+    if allowed_subset:
+        paths = [p for p in paths if p["target_id"] in allowed_subset]
+        if not paths:
+            return jsonify({
+                "ok": False,
+                "error": (
+                    "none of the selected targets are reachable through this "
+                    "connector in the local cache"
+                ),
+            }), 400
 
     targets_all, _err = fetch_all_targets()
     target_map = {t.get("id"): t for t in targets_all}
 
+    # Build the "already answered" filter — targets this connector has
+    # previously said yes (intro_requests row exists for this
+    # connection_id) or no (connector_overrides row) to. We exclude
+    # those from the next mint so the connector isn't re-asked. Only
+    # unanswered + new targets show up.
+    answered_target_ids: set = set()
+    with _db_lock, _db_connect() as conn:
+        # connector_overrides keys on (connector_key, target_id). One
+        # lookup gives us every "no" for this connector.
+        cur = conn.execute(
+            "SELECT target_id FROM connector_overrides WHERE connector_key = ?",
+            (connector_key,),
+        )
+        for row in cur.fetchall():
+            answered_target_ids.add(row[0])
+        # intro_requests keys on (target_id, connection_id). Every path
+        # row for this connector contributes one possible connection_id;
+        # we check each path's connection_id against intro_requests in
+        # one query.
+        path_connection_ids = [p["connection_id"] for p in paths if p.get("connection_id")]
+        if path_connection_ids:
+            placeholders = ",".join("?" * len(path_connection_ids))
+            cur = conn.execute(
+                f"SELECT target_id FROM intro_requests "
+                f"WHERE connection_id IN ({placeholders})",
+                tuple(path_connection_ids),
+            )
+            for row in cur.fetchall():
+                answered_target_ids.add(row[0])
+
     connector_info = None
     triage_targets: list[dict] = []
     seen_target_ids: set = set()
+    skipped_already_answered = 0
     for p in paths:
         target = target_map.get(p["target_id"])
         if not target:
@@ -4735,6 +4909,14 @@ def triage_mint_for_connector():
         if not target_id or target_id in seen_target_ids:
             continue
         seen_target_ids.add(target_id)
+
+        # Skip targets we've already heard a definitive answer on.
+        # Yeses are now in intro_requests; nos are in connector_overrides.
+        # We still capture connector_info from the first usable path even
+        # if that target is skipped — we need the name + LinkedIn URL.
+        already_answered = target_id in answered_target_ids
+        if already_answered:
+            skipped_already_answered += 1
 
         # First time through: capture the connector's name + LinkedIn URL.
         if connector_info is None:
@@ -4751,6 +4933,9 @@ def triage_mint_for_connector():
                     ).strip() or "(unnamed connector)",
                     "linkedin": (conn_obj.get("linkedinUrl") or "").strip(),
                 }
+
+        if already_answered:
+            continue
 
         pos = target.get("position") or {}
         target_name = (
@@ -4770,6 +4955,15 @@ def triage_mint_for_connector():
             "error": "couldn't resolve connector identity from local data — try a sync first",
         }), 404
     if not triage_targets:
+        if skipped_already_answered > 0:
+            return jsonify({
+                "ok": False,
+                "error": (
+                    f"every target this connector could intro has already been "
+                    f"answered ({skipped_already_answered} yes/no on file). "
+                    f"Add new targets or pick a different connector."
+                ),
+            }), 400
         return jsonify({
             "ok": False,
             "error": "no targets with valid LinkedIn URLs for this connector",
@@ -4840,7 +5034,7 @@ def triage_mint_for_connector():
     connector_url = data.get("connectorUrl") or ""
     view_url = data.get("viewUrl") or ""
     connector_first = (connector_info["name"].split(" ", 1) or ["there"])[0]
-    share_subject = "Quick favor — would you triage a short list?"
+    share_subject = "Quick favor — would you yes/no a short list?"
     share_body_lines = [
         f"Hi {connector_first},",
         "",
@@ -4874,24 +5068,38 @@ def triage_mint_for_connector():
 
 def _find_connection_id_for_connector_at_target(target_id: str, connector_norm_linkedin: str) -> str:
     """For a given target_id + a connector's normalized LinkedIn URL,
-    look up the local `connection_id` from the kit's cached
-    `connections` table. The kit's intro_requests table keys on
-    connection_id, so we need this mapping to mark yes-responses as
-    'requested'.
+    look up the local `connection_id` that the connector drawer + path
+    renderers actually USE — which comes from `connector_paths` (the
+    connector-first index), NOT from `connections.connections_json`.
 
-    Returns "" if no match (target not cached, or this connector doesn't
-    appear in the path data for this target — possibly stale cache).
+    Why this matters: `connections.connections_json` is the raw API
+    response cache, refreshed every sync. Each refresh can mint NEW
+    connection_id UUIDs for the same (connector, target) pair (the
+    Draftboard API does this). Meanwhile `connector_paths` is backfilled
+    from connections at a specific moment + sticks until the next
+    backfill. So the two stores routinely DRIFT on connection_id.
+
+    The renderer (`_enrich_connection`) reads conn_obj from
+    fetch_target_connections — but it FIRST gets the connection_id from
+    `connector_paths` via db_targets_for_connector, then finds the
+    matching conn_obj by `id == that connection_id`. So the connection_id
+    that actually appears in the rendered card is `connector_paths.
+    connection_id`. intro_requests rows have to match THAT, or the
+    "Requested" badge never shows up.
+
+    Returns "" if no match.
     """
     if not target_id or not connector_norm_linkedin:
         return ""
-    try:
-        connections, _err = fetch_target_connections(target_id)
-    except Exception:  # noqa: BLE001
-        return ""
-    for c in connections or []:
-        if _normalize_linkedin(c.get("linkedinUrl") or "") == connector_norm_linkedin:
-            return c.get("id") or ""
-    return ""
+    connector_key = f"li:{connector_norm_linkedin}"
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT connection_id FROM connector_paths "
+            "WHERE connector_key = ? AND target_id = ? LIMIT 1",
+            (connector_key, target_id),
+        )
+        row = cur.fetchone()
+    return row[0] if row else ""
 
 
 def _recent_connector_overrides_for_display(limit: int = 10) -> list:

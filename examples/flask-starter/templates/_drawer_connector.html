@@ -34,9 +34,9 @@
               data-connector-key="{{ connector.key }}"
               data-connector-first="{{ connector.first or 'they' }}"
               data-total-targets="{{ total_targets }}"
-              title="Mint a triage page to send to {{ connector.first or 'this connector' }} so they can quickly yes/no each target"
+              title="Mint a shortlist page to send to {{ connector.first or 'this connector' }} so they can quickly yes/no each target"
               class="inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md border border-indigo-300 bg-indigo-50 text-indigo-800 hover:bg-indigo-100">
-        🔗 Send triage page
+        🔗 Send shortlist
       </button>
       <button data-no-drawer onclick="closeDrawer()"
               class="text-slate-400 hover:text-slate-900 text-2xl leading-none">&times;</button>
@@ -48,7 +48,7 @@
   <div data-triage-mint-panel class="hidden mb-5 rounded-lg border border-indigo-200 bg-indigo-50/60 p-4 shadow-sm">
     <div class="flex items-start justify-between gap-3 mb-2">
       <h3 class="text-sm font-semibold text-indigo-900">
-        ✨ Triage page minted
+        ✨ Shortlist ready to send
       </h3>
       <button type="button" data-triage-mint-close
               class="text-indigo-400 hover:text-indigo-700 text-lg leading-none">&times;</button>
@@ -78,7 +78,7 @@
       </a>
     </div>
     <p class="mt-3 text-[11px] text-indigo-700/70">
-      Once they submit, you&rsquo;ll get an email. Download the JSON from the view page above and drop it into <a href="/import/triage-responses" class="underline">Import triage responses</a>.
+      Once they submit, you&rsquo;ll get an email. Download the JSON from the view page above and drop it into <a href="/import/triage-responses" class="underline">Import shortlist responses</a>.
     </p>
   </div>
 
@@ -114,6 +114,11 @@
               onclick="composeBulkIntro(this)"
               class="text-xs px-3 py-1.5 rounded bg-indigo-600 hover:bg-indigo-700 text-white inline-flex items-center gap-1.5">
         Compose bulk intro
+      </button>
+      <button type="button"
+              onclick="sendShortlistForSelected(this)"
+              class="text-xs px-3 py-1.5 rounded border border-indigo-400 bg-white hover:bg-indigo-50 text-indigo-800 inline-flex items-center gap-1.5">
+        🔗 Send shortlist for selected
       </button>
       <button type="button"
               onclick="clearBulkSelection(this)"
