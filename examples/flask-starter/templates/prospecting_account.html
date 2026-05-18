@@ -309,10 +309,23 @@
       li.className = 'py-3 flex items-start gap-3';
       li.setAttribute('data-linkedin', c.linkedin_url || '');
       const initials = ((c.first_name || '?')[0] || '?') + ((c.last_name || '')[0] || '');
+      // Confidence color buckets: 0.75+ green, 0.55+ amber, otherwise grey.
+      // Matches the AI re-rank prompt's bucket guidance (≥0.85 explicit
+      // company match, 0.55-0.84 plausible, ≤0.54 weak).
+      const conf = (typeof c.ai_confidence === 'number') ? c.ai_confidence : null;
+      let pillCls = 'bg-slate-100 text-slate-600 border-slate-200';
+      if (conf !== null) {
+        if (conf >= 0.75) pillCls = 'bg-emerald-50 text-emerald-800 border-emerald-200';
+        else if (conf >= 0.55) pillCls = 'bg-amber-50 text-amber-800 border-amber-200';
+      }
       li.innerHTML = `
         <div class="flex-shrink-0 w-9 h-9 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center text-xs font-semibold"></div>
         <div class="flex-1 min-w-0">
-          <div class="text-sm font-semibold text-slate-900"></div>
+          <div class="flex items-center gap-2 flex-wrap">
+            <span class="text-sm font-semibold text-slate-900" data-cand-name></span>
+            <span class="hidden inline-flex items-center text-[10px] px-1.5 py-0.5 rounded-full border ${pillCls} font-medium"
+                  data-cand-confidence></span>
+          </div>
           <div class="text-xs text-slate-600" data-cand-title></div>
           <div class="mt-1 flex items-center gap-3 text-[11px] text-slate-500">
             <a target="_blank" rel="noopener" class="text-indigo-700 hover:underline" data-cand-link>↗ LinkedIn</a>
@@ -324,8 +337,20 @@
         </button>
       `;
       li.querySelector('.bg-emerald-100').textContent = initials.toUpperCase();
-      li.querySelector('.text-sm.font-semibold').textContent = c.name || '(unknown)';
+      li.querySelector('[data-cand-name]').textContent = c.name || '(unknown)';
       li.querySelector('[data-cand-title]').textContent = c.title || '';
+      if (conf !== null) {
+        const pill = li.querySelector('[data-cand-confidence]');
+        pill.classList.remove('hidden');
+        pill.textContent = conf.toFixed(2);
+        const reason = (c.ai_reason || '').trim();
+        // Tooltip via title= attr (browser-native, no extra deps). Includes
+        // the threshold reminder so users know why some candidates were
+        // filtered out entirely (anything below 0.45 doesn't reach here).
+        pill.title = reason
+          ? `Confidence: ${conf.toFixed(2)} — ${reason}`
+          : `Confidence: ${conf.toFixed(2)} (no reason given by the AI judge)`;
+      }
       const link = li.querySelector('[data-cand-link]');
       link.href = c.linkedin_url || '#';
 
