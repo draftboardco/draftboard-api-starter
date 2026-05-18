@@ -40,6 +40,15 @@ from prospecting import (
 
 API_BASE = "https://intros.draftboard.com/api/v1/integration"
 
+# Where the kit mints triage pages. Defaults to the production draftboard.com
+# /api/triage/generate endpoint. Override with TRIAGE_API_URL when testing
+# against a Vercel preview deploy (e.g.,
+# https://draftboard-landing-<hash>-draftboard-727a852b.vercel.app/api/triage/generate).
+TRIAGE_API_URL = os.environ.get(
+    "TRIAGE_API_URL",
+    "https://www.draftboard.com/api/triage/generate",
+).strip()
+
 # Where the LinkedIn resolver wizard saves the customer's Apollo / Google CSE /
 # OpenAI keys when env vars aren't set. Mirrors the storage pattern used for
 # the Draftboard API key (~/.draftboard-secrets/draftboard-api-starter).
@@ -4664,6 +4673,203 @@ def import_triage_responses_view():
         compose_drafts=[],
         recent_overrides=_recent_connector_overrides_for_display(),
     )
+
+
+@app.route("/triage/mint", methods=["POST"])
+def triage_mint_for_connector():
+    """Mint a triage page for a specific connector + the targets they can
+    intro to (from the kit's local cache). POSTs to the draftboard.com
+    triage API and returns the resulting connector URL + view URL.
+
+    Body params (form or JSON):
+      connector_key  (required) — the kit's stable connector_key
+      list_label     (optional) — short human label shown on the swipe page
+
+    Returns JSON:
+      {ok, connectorUrl, viewUrl, expiresAt, targetCount}
+
+    No new state is stored locally — the source of truth is the triage
+    session on Vercel/KV. Re-running this for the same connector mints a
+    fresh URL (intentionally — the old URL is still valid until it
+    expires, but the new mint generates a fresh signed token in case the
+    user wants to re-share to a different contact email).
+    """
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+
+    # Accept both form-encoded and JSON bodies.
+    body_json = request.get_json(silent=True) or {}
+    connector_key = (
+        request.form.get("connector_key")
+        or body_json.get("connector_key")
+        or ""
+    ).strip()
+    list_label = (
+        request.form.get("list_label")
+        or body_json.get("list_label")
+        or ""
+    ).strip()[:80]
+    if not connector_key:
+        return jsonify({"ok": False, "error": "connector_key required"}), 400
+
+    # Resolve connector identity + targets from kit state.
+    paths = db_targets_for_connector(connector_key)
+    if not paths:
+        return jsonify({
+            "ok": False,
+            "error": "no paths found for this connector_key in the local cache",
+        }), 404
+
+    targets_all, _err = fetch_all_targets()
+    target_map = {t.get("id"): t for t in targets_all}
+
+    connector_info = None
+    triage_targets: list[dict] = []
+    seen_target_ids: set = set()
+    for p in paths:
+        target = target_map.get(p["target_id"])
+        if not target:
+            continue
+        target_id = target.get("id")
+        if not target_id or target_id in seen_target_ids:
+            continue
+        seen_target_ids.add(target_id)
+
+        # First time through: capture the connector's name + LinkedIn URL.
+        if connector_info is None:
+            target_conns, _e = fetch_target_connections(target_id)
+            conn_obj = next(
+                (c for c in target_conns if c.get("id") == p["connection_id"]),
+                None,
+            )
+            if conn_obj:
+                connector_info = {
+                    "name": (
+                        (conn_obj.get("firstName") or "") + " "
+                        + (conn_obj.get("lastName") or "")
+                    ).strip() or "(unnamed connector)",
+                    "linkedin": (conn_obj.get("linkedinUrl") or "").strip(),
+                }
+
+        pos = target.get("position") or {}
+        target_name = (
+            (target.get("firstName") or "") + " " + (target.get("lastName") or "")
+        ).strip() or "(unnamed)"
+        triage_targets.append({
+            "id": target_id,
+            "name": target_name,
+            "linkedinUrl": (target.get("linkedinUrl") or "").strip(),
+            "title": pos.get("title") or None,
+            "company": pos.get("companyName") or None,
+        })
+
+    if not connector_info:
+        return jsonify({
+            "ok": False,
+            "error": "couldn't resolve connector identity from local data — try a sync first",
+        }), 404
+    if not triage_targets:
+        return jsonify({
+            "ok": False,
+            "error": "no targets with valid LinkedIn URLs for this connector",
+        }), 400
+
+    # Customer identity from /me cache.
+    me_data, _me_err = fetch_me()
+    customer_email = ""
+    customer_name = ""
+    if me_data:
+        customer_email = (me_data.get("user_email") or me_data.get("email") or "").strip()
+        first = (me_data.get("user_first") or "").strip()
+        last = (me_data.get("user_last") or "").strip()
+        customer_name = (first + " " + last).strip() or me_data.get("customer_name") or ""
+
+    # Fall back to KIT_AUTHOR_EMAIL if /me hasn't been hydrated yet — at
+    # least the notification email goes somewhere reachable. Customer name
+    # falls back to "Draftboard customer" so the connector's view of who
+    # sent the page reads naturally.
+    if not customer_email:
+        customer_email = KIT_AUTHOR_EMAIL or "noreply@draftboard.com"
+    if not customer_name:
+        customer_name = "Draftboard customer"
+
+    payload = {
+        "customerEmail": customer_email,
+        "customerName": customer_name,
+        "connectorName": connector_info["name"],
+        "connectorLinkedinUrl": connector_info["linkedin"],
+        "listLabel": list_label or None,
+        "targets": triage_targets,
+    }
+
+    try:
+        r = requests.post(
+            TRIAGE_API_URL,
+            headers={"Content-Type": "application/json"},
+            json={k: v for k, v in payload.items() if v is not None},
+            timeout=20,
+        )
+    except requests.RequestException as e:
+        return jsonify({
+            "ok": False,
+            "error": f"network error reaching {TRIAGE_API_URL}: {type(e).__name__}",
+        }), 502
+
+    if r.status_code != 200:
+        return jsonify({
+            "ok": False,
+            "error": f"triage API {r.status_code}",
+            "detail": (r.text or "")[:300],
+        }), r.status_code
+
+    try:
+        data = r.json()
+    except ValueError:
+        return jsonify({"ok": False, "error": "triage API returned non-JSON"}), 502
+
+    if not data.get("ok"):
+        return jsonify({
+            "ok": False,
+            "error": data.get("error") or "triage API rejected the mint",
+        }), 400
+
+    # Build a Gmail draft the user can use to share the URL with the
+    # connector. To: empty (we don't have the connector's email), subject
+    # + body filled in.
+    connector_url = data.get("connectorUrl") or ""
+    view_url = data.get("viewUrl") or ""
+    connector_first = (connector_info["name"].split(" ", 1) or ["there"])[0]
+    share_subject = "Quick favor — would you triage a short list?"
+    share_body_lines = [
+        f"Hi {connector_first},",
+        "",
+        f"I'm trying to reach a few people and thought you might be able to help "
+        f"with some of them. Could you spend ~2 minutes on the link below and "
+        f"mark yes/no on each one?",
+        "",
+        connector_url,
+        "",
+        f"It's a quick page on draftboard.com — just two buttons per target, no "
+        f"login required. Whoever you can intro me to, I'll handle the outreach.",
+        "",
+        "Thanks!",
+        customer_name,
+    ]
+    share_body = "\n".join(share_body_lines)
+    share_gmail_url = _gmail_compose_url(share_subject, share_body)
+
+    return jsonify({
+        "ok": True,
+        "connectorUrl": connector_url,
+        "viewUrl": view_url,
+        "expiresAt": data.get("expiresAt"),
+        "targetCount": len(triage_targets),
+        "connectorName": connector_info["name"],
+        "shareGmailUrl": share_gmail_url,
+        "shareSubject": share_subject,
+        "shareBody": share_body,
+    })
 
 
 def _find_connection_id_for_connector_at_target(target_id: str, connector_norm_linkedin: str) -> str:

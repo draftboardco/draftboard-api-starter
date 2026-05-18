@@ -599,6 +599,113 @@
       });
   };
 
+  // Triage-mint button on the connector drawer. POSTs to /triage/mint
+  // which builds the targets payload from the kit's local cache and
+  // forwards to draftboard.com /api/triage/generate. On success, swaps
+  // the result panel from hidden → visible with the connector URL +
+  // copy-to-clipboard + a pre-drafted Gmail share link.
+  document.addEventListener('click', function (e) {
+    var btn = e.target.closest('[data-triage-mint-btn]');
+    if (!btn) return;
+    e.preventDefault();
+    e.stopPropagation();
+    var key = btn.getAttribute('data-connector-key') || '';
+    var first = btn.getAttribute('data-connector-first') || 'them';
+    var total = btn.getAttribute('data-total-targets') || '0';
+    if (!key) return;
+
+    var content = document.getElementById('drawer-content');
+    if (!content) return;
+    var panel = content.querySelector('[data-triage-mint-panel]');
+    var errEl = content.querySelector('[data-triage-mint-error]');
+    if (errEl) errEl.classList.add('hidden');
+
+    var orig = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Minting…';
+    var fd = new FormData();
+    fd.append('connector_key', key);
+    fd.append('list_label', total + ' target' + (total === '1' ? '' : 's') + ' from your workspace');
+    fetch('/triage/mint', { method: 'POST', body: fd })
+      .then(function (r) { return r.json().then(function (j) { return { status: r.status, body: j }; }); })
+      .then(function (resp) {
+        btn.disabled = false;
+        btn.textContent = orig;
+        var body = resp.body || {};
+        if (!body.ok) {
+          if (errEl) {
+            errEl.classList.remove('hidden');
+            errEl.textContent = 'Mint failed: ' + (body.error || ('HTTP ' + resp.status)) +
+              (body.detail ? ' — ' + body.detail : '');
+          }
+          return;
+        }
+        if (!panel) return;
+        panel.classList.remove('hidden');
+        var summaryEl = panel.querySelector('[data-triage-mint-summary]');
+        if (summaryEl) {
+          summaryEl.textContent =
+            'Asking ' + first + ' for a yes/no on ' + body.targetCount +
+            ' target' + (body.targetCount === 1 ? '' : 's') + '. ' +
+            'URL expires in 30 days.';
+        }
+        var urlEl = panel.querySelector('[data-triage-mint-url]');
+        if (urlEl) {
+          urlEl.value = body.connectorUrl || '';
+        }
+        var gmailEl = panel.querySelector('[data-triage-mint-gmail]');
+        if (gmailEl) {
+          gmailEl.href = body.shareGmailUrl || '#';
+        }
+        var viewEl = panel.querySelector('[data-triage-mint-view]');
+        if (viewEl) {
+          viewEl.href = body.viewUrl || '#';
+        }
+        panel.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      })
+      .catch(function (err) {
+        btn.disabled = false;
+        btn.textContent = orig;
+        if (errEl) {
+          errEl.classList.remove('hidden');
+          errEl.textContent = 'Network error: ' + (err && err.message ? err.message : 'unknown');
+        }
+      });
+  });
+
+  // Copy-to-clipboard for the triage-mint URL input.
+  document.addEventListener('click', function (e) {
+    var btn = e.target.closest('[data-triage-mint-copy]');
+    if (!btn) return;
+    e.preventDefault();
+    e.stopPropagation();
+    var content = document.getElementById('drawer-content');
+    if (!content) return;
+    var urlEl = content.querySelector('[data-triage-mint-url]');
+    if (!urlEl || !urlEl.value) return;
+    var orig = btn.textContent;
+    navigator.clipboard.writeText(urlEl.value).then(function () {
+      btn.textContent = '✓ Copied';
+      setTimeout(function () { btn.textContent = orig; }, 1500);
+    }).catch(function () {
+      // Fallback: select the input so the user can ⌘C manually
+      urlEl.focus();
+      urlEl.select();
+      btn.textContent = 'Press ⌘C';
+      setTimeout(function () { btn.textContent = orig; }, 1500);
+    });
+  });
+
+  // Close button on the result panel.
+  document.addEventListener('click', function (e) {
+    var btn = e.target.closest('[data-triage-mint-close]');
+    if (!btn) return;
+    var content = document.getElementById('drawer-content');
+    if (!content) return;
+    var panel = content.querySelector('[data-triage-mint-panel]');
+    if (panel) panel.classList.add('hidden');
+  });
+
   // Account-drawer left-column target click → swap the right-column connectors
   // panel without losing the targets list. Lives here (not in the drawer
   // template) because <script> tags inserted via innerHTML don't execute.
