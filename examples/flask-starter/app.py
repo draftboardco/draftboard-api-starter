@@ -55,12 +55,16 @@ TRIAGE_API_URL = os.environ.get(
 RESOLVER_SECRETS_PATH = os.path.expanduser(
     "~/.draftboard-secrets/draftboard-api-starter-resolver.json"
 )
-RESOLVER_KEY_NAMES = ("apollo_api_key", "google_cse_api_key", "google_cse_id", "openai_api_key")
+RESOLVER_KEY_NAMES = (
+    "apollo_api_key", "google_cse_api_key", "google_cse_id", "openai_api_key",
+    "scrupp_api_key",
+)
 RESOLVER_ENV_MAP = {
     "apollo_api_key":     "APOLLO_API_KEY",
     "google_cse_api_key": "GOOGLE_CSE_API_KEY",
     "google_cse_id":      "GOOGLE_CSE_ID",
     "openai_api_key":     "OPENAI_API_KEY",
+    "scrupp_api_key":     "SCRUPP_API_KEY",
 }
 # Cache hits within this window skip re-paying for Apollo/CSE/OpenAI calls.
 RESOLUTION_CACHE_TTL = 30 * 24 * 3600  # 30 days
@@ -4801,6 +4805,206 @@ def shortlist_template_settings():
 
     db_set_shortlist_template(subject, body)
     return jsonify({"ok": True, "subject": subject, "body": body})
+
+
+# =====================================================================
+# Scrupp Sales-Navigator URL import
+# =====================================================================
+# Scrupp (scrupp.io) is a Sales Navigator scraping service. The flow:
+#   1. User saves their Scrupp API key on /settings/api-keys.
+#   2. User pastes a Sales Nav search URL on /import/sales-nav.
+#   3. We POST to https://api.scrupp.com/sn/search; Scrupp returns up to
+#      `max` leads with linkedinUrl/name/title/company.
+#   4. We render a preview with checkboxes (all selected by default).
+#   5. User clicks Import → we POST the chosen URLs to Draftboard's
+#      /targets/import (same path as the manual paste-LinkedIn-URLs flow).
+#
+# Scrupp's published quota was 500 results/month with a cap of 100
+# per search. We default the per-search cap to 25 to be conservative
+# and let the user crank it up via the form.
+
+SCRUPP_API_BASE = os.environ.get("SCRUPP_API_BASE", "https://api.scrupp.com")
+SCRUPP_SEARCH_DEFAULT_MAX = 25
+SCRUPP_SEARCH_HARD_MAX = 100
+
+
+def _scrupp_call_search(api_key: str, sales_nav_url: str, max_results: int) -> tuple[list[dict], str | None]:
+    """POST to Scrupp's /sn/search. Returns (leads, error_message).
+    Each lead is a dict with whichever of name/title/company/linkedin we
+    could extract — different Scrupp endpoint versions emit slightly
+    different field names so we normalize here.
+    """
+    if not api_key:
+        return [], "No Scrupp API key configured. Add one on /settings/api-keys."
+    if not sales_nav_url.strip():
+        return [], "Paste a Sales Navigator search URL first."
+    # Clamp to Scrupp's published hard cap so we don't 400.
+    max_results = max(1, min(SCRUPP_SEARCH_HARD_MAX, int(max_results or SCRUPP_SEARCH_DEFAULT_MAX)))
+    try:
+        r = requests.post(
+            f"{SCRUPP_API_BASE}/sn/search",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={"url": sales_nav_url.strip(), "max": max_results},
+            timeout=180,
+        )
+    except requests.RequestException as e:
+        return [], f"Network error reaching Scrupp: {type(e).__name__}"
+    if r.status_code != 200:
+        # Scrupp's error bodies vary — best-effort surface the first
+        # human-readable chunk so the user can diagnose.
+        snippet = (r.text or "")[:300].replace("\n", " ")
+        return [], f"Scrupp returned HTTP {r.status_code}: {snippet}"
+    try:
+        body = r.json()
+    except ValueError:
+        return [], "Scrupp returned non-JSON. Their API may be down."
+
+    # Different Scrupp builds wrap results under "results", "leads", or
+    # the bare list. Handle all three.
+    if isinstance(body, list):
+        raw_items = body
+    elif isinstance(body, dict):
+        raw_items = body.get("results") or body.get("leads") or body.get("data") or []
+    else:
+        raw_items = []
+
+    leads: list[dict] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        linkedin = (
+            item.get("linkedin_url")
+            or item.get("linkedinUrl")
+            or item.get("profile_url")
+            or item.get("profileUrl")
+            or ""
+        ).strip()
+        if not linkedin:
+            continue
+        name = (item.get("name") or item.get("full_name") or item.get("fullName") or "").strip()
+        if not name:
+            first = (item.get("first_name") or item.get("firstName") or "").strip()
+            last = (item.get("last_name") or item.get("lastName") or "").strip()
+            name = (first + " " + last).strip()
+        title = (item.get("title") or item.get("position") or item.get("headline") or "").strip()
+        company = (
+            item.get("company")
+            or item.get("company_name")
+            or item.get("companyName")
+            or item.get("current_company")
+            or ""
+        ).strip()
+        leads.append({
+            "name": name or "(unnamed)",
+            "title": title,
+            "company": company,
+            "linkedin_url": linkedin,
+        })
+    return leads, None
+
+
+@app.route("/import/sales-nav", methods=["GET"])
+def import_sales_nav_view():
+    """Render the Sales Nav URL → Scrupp → import flow. The page is
+    a single SPA-ish form with JS handling the two POSTs (search +
+    import) inline so the user sees results + checkboxes before
+    committing to Draftboard."""
+    keys = _load_resolver_keys()
+    return render_template(
+        "import_sales_nav.html",
+        active="import_sales_nav",
+        api_key_set=bool(API_KEY),
+        scrupp_configured=bool(keys.get("scrupp_api_key")),
+        default_max=SCRUPP_SEARCH_DEFAULT_MAX,
+        hard_max=SCRUPP_SEARCH_HARD_MAX,
+    )
+
+
+@app.route("/import/sales-nav/search", methods=["POST"])
+def import_sales_nav_search():
+    """Hit Scrupp's /sn/search and return JSON leads for the preview UI.
+    Doesn't touch Draftboard's /targets/import yet — the user picks which
+    leads to import on the preview step."""
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+    body = request.get_json(silent=True) or {}
+    sales_nav_url = (body.get("url") or "").strip()
+    try:
+        max_results = int(body.get("max") or SCRUPP_SEARCH_DEFAULT_MAX)
+    except (TypeError, ValueError):
+        max_results = SCRUPP_SEARCH_DEFAULT_MAX
+    keys = _load_resolver_keys()
+    leads, err = _scrupp_call_search(keys.get("scrupp_api_key") or "", sales_nav_url, max_results)
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    return jsonify({"ok": True, "leads": leads, "count": len(leads)})
+
+
+@app.route("/import/sales-nav/import", methods=["POST"])
+def import_sales_nav_import():
+    """Take the user-selected LinkedIn URLs from the preview step and
+    POST them to Draftboard's /targets/import. Same path the manual
+    paste-URLs flow uses — re-use rather than re-implement."""
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+    if not _current_api_key():
+        return jsonify({
+            "ok": False,
+            "error": "DRAFTBOARD_API_KEY not set. Add it before importing.",
+        }), 400
+    body = request.get_json(silent=True) or {}
+    raw_urls = body.get("linkedin_urls") or []
+    if not isinstance(raw_urls, list):
+        return jsonify({"ok": False, "error": "linkedin_urls must be a list"}), 400
+    # De-dupe + normalize through the same helper the manual flow uses
+    # so we get matching behavior for /in/foo vs https://...
+    cleaned = normalize_linkedin_urls("\n".join(u for u in raw_urls if isinstance(u, str)))
+    if not cleaned:
+        return jsonify({"ok": False, "error": "No valid LinkedIn URLs in selection."}), 400
+
+    tags_raw = body.get("tags") or ""
+    tags = [t.strip() for t in re.split(r"[\n,]+", tags_raw) if t.strip()] if isinstance(tags_raw, str) else []
+    # Auto-tag every Scrupp import so the user can filter on it later.
+    if "scrupp" not in {t.lower() for t in tags}:
+        tags.append("scrupp")
+
+    try:
+        payload = {"linkedinUrls": cleaned}
+        if tags:
+            payload["tags"] = tags
+        r = requests.post(
+            f"{API_BASE}/targets/import",
+            headers=_auth_headers(),
+            json=payload,
+            timeout=60,
+        )
+    except requests.RequestException as e:
+        return jsonify({"ok": False, "error": f"Network error: {type(e).__name__}"}), 502
+
+    try:
+        data = r.json()
+    except ValueError:
+        data = {"raw": r.text}
+    if r.status_code != 200:
+        return jsonify({
+            "ok": False,
+            "error": f"Draftboard /targets/import returned {r.status_code}",
+            "detail": data,
+        }), r.status_code
+
+    return jsonify({
+        "ok": True,
+        "submitted": len(cleaned),
+        "imported": data.get("imported"),
+        "notImported": data.get("notImported"),
+        "errors": data.get("errors") or [],
+        "tags_used": tags,
+    })
 
 
 @app.route("/triage/mint", methods=["POST"])
@@ -9934,6 +10138,11 @@ def _resolver_status(keys: dict) -> dict:
         "cse_key_present": bool(keys.get("google_cse_api_key")),
         "cse_id_present": bool(keys.get("google_cse_id")),
         "openai_present": bool(keys.get("openai_api_key")),
+        # Scrupp powers the Sales Navigator URL import flow at
+        # /import/sales-nav. Status-only (presence flag) so the template
+        # never re-renders the secret value.
+        "scrupp_present": bool(keys.get("scrupp_api_key")),
+        "scrupp_ready": bool(keys.get("scrupp_api_key")),
     }
 
 
