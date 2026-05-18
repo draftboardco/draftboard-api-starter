@@ -41,7 +41,6 @@ from typing import Any
 import requests
 
 logger = logging.getLogger(__name__)
-_log = logger.info
 
 OPENAI_MODEL_FAST = "gpt-4o-mini"
 APOLLO_COMPANIES_SEARCH_URL = "https://api.apollo.io/api/v1/mixed_companies/search"
@@ -247,7 +246,7 @@ def apollo_search_companies(
             "linkedin_url": (c.get("linkedin_url") or "").strip(),
             "description": (c.get("short_description") or c.get("description") or "").strip()[:400],
             "industry": (c.get("industry") or "").strip(),
-            "employee_count": c.get("estimated_num_employees") or c.get("publicly_traded_symbol") or None,
+            "employee_count": c.get("estimated_num_employees") or None,
             "location": " · ".join(filter(None, [
                 (c.get("city") or "").strip(),
                 (c.get("state") or "").strip(),
@@ -337,8 +336,17 @@ def score_candidates(
                 idx = int(s.get("index"))
             except (TypeError, ValueError):
                 continue
+            # Coerce score per-row. LLMs sometimes return "high" / "8/10"
+            # / "N/A" instead of an int. Skip the bad row rather than
+            # aborting the whole batch, so a single bad entry doesn't
+            # wipe out scoring for the other 24.
+            raw_score = s.get("score")
+            try:
+                score = max(1, min(10, int(raw_score) if raw_score is not None else 5))
+            except (TypeError, ValueError):
+                continue
             by_idx[idx] = {
-                "score": max(1, min(10, int(s.get("score") or 5))),
+                "score": score,
                 "rationale": str(s.get("rationale") or "").strip()[:200],
             }
         for i, c in enumerate(candidates):

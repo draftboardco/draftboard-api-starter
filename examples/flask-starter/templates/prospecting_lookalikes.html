@@ -104,6 +104,12 @@
           return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
         });
       }
+      // Defense-in-depth: only emit http(s) hrefs so an Apollo record
+      // with a weird URL can't render as javascript: or data:.
+      function safeHttpHref(url) {
+        var s = String(url == null ? '' : url).trim();
+        return /^https?:\/\//i.test(s) ? s : '';
+      }
 
       function scoreClasses(score) {
         if (score == null) return 'bg-slate-100 text-slate-700';
@@ -154,11 +160,13 @@
             .filter(function (x) { return x; })
             .map(escapeHtml)
             .join(' · ');
-          var liLink = c.linkedin_url
-            ? '<a href="' + escapeHtml(c.linkedin_url) + '" target="_blank" rel="noopener" class="text-[11px] text-indigo-600 hover:underline">↗ LinkedIn</a>'
+          var liHref = safeHttpHref(c.linkedin_url);
+          var siteHref = safeHttpHref(c.website_url);
+          var liLink = liHref
+            ? '<a href="' + escapeHtml(liHref) + '" target="_blank" rel="noopener" class="text-[11px] text-indigo-600 hover:underline">↗ LinkedIn</a>'
             : '';
-          var siteLink = c.website_url
-            ? '<a href="' + escapeHtml(c.website_url) + '" target="_blank" rel="noopener" class="text-[11px] text-indigo-600 hover:underline">↗ Website</a>'
+          var siteLink = siteHref
+            ? '<a href="' + escapeHtml(siteHref) + '" target="_blank" rel="noopener" class="text-[11px] text-indigo-600 hover:underline">↗ Website</a>'
             : '';
           return (
             '<article class="bg-white border border-slate-200 rounded-lg p-4 shadow-sm">' +
