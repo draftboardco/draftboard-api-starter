@@ -151,6 +151,13 @@
           return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
         });
       }
+      // Defense-in-depth XSS guard. Server-side _scrupp_call_search
+      // already rejects non-LinkedIn URLs; this stops anything weird
+      // from rendering as a clickable href in the preview anyway.
+      function safeHref(url) {
+        var s = String(url == null ? '' : url).trim();
+        return /^https?:\/\/(www\.)?linkedin\.com\//i.test(s) ? s : '';
+      }
 
       function refreshPickedCount() {
         var n = leadList.querySelectorAll('input[type=checkbox]:checked').length;
@@ -175,7 +182,9 @@
                       escapeHtml(lead.company) +
                     '</div>'
                   : '') +
-                '<a href="' + escapeHtml(lead.linkedin_url) + '" target="_blank" rel="noopener" class="text-[11px] text-indigo-600 hover:underline">↗ LinkedIn</a>' +
+                ((safeHref(lead.linkedin_url))
+                  ? '<a href="' + escapeHtml(safeHref(lead.linkedin_url)) + '" target="_blank" rel="noopener" class="text-[11px] text-indigo-600 hover:underline">↗ LinkedIn</a>'
+                  : '') +
               '</div>' +
             '</label>';
           leadList.appendChild(li);

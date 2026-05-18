@@ -4850,6 +4850,11 @@ def _scrupp_call_search(api_key: str, sales_nav_url: str, max_results: int) -> t
             json={"url": sales_nav_url.strip(), "max": max_results},
             timeout=180,
         )
+    except requests.Timeout:
+        return [], (
+            "Scrupp took longer than 3 minutes to respond. Their queue is "
+            "probably backed up - retry in a few minutes."
+        )
     except requests.RequestException as e:
         return [], f"Network error reaching Scrupp: {type(e).__name__}"
     if r.status_code != 200:
@@ -4863,11 +4868,15 @@ def _scrupp_call_search(api_key: str, sales_nav_url: str, max_results: int) -> t
         return [], "Scrupp returned non-JSON. Their API may be down."
 
     # Different Scrupp builds wrap results under "results", "leads", or
-    # the bare list. Handle all three.
-    if isinstance(body, list):
-        raw_items = body
-    elif isinstance(body, dict):
+    # the bare list. Handle all three. Surface explicit error envelopes
+    # so a 200-with-error doesn't render as a silent 0-leads result.
+    if isinstance(body, dict):
+        explicit_error = body.get("error") or body.get("message")
+        if explicit_error and not (body.get("results") or body.get("leads") or body.get("data")):
+            return [], f"Scrupp: {explicit_error}"
         raw_items = body.get("results") or body.get("leads") or body.get("data") or []
+    elif isinstance(body, list):
+        raw_items = body
     else:
         raw_items = []
 
@@ -4883,6 +4892,12 @@ def _scrupp_call_search(api_key: str, sales_nav_url: str, max_results: int) -> t
             or ""
         ).strip()
         if not linkedin:
+            continue
+        # Defense-in-depth: drop anything that doesn't look like a real
+        # LinkedIn profile URL. Stops a hostile or buggy Scrupp response
+        # from injecting javascript:/data: URLs into the preview's
+        # rendered <a href>.
+        if not _LI_RE.search(linkedin):
             continue
         name = (item.get("name") or item.get("full_name") or item.get("fullName") or "").strip()
         if not name:
