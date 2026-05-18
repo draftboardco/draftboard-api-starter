@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Draftboard — Import triage responses</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    {% include "_nav.html" %}
+
+    <header class="mb-6">
+      <h1 class="text-2xl font-semibold tracking-tight">Import triage responses</h1>
+      <p class="text-sm text-slate-500 mt-1">
+        Drop in the JSON file you downloaded from a connector's triage page on draftboard.com.
+        Each "yes" becomes an intro request in your pipeline; each "no" zeros out that
+        (connector → target) path so it stops cluttering your views.
+      </p>
+    </header>
+
+    {% if result and result.error %}
+      <div class="mb-6 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">
+        {{ result.error }}
+      </div>
+    {% elif result %}
+      <div class="mb-6 rounded-md border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
+        <strong>Imported from {{ result.connector_name }}{% if result.list_label %} ({{ result.list_label }}){% endif %}:</strong>
+        {{ result.yes_added }} target{{ '' if result.yes_added == 1 else 's' }} marked as <strong>intro requested</strong>,
+        {{ result.no_added }} {{ 'path' if result.no_added == 1 else 'paths' }} <strong>zeroed out</strong>.
+        {% if result.skipped_no_connection_id %}
+          <span class="block mt-1 text-emerald-800/80">
+            ({{ result.skipped_no_connection_id }} yes-response{{ '' if result.skipped_no_connection_id == 1 else 's' }} skipped — couldn&rsquo;t find the local connection_id;
+            run a Draftboard sync and try again.)
+          </span>
+        {% endif %}
+      </div>
+    {% endif %}
+
+    <section class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm">
+      <form method="POST" action="/import/triage-responses" enctype="multipart/form-data" class="space-y-4">
+        <label class="block">
+          <span class="text-xs uppercase tracking-wider text-slate-500">Triage response file</span>
+          <input type="file" name="triage_json" accept="application/json,.json" required
+                 class="mt-1 w-full text-sm file:mr-3 file:px-3 file:py-1.5 file:rounded-md file:border-0 file:bg-indigo-600 file:text-white file:cursor-pointer hover:file:bg-indigo-700" />
+          <p class="mt-1 text-xs text-slate-500">
+            Filenames look like <code>triage-responses-tim-2026-05-18.json</code> — you got it from the
+            <em>⬇ Download responses (JSON)</em> button on the triage view page.
+          </p>
+        </label>
+
+        <button type="submit"
+                class="inline-flex items-center justify-center rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow hover:bg-indigo-700">
+          Import responses
+        </button>
+      </form>
+
+      <div class="mt-6 pt-4 border-t border-slate-100 text-xs text-slate-500 space-y-1">
+        <p><strong>What happens on import:</strong></p>
+        <ul class="list-disc pl-5 space-y-1">
+          <li><strong>Yes responses</strong> — the (connector → target) path gets marked as <em>intro requested</em> in the same flow as the Mark-as-requested button on connector cards.</li>
+          <li><strong>No responses</strong> — the path stays in the database (we still know the connector knows them) but its score is forced to 0 wherever it renders. Effectively de-prioritizes the path without losing data.</li>
+          <li>Re-importing the same file is safe. Both writes are idempotent.</li>
+        </ul>
+      </div>
+    </section>
+
+    {% if recent_overrides %}
+      <section class="mt-8 bg-white border border-slate-200 rounded-lg p-5 shadow-sm">
+        <h2 class="text-sm font-semibold text-slate-900">
+          Recent triage-driven path overrides
+          <span class="ml-1 text-slate-400 font-normal">({{ recent_overrides|length }})</span>
+        </h2>
+        <ul class="mt-3 divide-y divide-slate-100">
+          {% for o in recent_overrides %}
+            <li class="py-2 text-xs">
+              <div class="flex items-center justify-between gap-3">
+                <code class="text-slate-700 truncate">{{ o.connector_key }}</code>
+                <span class="text-slate-400 flex-shrink-0">→</span>
+                <code class="text-slate-700 truncate flex-1">{{ o.target_id }}</code>
+                <span class="text-slate-400 flex-shrink-0">{{ o.override_type }}</span>
+              </div>
+              {% if o.note %}
+                <div class="mt-1 px-2 py-1 bg-slate-50 border border-slate-200 rounded text-slate-700">
+                  <span class="font-semibold">Note:</span> {{ o.note }}
+                </div>
+              {% endif %}
+            </li>
+          {% endfor %}
+        </ul>
+      </section>
+    {% endif %}
+
+    <footer class="mt-10 text-xs text-slate-400 text-center">
+      Draftboard API starter · Import triage responses
+    </footer>
+  </div>
+</body>
+</html>

@@ -763,6 +763,29 @@ def init_db():
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_title_personas_last_used_at ON title_personas(last_used_at DESC)")
 
+        # Per-(connector, target) overrides applied to the path display.
+        # Populated by /import/triage-responses: when a connector says
+        # "no" via the triage page, we don't delete their path to that
+        # target (we still know the path exists) — instead we record an
+        # override here that the path-rendering layer reads to ZERO OUT
+        # the displayed score. Yeses from triage flow into intro_requests
+        # the standard way; only nos go here.
+        # connector_key matches the existing connector_paths.connector_key
+        # convention (normalized LinkedIn URL, with a "name:..." fallback
+        # when no URL is on file).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS connector_overrides (
+                connector_key TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                override_type TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'triage',
+                note TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (connector_key, target_id)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_connector_overrides_target ON connector_overrides(target_id)")
+
         # Per-supporter relationship category (customer / investor / vendor /
         # friend / coworker / unclassified). Populated by the categorizer
         # which uses, in priority order: manual override > user-uploaded
@@ -3592,6 +3615,102 @@ def db_persona_mark_used(persona_id) -> None:
         conn.commit()
 
 
+# ---------- Connector overrides (from /import/triage-responses) ----------
+#
+# When a connector tells us via the triage page that they CAN'T help with a
+# specific target, we don't delete the path data — we still know the path
+# exists. We record an override here so the path-rendering layer can zero
+# out the displayed score and visually de-emphasize that connector for
+# that target. Yes-responses don't end up here; they flow into the
+# existing `intro_requests` table with status='requested'.
+
+OVERRIDE_TYPE_TRIAGE_NO = "triage_no"
+
+
+def db_connector_overrides_map() -> dict:
+    """{(connector_key, target_id) → {override_type, source, note, created_at}}
+    for every active override. Cached per-request on flask.g so the path
+    rendering code can check overrides without re-hitting the DB on every
+    candidate. Tiny memory footprint — bounded by the override count,
+    which won't exceed a few hundred even for heavy users."""
+    try:
+        from flask import g
+        cached = getattr(g, "_connector_overrides_map", None)
+    except RuntimeError:
+        cached = None
+        g = None
+    if cached is not None:
+        return cached
+
+    out: dict = {}
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT connector_key, target_id, override_type, source, note, created_at "
+            "FROM connector_overrides"
+        )
+        for row in cur.fetchall():
+            out[(row[0], row[1])] = {
+                "override_type": row[2],
+                "source": row[3],
+                "note": row[4],
+                "created_at": row[5],
+            }
+    if g is not None:
+        g._connector_overrides_map = out
+    return out
+
+
+def db_connector_override_upsert(
+    connector_key: str,
+    target_id: str,
+    override_type: str = OVERRIDE_TYPE_TRIAGE_NO,
+    source: str = "triage",
+    note: str = "",
+) -> None:
+    """Insert-or-replace an override row. Idempotent — running an import
+    twice for the same triage session won't create duplicates."""
+    if not connector_key or not target_id:
+        return
+    now = int(time.time())
+    with _db_lock, _db_connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO connector_overrides "
+            "(connector_key, target_id, override_type, source, note, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (connector_key, target_id, override_type, source, (note or "")[:300], now),
+        )
+        conn.commit()
+    # Drop the request-scoped cache so subsequent calls within the same
+    # request reflect the new override.
+    try:
+        from flask import g
+        if hasattr(g, "_connector_overrides_map"):
+            delattr(g, "_connector_overrides_map")
+    except RuntimeError:
+        pass
+
+
+def db_connector_override_clear(connector_key: str, target_id: str) -> bool:
+    """Remove an override. Returns True if a row was deleted."""
+    if not connector_key or not target_id:
+        return False
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM connector_overrides WHERE connector_key = ? AND target_id = ?",
+            (connector_key, target_id),
+        )
+        removed = cur.rowcount
+        conn.commit()
+    if removed:
+        try:
+            from flask import g
+            if hasattr(g, "_connector_overrides_map"):
+                delattr(g, "_connector_overrides_map")
+        except RuntimeError:
+            pass
+    return bool(removed)
+
+
 def _targets_with_supporter_paths() -> set:
     """Set of target_ids where at least one connector path (API connector OR
     manual-list owner) is on the Supporters list — i.e., someone the user
@@ -3743,6 +3862,19 @@ def _enrich_connection(target, connection, requested_set=None, my_user_id=None):
         norm_li and norm_li in db_manual_supporter_urls_norm()
     )
 
+    # Connector-override check: when this (connector, target) pair has a
+    # 'triage_no' override from a past triage import, we zero the score so
+    # the row sinks to the bottom of any sorted list AND flag it so the
+    # template can render a small "Connector passed on this via triage"
+    # hint. The underlying path data is unchanged — we still know the
+    # connection exists. The override is purely a display layer.
+    connector_key = _compute_connector_key(connection)
+    target_id = (target or {}).get("id") or ""
+    override = db_connector_overrides_map().get((connector_key, target_id))
+    triage_passed = bool(override and override.get("override_type") == OVERRIDE_TYPE_TRIAGE_NO)
+    raw_score = connection.get("score")
+    displayed_score = 0 if triage_passed else raw_score
+
     return {
         "id": cid,
         "name": f"{first} {last}".strip() or "(no name)",
@@ -3755,7 +3887,13 @@ def _enrich_connection(target, connection, requested_set=None, my_user_id=None):
         # Use direct .get() — falsy 0 from real Draftboard data is kept
         # as 0 (renders the "0" pill); None from manual paths stays None
         # (hides the pill). The previous `or 0` coalesce defeated this.
-        "score": connection.get("score"),
+        # When a triage_no override applies, we force the displayed score
+        # to 0 so this path sorts to the bottom of any list.
+        "score": displayed_score,
+        # Surface the raw underlying score even when zeroed, so power
+        # users can see "this WOULD be a 92, but the connector said no."
+        "raw_score": raw_score,
+        "triage_passed": triage_passed,
         "score_details": connection.get("scoreDetails") or [],
         "humanized_details": humanized,
         "owners": raw_owners,
@@ -4313,6 +4451,224 @@ def import_supporters_view():
         result=None,
         recent=db_manual_supporters_recent(50),
     )
+
+
+@app.route("/import/triage-responses", methods=["GET", "POST"])
+def import_triage_responses_view():
+    """Upload-a-JSON-file flow that ingests the responses a connector
+    submitted on draftboard.com/triage/<token>.
+
+    GET: render the upload form + a short explainer + last 5 imports.
+    POST: parse the uploaded JSON, validate shape, apply each response:
+        - yes  → INSERT into intro_requests with status='requested'
+        - no   → INSERT into connector_overrides with override_type='triage_no'
+                 (zeroes the score for that (connector, target) pair in the
+                 path-rendering layer)
+      Then redirect back to this page with a summary banner.
+
+    Idempotent: re-uploading the same file is safe — both target tables
+    have stable composite keys (intro_requests.(target_id, connection_id)
+    and connector_overrides.(connector_key, target_id)) so duplicate
+    inserts no-op via OR REPLACE / silent skip.
+    """
+    if request.method == "POST":
+        # Cross-origin defense for forms that hit a state-mutating endpoint.
+        sec_site = request.headers.get("Sec-Fetch-Site")
+        if sec_site and sec_site not in ("same-origin", "none"):
+            return ("cross-site form submission blocked", 403)
+
+        upload = request.files.get("triage_json")
+        if not upload or not upload.filename:
+            return render_template(
+                "import_triage_responses.html",
+                api_key_set=bool(API_KEY),
+                active="import_triage_responses",
+                result={"error": "No file uploaded. Pick the JSON file you downloaded from the triage view page."},
+                recent_overrides=_recent_connector_overrides_for_display(),
+            )
+
+        # Cap upload size — 5 MB is generous (75 targets × a few hundred
+        # bytes each, even with notes, is well under 100 KB). Anything
+        # larger is malformed or hostile.
+        upload.stream.seek(0, 2)
+        size = upload.stream.tell()
+        upload.stream.seek(0)
+        if size > 5 * 1024 * 1024:
+            return render_template(
+                "import_triage_responses.html",
+                api_key_set=bool(API_KEY),
+                active="import_triage_responses",
+                result={"error": f"File too large ({size} bytes). Triage JSON files should be under a few hundred KB."},
+                recent_overrides=_recent_connector_overrides_for_display(),
+            )
+
+        try:
+            data = json.loads(upload.read().decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as e:
+            return render_template(
+                "import_triage_responses.html",
+                api_key_set=bool(API_KEY),
+                active="import_triage_responses",
+                result={"error": f"Not valid JSON: {type(e).__name__}. Was this the file you downloaded from the triage page?"},
+                recent_overrides=_recent_connector_overrides_for_display(),
+            )
+
+        # Validate the expected shape.
+        if not isinstance(data, dict) or data.get("version") not in (1, 2):
+            return render_template(
+                "import_triage_responses.html",
+                api_key_set=bool(API_KEY),
+                active="import_triage_responses",
+                result={"error": "Unrecognized file shape. Expected `{version: 2, session, responses}` from draftboard.com/triage."},
+                recent_overrides=_recent_connector_overrides_for_display(),
+            )
+        session_meta = data.get("session") or {}
+        responses = data.get("responses") or []
+        if not isinstance(responses, list):
+            return render_template(
+                "import_triage_responses.html",
+                api_key_set=bool(API_KEY),
+                active="import_triage_responses",
+                result={"error": "`responses` should be an array."},
+                recent_overrides=_recent_connector_overrides_for_display(),
+            )
+
+        # Match the connector. The downloaded JSON includes
+        # session.connectorLinkedinUrl (added in triage v2). Without it
+        # we can't map to a local connector_key reliably, so we reject
+        # rather than guess.
+        connector_linkedin = (session_meta.get("connectorLinkedinUrl") or "").strip()
+        if not connector_linkedin:
+            return render_template(
+                "import_triage_responses.html",
+                api_key_set=bool(API_KEY),
+                active="import_triage_responses",
+                result={"error": "Connector LinkedIn URL missing from the upload. Generate a new triage page from inside Draftboard so the connector's LinkedIn URL is included."},
+                recent_overrides=_recent_connector_overrides_for_display(),
+            )
+        connector_norm = _normalize_linkedin(connector_linkedin)
+        connector_key = f"li:{connector_norm}" if connector_norm else ""
+        if not connector_key:
+            return render_template(
+                "import_triage_responses.html",
+                api_key_set=bool(API_KEY),
+                active="import_triage_responses",
+                result={"error": f"Connector LinkedIn URL doesn't look like a LinkedIn URL: {connector_linkedin}"},
+                recent_overrides=_recent_connector_overrides_for_display(),
+            )
+
+        # Walk each response. For yes → upsert intro_requests with
+        # status='requested'; for no → upsert connector_overrides.
+        # Anything else (legacy 'maybe') is treated as 'no' since the
+        # v2 product decision was that maybe isn't a customer-actionable
+        # answer.
+        yes_added = 0
+        no_added = 0
+        skipped_no_connection_id = 0
+        for r in responses:
+            if not isinstance(r, dict):
+                continue
+            target_id = (r.get("targetId") or "").strip()
+            verdict = (r.get("verdict") or "").strip().lower()
+            note = (r.get("note") or "").strip()[:300]
+            if not target_id:
+                continue
+            if verdict == "yes":
+                # Find the local connection_id for (this connector, this
+                # target). The kit caches per-target connections; we
+                # walk that cache for a normalized-linkedin match. If we
+                # can't find one, we skip (the kit's path data may be
+                # stale or the connector might not be in the cache yet).
+                connection_id = _find_connection_id_for_connector_at_target(
+                    target_id, connector_norm,
+                )
+                if not connection_id:
+                    skipped_no_connection_id += 1
+                    continue
+                _, err = db_intro_request_set_status(target_id, connection_id, "requested")
+                if not err:
+                    yes_added += 1
+            else:
+                # Treat 'no' (and anything else, e.g. stale 'maybe') as
+                # a path-deprioritization signal.
+                db_connector_override_upsert(
+                    connector_key=connector_key,
+                    target_id=target_id,
+                    override_type=OVERRIDE_TYPE_TRIAGE_NO,
+                    source="triage",
+                    note=note,
+                )
+                no_added += 1
+
+        return render_template(
+            "import_triage_responses.html",
+            api_key_set=bool(API_KEY),
+            active="import_triage_responses",
+            result={
+                "connector_name": session_meta.get("connectorName") or "(connector)",
+                "list_label": session_meta.get("listLabel") or "",
+                "yes_added": yes_added,
+                "no_added": no_added,
+                "skipped_no_connection_id": skipped_no_connection_id,
+            },
+            recent_overrides=_recent_connector_overrides_for_display(),
+        )
+
+    # GET — empty form
+    return render_template(
+        "import_triage_responses.html",
+        api_key_set=bool(API_KEY),
+        active="import_triage_responses",
+        result=None,
+        recent_overrides=_recent_connector_overrides_for_display(),
+    )
+
+
+def _find_connection_id_for_connector_at_target(target_id: str, connector_norm_linkedin: str) -> str:
+    """For a given target_id + a connector's normalized LinkedIn URL,
+    look up the local `connection_id` from the kit's cached
+    `connections` table. The kit's intro_requests table keys on
+    connection_id, so we need this mapping to mark yes-responses as
+    'requested'.
+
+    Returns "" if no match (target not cached, or this connector doesn't
+    appear in the path data for this target — possibly stale cache).
+    """
+    if not target_id or not connector_norm_linkedin:
+        return ""
+    try:
+        connections, _err = fetch_target_connections(target_id)
+    except Exception:  # noqa: BLE001
+        return ""
+    for c in connections or []:
+        if _normalize_linkedin(c.get("linkedinUrl") or "") == connector_norm_linkedin:
+            return c.get("id") or ""
+    return ""
+
+
+def _recent_connector_overrides_for_display(limit: int = 10) -> list:
+    """Last N triage-driven connector overrides, for the recent-imports
+    panel on the import-page UI. Best-effort — joins are loose; the
+    list is purely informational."""
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT connector_key, target_id, override_type, note, created_at "
+            "FROM connector_overrides "
+            "WHERE source = 'triage' "
+            "ORDER BY created_at DESC LIMIT ?",
+            (int(limit),),
+        )
+        rows = cur.fetchall()
+    return [
+        {
+            "connector_key": r[0],
+            "target_id": r[1],
+            "override_type": r[2],
+            "note": r[3],
+            "created_at": r[4],
+        }
+        for r in rows
+    ]
 
 
 @app.route("/import", methods=["POST"])
