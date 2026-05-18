@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Draftboard — Ideal Customer Profile</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    {% include "_nav.html" %}
+
+    <header class="mb-6">
+      <h1 class="text-2xl font-semibold tracking-tight">Ideal Customer Profile</h1>
+      <p class="text-sm text-slate-500 mt-1">
+        Describe who buys from you and which existing customers fit best. The lookalike engine uses this to surface new accounts that look like them.
+      </p>
+    </header>
+
+    <div id="status-banner"></div>
+
+    <section class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm space-y-4">
+      <label class="block">
+        <span class="text-xs uppercase tracking-wider text-slate-500">ICP description</span>
+        <textarea
+          id="icp-description"
+          rows="8"
+          maxlength="5000"
+          class="mt-1 w-full text-sm rounded-md border border-slate-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+          placeholder="e.g. Series B - C SaaS companies (50 - 500 employees), HQ'd in US or UK, selling tools to RevOps / sales-ops teams. Bonus signals: PLG motion, hybrid sales + self-serve, $5-30M ARR.">{{ icp.description }}</textarea>
+        <p class="mt-1 text-xs text-slate-500">
+          Plain English is fine. The engine extracts structured filters (industry, size, location) automatically.
+        </p>
+      </label>
+
+      <label class="block">
+        <span class="text-xs uppercase tracking-wider text-slate-500">Example current customers</span>
+        <textarea
+          id="icp-examples"
+          rows="6"
+          class="mt-1 w-full text-sm rounded-md border border-slate-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+          placeholder="One per line. Company name, domain, or LinkedIn URL all work.
+Notion
+Linear
+gong.io">{{ icp.examples | join('\n') }}</textarea>
+        <p class="mt-1 text-xs text-slate-500">
+          Up to 50 examples. We use these to ground the LLM's scoring — companies that resemble these (and match the ICP description) get higher scores.
+        </p>
+      </label>
+
+      <div class="flex items-center justify-between gap-3">
+        <p class="text-xs text-slate-500">
+          Saved to the kit's local database. Edit anytime.
+        </p>
+        <button
+          type="button"
+          id="save-btn"
+          class="rounded-md bg-indigo-600 hover:bg-indigo-700 px-4 py-2 text-sm font-medium text-white shadow disabled:opacity-50"
+        >
+          Save ICP
+        </button>
+      </div>
+    </section>
+
+    <section class="mt-6 bg-white border border-slate-200 rounded-lg p-5 shadow-sm">
+      <h2 class="text-sm font-semibold text-slate-900 mb-2">What this unlocks</h2>
+      <ul class="list-disc pl-5 text-xs text-slate-500 space-y-1">
+        <li><a class="text-indigo-600 underline" href="/prospecting/lookalikes">Find lookalike accounts</a> — surfaces Apollo companies that match the ICP + resemble your examples, scored 1-10 with a rationale.</li>
+        <li>The ICP is also a good place to capture what you know about your buyers — disqualifying signals, key personas, common objections. Edit freely.</li>
+        <li>Requires Apollo + OpenAI keys on the <a class="text-indigo-600 underline" href="/settings/api-keys">API keys page</a>.</li>
+      </ul>
+    </section>
+
+    <footer class="mt-10 text-xs text-slate-400 text-center">
+      Draftboard API starter · ICP settings
+    </footer>
+  </div>
+
+  <script>
+    (function () {
+      var descEl = document.getElementById('icp-description');
+      var examplesEl = document.getElementById('icp-examples');
+      var saveBtn = document.getElementById('save-btn');
+      var banner = document.getElementById('status-banner');
+
+      function escapeHtml(s) {
+        return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+          return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
+        });
+      }
+
+      saveBtn.addEventListener('click', function () {
+        var description = (descEl.value || '').trim();
+        var examples = (examplesEl.value || '').trim();
+        if (!description) {
+          banner.innerHTML = '<div class="mb-6 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">Add a description first.</div>';
+          return;
+        }
+        saveBtn.disabled = true;
+        var origText = saveBtn.textContent;
+        saveBtn.textContent = 'Saving…';
+        banner.innerHTML = '';
+        fetch('/settings/icp', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ description: description, examples: examples }),
+        })
+          .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+          .then(function (resp) {
+            saveBtn.disabled = false;
+            saveBtn.textContent = origText;
+            var b = resp.body || {};
+            if (!b.ok) {
+              banner.innerHTML = '<div class="mb-6 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">' + escapeHtml(b.error || 'Save failed') + '</div>';
+              return;
+            }
+            banner.innerHTML = '<div class="mb-6 rounded-md border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">Saved. <a class="underline" href="/prospecting/lookalikes">Find lookalikes →</a></div>';
+          })
+          .catch(function (err) {
+            saveBtn.disabled = false;
+            saveBtn.textContent = origText;
+            banner.innerHTML = '<div class="mb-6 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">Network error: ' + escapeHtml(err && err.message ? err.message : 'unknown') + '</div>';
+          });
+      });
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Draftboard — Lookalike accounts</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+  <div class="max-w-4xl mx-auto px-6 py-10">
+    {% include "_nav.html" %}
+
+    <header class="mb-6">
+      <h1 class="text-2xl font-semibold tracking-tight">Lookalike accounts</h1>
+      <p class="text-sm text-slate-500 mt-1">
+        Surface new accounts that match your ICP and resemble your existing customers. Apollo provides the candidate pool; GPT scores each one against your ICP with a short rationale.
+      </p>
+    </header>
+
+    {% if not icp.description %}
+      <div class="mb-6 rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+        <strong>ICP not set yet.</strong> Save one on the
+        <a class="underline" href="/settings/icp">ICP settings page</a> first.
+      </div>
+    {% endif %}
+
+    {% if not apollo_present or not openai_present %}
+      <div class="mb-6 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">
+        <strong>Missing API keys.</strong>
+        {% if not apollo_present %}Apollo key is required for the candidate search.{% endif %}
+        {% if not openai_present %}OpenAI key is required for criteria extraction + scoring.{% endif %}
+        Add them on the <a class="underline" href="/settings/api-keys">API keys page</a>.
+      </div>
+    {% endif %}
+
+    {% if icp.description %}
+      <section class="mb-6 bg-white border border-slate-200 rounded-lg p-5 shadow-sm">
+        <header class="flex items-start justify-between gap-3 mb-3">
+          <div>
+            <h2 class="text-sm font-semibold text-slate-900">Your ICP</h2>
+            <p class="text-xs text-slate-500 mt-0.5">Edit on the <a class="underline text-indigo-600" href="/settings/icp">ICP settings page</a>.</p>
+          </div>
+          <button
+            type="button"
+            id="find-btn"
+            class="inline-flex items-center justify-center rounded-md bg-indigo-600 hover:bg-indigo-700 px-4 py-2 text-sm font-medium text-white shadow disabled:opacity-50"
+            {% if not apollo_present or not openai_present %}disabled{% endif %}
+          >
+            🔍 Find lookalike accounts
+          </button>
+        </header>
+        <p class="text-xs text-slate-700 mb-2 whitespace-pre-wrap">{{ icp.description }}</p>
+        {% if icp.examples %}
+          <details class="mt-2">
+            <summary class="text-xs text-slate-500 cursor-pointer">{{ icp.examples | length }} example customer{{ '' if icp.examples|length == 1 else 's' }}</summary>
+            <ul class="mt-2 flex flex-wrap gap-1">
+              {% for ex in icp.examples %}
+                <li class="text-[11px] bg-slate-100 text-slate-700 rounded px-2 py-0.5">{{ ex }}</li>
+              {% endfor %}
+            </ul>
+          </details>
+        {% endif %}
+      </section>
+    {% endif %}
+
+    <section id="status" class="mb-6 text-sm text-slate-500"></section>
+
+    <section id="criteria-panel" class="hidden mb-6 bg-indigo-50 border border-indigo-200 rounded-lg p-4 text-xs text-indigo-900">
+      <header class="font-semibold mb-1">LLM-derived Apollo filters</header>
+      <div id="criteria-body" class="space-y-1"></div>
+    </section>
+
+    <section id="results" class="space-y-3"></section>
+
+    <section class="mt-8 bg-white border border-slate-200 rounded-lg p-5 shadow-sm">
+      <h2 class="text-sm font-semibold text-slate-900 mb-2">How the engine works</h2>
+      <ol class="list-decimal pl-5 text-xs text-slate-500 space-y-1">
+        <li>gpt-4o-mini reads your ICP description + customer examples → returns a structured Apollo search (keywords, employee bands, locations) + a scoring rubric.</li>
+        <li>Apollo's <code>mixed_companies/search</code> returns ~25 candidate companies.</li>
+        <li>gpt-4o-mini scores each candidate 1-10 against the rubric and writes a one-sentence rationale.</li>
+        <li>You see the scored list. Open any LinkedIn link to verify, then run <a class="underline" href="/import/sales-nav">Sales Nav import</a> on the company to add people from it as Draftboard targets.</li>
+      </ol>
+      <p class="mt-3 text-xs text-slate-500">
+        v1 doesn't auto-import accounts as Draftboard targets — Draftboard targets are people, not companies. Use the candidate list to pick promising accounts, then run the people-prospecting flow on each.
+      </p>
+    </section>
+
+    <footer class="mt-10 text-xs text-slate-400 text-center">
+      Draftboard API starter · Lookalike accounts
+    </footer>
+  </div>
+
+  <script>
+    (function () {
+      var findBtn = document.getElementById('find-btn');
+      if (!findBtn) return; // no ICP set yet — page renders without the search button
+      var statusEl = document.getElementById('status');
+      var resultsEl = document.getElementById('results');
+      var criteriaPanel = document.getElementById('criteria-panel');
+      var criteriaBody = document.getElementById('criteria-body');
+
+      function escapeHtml(s) {
+        return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+          return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
+        });
+      }
+      // Defense-in-depth: only emit http(s) hrefs so an Apollo record
+      // with a weird URL can't render as javascript: or data:.
+      function safeHttpHref(url) {
+        var s = String(url == null ? '' : url).trim();
+        return /^https?:\/\//i.test(s) ? s : '';
+      }
+
+      function scoreClasses(score) {
+        if (score == null) return 'bg-slate-100 text-slate-700';
+        if (score >= 8) return 'bg-emerald-100 text-emerald-800';
+        if (score >= 5) return 'bg-amber-100 text-amber-800';
+        return 'bg-rose-100 text-rose-800';
+      }
+
+      function renderCriteria(criteria) {
+        if (!criteria) {
+          criteriaPanel.classList.add('hidden');
+          return;
+        }
+        var bits = [];
+        if (criteria.keywords && criteria.keywords.length) {
+          bits.push('<div><strong>Keywords:</strong> ' + criteria.keywords.map(escapeHtml).join(', ') + '</div>');
+        }
+        if (criteria.industries && criteria.industries.length) {
+          bits.push('<div><strong>Industries:</strong> ' + criteria.industries.map(escapeHtml).join(', ') + '</div>');
+        }
+        if (criteria.headcount_bands && criteria.headcount_bands.length) {
+          bits.push('<div><strong>Employee bands:</strong> ' + criteria.headcount_bands.map(escapeHtml).join(', ') + '</div>');
+        }
+        if (criteria.locations && criteria.locations.length) {
+          bits.push('<div><strong>Locations:</strong> ' + criteria.locations.map(escapeHtml).join(', ') + '</div>');
+        }
+        if (criteria.rubric) {
+          bits.push('<details class="mt-1"><summary class="cursor-pointer">Scoring rubric the second LLM call used</summary><p class="mt-1 whitespace-pre-wrap text-indigo-800">' + escapeHtml(criteria.rubric) + '</p></details>');
+        }
+        if (!bits.length) {
+          criteriaPanel.classList.add('hidden');
+          return;
+        }
+        criteriaBody.innerHTML = bits.join('');
+        criteriaPanel.classList.remove('hidden');
+      }
+
+      function renderCandidates(candidates) {
+        if (!candidates.length) {
+          resultsEl.innerHTML = '<div class="rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">No candidates returned. Try a more descriptive ICP or different example customers.</div>';
+          return;
+        }
+        var rows = candidates.map(function (c) {
+          var scoreBadge = c.score != null
+            ? '<span class="inline-flex items-center justify-center w-8 h-8 rounded-full text-sm font-bold ' + scoreClasses(c.score) + '">' + c.score + '</span>'
+            : '<span class="inline-flex items-center justify-center w-8 h-8 rounded-full text-xs ' + scoreClasses(null) + '">?</span>';
+          var subline = [c.industry, (c.employee_count ? '~' + c.employee_count + ' employees' : ''), c.location]
+            .filter(function (x) { return x; })
+            .map(escapeHtml)
+            .join(' · ');
+          var liHref = safeHttpHref(c.linkedin_url);
+          var siteHref = safeHttpHref(c.website_url);
+          var liLink = liHref
+            ? '<a href="' + escapeHtml(liHref) + '" target="_blank" rel="noopener" class="text-[11px] text-indigo-600 hover:underline">↗ LinkedIn</a>'
+            : '';
+          var siteLink = siteHref
+            ? '<a href="' + escapeHtml(siteHref) + '" target="_blank" rel="noopener" class="text-[11px] text-indigo-600 hover:underline">↗ Website</a>'
+            : '';
+          return (
+            '<article class="bg-white border border-slate-200 rounded-lg p-4 shadow-sm">' +
+              '<div class="flex items-start gap-3">' +
+                scoreBadge +
+                '<div class="flex-1 min-w-0">' +
+                  '<div class="text-sm font-semibold text-slate-900 truncate">' + escapeHtml(c.name) + '</div>' +
+                  (subline ? '<div class="text-xs text-slate-600 truncate">' + subline + '</div>' : '') +
+                  (c.description ? '<p class="mt-1 text-xs text-slate-700 line-clamp-2">' + escapeHtml(c.description) + '</p>' : '') +
+                  (c.rationale ? '<div class="mt-2 px-2 py-1 bg-slate-50 border border-slate-200 rounded text-xs text-slate-700"><strong>Why:</strong> ' + escapeHtml(c.rationale) + '</div>' : '') +
+                  '<div class="mt-2 flex items-center gap-3">' + liLink + ' ' + siteLink + '</div>' +
+                '</div>' +
+              '</div>' +
+            '</article>'
+          );
+        }).join('');
+        resultsEl.innerHTML = rows;
+      }
+
+      findBtn.addEventListener('click', function () {
+        findBtn.disabled = true;
+        var origText = findBtn.textContent;
+        findBtn.textContent = 'Searching…';
+        statusEl.innerHTML = '<span class="text-slate-500">Asking GPT for Apollo filters, then querying Apollo, then scoring. Usually 5-15 seconds.</span>';
+        resultsEl.innerHTML = '';
+        criteriaPanel.classList.add('hidden');
+        fetch('/prospecting/lookalikes/find', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({}),
+        })
+          .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+          .then(function (resp) {
+            findBtn.disabled = false;
+            findBtn.textContent = origText;
+            var b = resp.body || {};
+            if (!b.ok) {
+              statusEl.innerHTML = '<div class="rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">' + escapeHtml(b.error || 'Search failed') + '</div>';
+              return;
+            }
+            statusEl.innerHTML = '<span class="text-emerald-700">Found ' + (b.candidates || []).length + ' candidate account' + ((b.candidates || []).length === 1 ? '' : 's') + '.</span>' +
+              (b.warning ? ' <span class="text-amber-700 block mt-1">Note: ' + escapeHtml(b.warning) + '</span>' : '');
+            renderCriteria(b.criteria);
+            renderCandidates(b.candidates || []);
+          })
+          .catch(function (err) {
+            findBtn.disabled = false;
+            findBtn.textContent = origText;
+            statusEl.innerHTML = '<div class="rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">Network error: ' + escapeHtml(err && err.message ? err.message : 'unknown') + '</div>';
+          });
+      });
+    })();
+  </script>
+</body>
+</html>

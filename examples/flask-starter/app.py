@@ -4803,6 +4803,153 @@ def shortlist_template_settings():
     return jsonify({"ok": True, "subject": subject, "body": body})
 
 
+# =====================================================================
+# ICP definition + account-level lookalike prospecting
+# =====================================================================
+# The user describes their Ideal Customer Profile in plain English +
+# pastes a list of existing customers. An LLM extracts structured
+# Apollo search criteria, queries Apollo for similar companies, and an
+# LLM-scoring step ranks each result for ICP fit with a short rationale.
+#
+# Storage: app_state['icp_definition'] = json({description, examples}).
+# Pipeline lives in prospecting_lookalikes.py.
+
+from prospecting_lookalikes import (
+    find_lookalikes as _icp_find_lookalikes,
+    _normalize_customer_examples as _icp_normalize_examples,
+)
+
+
+def db_get_icp_definition() -> dict:
+    """Return the saved ICP description + customer examples. Always
+    returns a dict with `description` (str) and `examples` (list[str])
+    keys; missing/unset values default to empty."""
+    raw = db_app_state_get("icp_definition")
+    if not raw:
+        return {"description": "", "examples": []}
+    try:
+        data = json.loads(raw)
+        return {
+            "description": (data.get("description") or "").strip(),
+            "examples": [
+                str(e).strip() for e in (data.get("examples") or []) if str(e).strip()
+            ],
+        }
+    except (ValueError, TypeError):
+        return {"description": "", "examples": []}
+
+
+def db_set_icp_definition(description: str, examples: list[str]) -> None:
+    db_app_state_set(
+        "icp_definition",
+        json.dumps({"description": description, "examples": examples}),
+    )
+
+
+@app.route("/settings/icp", methods=["GET"])
+def settings_icp_view():
+    icp = db_get_icp_definition()
+    return render_template(
+        "settings_icp.html",
+        active="settings_icp",
+        api_key_set=bool(API_KEY),
+        icp=icp,
+    )
+
+
+@app.route("/settings/icp", methods=["POST"])
+def settings_icp_save():
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+    body = request.get_json(silent=True) or {}
+    description = (body.get("description") or "").strip()
+    raw_examples = body.get("examples") or ""
+    if isinstance(raw_examples, list):
+        raw_examples = "\n".join(str(e) for e in raw_examples)
+    examples = _icp_normalize_examples(str(raw_examples))
+    if not description:
+        return jsonify({"ok": False, "error": "ICP description required"}), 400
+    if len(description) > 5000:
+        return jsonify({"ok": False, "error": "ICP description too long (max 5000 chars)"}), 400
+    db_set_icp_definition(description, examples)
+    return jsonify({"ok": True, "description": description, "examples": examples})
+
+
+@app.route("/prospecting/lookalikes", methods=["GET"])
+def prospecting_lookalikes_view():
+    icp = db_get_icp_definition()
+    keys = _load_resolver_keys()
+    return render_template(
+        "prospecting_lookalikes.html",
+        active="prospecting_lookalikes",
+        api_key_set=bool(API_KEY),
+        icp=icp,
+        apollo_present=bool(keys.get("apollo_api_key")),
+        openai_present=bool(keys.get("openai_api_key")),
+    )
+
+
+@app.route("/prospecting/lookalikes/find", methods=["POST"])
+def prospecting_lookalikes_find():
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+    body = request.get_json(silent=True) or {}
+    saved = db_get_icp_definition()
+
+    description = (body.get("description") or saved["description"] or "").strip()
+    raw_examples = body.get("examples")
+    if raw_examples is None:
+        examples = saved["examples"]
+    elif isinstance(raw_examples, list):
+        examples = _icp_normalize_examples("\n".join(str(e) for e in raw_examples))
+    else:
+        examples = _icp_normalize_examples(str(raw_examples))
+
+    if not description:
+        return jsonify({
+            "ok": False,
+            "error": "ICP description is required. Save one on /settings/icp first.",
+        }), 400
+
+    keys = _load_resolver_keys()
+    apollo_key = (keys.get("apollo_api_key") or "").strip()
+    openai_key = (keys.get("openai_api_key") or "").strip()
+    if not apollo_key:
+        return jsonify({
+            "ok": False,
+            "error": "Apollo API key required. Add one on /settings/api-keys.",
+        }), 400
+    if not openai_key:
+        return jsonify({
+            "ok": False,
+            "error": "OpenAI API key required. Add one on /settings/api-keys.",
+        }), 400
+
+    try:
+        per_page = int(body.get("per_page") or 25)
+    except (TypeError, ValueError):
+        per_page = 25
+    per_page = max(5, min(50, per_page))
+
+    result, err = _icp_find_lookalikes(
+        description,
+        examples,
+        apollo_key=apollo_key,
+        openai_key=openai_key,
+        per_page=per_page,
+    )
+    if err and not result.get("candidates"):
+        return jsonify({"ok": False, "error": err}), 502
+    return jsonify({
+        "ok": True,
+        "criteria": result.get("criteria") or {},
+        "candidates": result.get("candidates") or [],
+        "warning": result.get("warning") or "",
+    })
+
+
 @app.route("/triage/mint", methods=["POST"])
 def triage_mint_for_connector():
     """Mint a triage page for a specific connector + the targets they can
