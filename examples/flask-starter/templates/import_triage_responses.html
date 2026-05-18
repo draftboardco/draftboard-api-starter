@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Draftboard — Import shortlist responses</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    {% include "_nav.html" %}
+
+    <header class="mb-6 flex items-start justify-between gap-4">
+      <div>
+        <h1 class="text-2xl font-semibold tracking-tight">Import shortlist responses</h1>
+        <p class="text-sm text-slate-500 mt-1">
+          Drop in the JSON file you downloaded from a connector's shortlist page on draftboard.com.
+          Each "yes" becomes an intro request in your pipeline; each "no" zeros out that
+          (connector → target) path so it stops cluttering your views.
+        </p>
+      </div>
+      <button type="button" id="edit-template-btn"
+              class="flex-shrink-0 inline-flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">
+        ✏️ Edit email template
+      </button>
+    </header>
+
+    {% if result and result.error %}
+      <div class="mb-6 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">
+        {{ result.error }}
+      </div>
+    {% elif result %}
+      <div class="mb-6 rounded-md border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
+        <strong>Imported from {{ result.connector_name }}{% if result.list_label %} ({{ result.list_label }}){% endif %}:</strong>
+        {{ result.yes_added }} target{{ '' if result.yes_added == 1 else 's' }} marked as <strong>intro requested</strong>,
+        {{ result.no_added }} {{ 'path' if result.no_added == 1 else 'paths' }} <strong>zeroed out</strong>{% if result.unanswered_skipped %},
+        {{ result.unanswered_skipped }} <strong>left unanswered</strong> (eligible to be re-asked on the next mint to this connector){% endif %}.
+        {% if result.skipped_no_connection_id %}
+          <span class="block mt-1 text-emerald-800/80">
+            ({{ result.skipped_no_connection_id }} yes-response{{ '' if result.skipped_no_connection_id == 1 else 's' }} skipped — couldn&rsquo;t find the local connection_id;
+            run a Draftboard sync and try again.)
+          </span>
+        {% endif %}
+      </div>
+    {% endif %}
+
+    {# After a successful import: surface the natural-next-step CTA for
+       each yes-target — an editable subject + body + connector_email,
+       with the "Open in Gmail" link regenerated client-side as the user
+       types. Each row is independent; editing one prompt doesn't touch
+       the others. To save changes globally for next time, the user uses
+       the "Edit email template" modal at the top of the page. #}
+    {% if compose_drafts %}
+      <section class="mb-6 rounded-lg bg-white border border-indigo-200 p-5 shadow-sm">
+        <header class="mb-3">
+          <h2 class="text-sm font-semibold text-slate-900">
+            📧 Follow up with {{ result.connector_first or result.connector_name }} on
+            {{ compose_drafts|length }} {{ 'intro' if compose_drafts|length == 1 else 'intros' }}
+          </h2>
+          <p class="mt-1 text-xs text-slate-500">
+            One editable email per yes-target. Add {{ result.connector_first or 'the connector' }}&rsquo;s email,
+            tweak the subject or body if you want, then click <em>Open in Gmail</em>.
+            Edits here only affect this row. Use <em>✏️ Edit email template</em> above to change the default for future imports.
+          </p>
+        </header>
+        <ul class="divide-y divide-slate-100" id="compose-list">
+          {% for d in compose_drafts %}
+            <li class="py-4" data-target-id="{{ d.target_id }}">
+              <div class="flex items-start gap-3 mb-2">
+                <div class="flex-shrink-0 w-8 h-8 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center text-[10px] font-semibold">
+                  ✓
+                </div>
+                <div class="flex-1 min-w-0">
+                  <div class="text-sm font-semibold text-slate-900 truncate">{{ d.target_name }}</div>
+                  {% if d.target_linkedin_url %}
+                    <a href="{{ d.target_linkedin_url }}" target="_blank" rel="noopener"
+                       class="text-[11px] text-indigo-600 hover:underline">↗ LinkedIn</a>
+                  {% endif %}
+                  {% if d.connector_note %}
+                    <div class="mt-1 px-2 py-1 bg-slate-50 border border-slate-200 rounded text-xs text-slate-700">
+                      <span class="font-semibold">{{ result.connector_first or 'Connector' }}&rsquo;s note:</span> {{ d.connector_note }}
+                    </div>
+                  {% endif %}
+                </div>
+                <a class="compose-open flex-shrink-0 inline-flex items-center gap-1 text-xs px-3 py-1.5 rounded-md bg-indigo-600 text-white font-medium hover:bg-indigo-700"
+                   href="{{ d.gmail_url }}" target="_blank" rel="noopener">
+                  📧 Open in Gmail
+                </a>
+              </div>
+
+              <div class="grid gap-2 ml-11">
+                <label class="block">
+                  <span class="text-[10px] uppercase tracking-wider text-slate-500">To</span>
+                  <input type="email" class="compose-to mt-0.5 w-full text-sm rounded-md border border-slate-300 px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500"
+                         placeholder="{{ result.connector_first or 'connector' }}@example.com" />
+                </label>
+                <label class="block">
+                  <span class="text-[10px] uppercase tracking-wider text-slate-500">Subject</span>
+                  <input type="text" class="compose-subject mt-0.5 w-full text-sm rounded-md border border-slate-300 px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500"
+                         value="{{ d.subject }}" />
+                </label>
+                <label class="block">
+                  <span class="text-[10px] uppercase tracking-wider text-slate-500">Body</span>
+                  <textarea rows="6"
+                            class="compose-body mt-0.5 w-full text-sm rounded-md border border-slate-300 px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500 font-sans">{{ d.body }}</textarea>
+                </label>
+              </div>
+            </li>
+          {% endfor %}
+        </ul>
+      </section>
+    {% endif %}
+
+    <section class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm">
+      <form method="POST" action="/import/triage-responses" enctype="multipart/form-data" class="space-y-4">
+        <label class="block">
+          <span class="text-xs uppercase tracking-wider text-slate-500">Shortlist response file</span>
+          <input type="file" name="triage_json" accept="application/json,.json" required
+                 class="mt-1 w-full text-sm file:mr-3 file:px-3 file:py-1.5 file:rounded-md file:border-0 file:bg-indigo-600 file:text-white file:cursor-pointer hover:file:bg-indigo-700" />
+          <p class="mt-1 text-xs text-slate-500">
+            Filenames look like <code>shortlist-responses-tim-2026-05-18.json</code> (older
+            files named <code>triage-responses-…</code> still import fine) — you got it from the
+            <em>⬇ Download responses (JSON)</em> button on the shortlist view page.
+          </p>
+        </label>
+
+        <button type="submit"
+                class="inline-flex items-center justify-center rounded-md bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow hover:bg-indigo-700">
+          Import responses
+        </button>
+      </form>
+
+      <div class="mt-6 pt-4 border-t border-slate-100 text-xs text-slate-500 space-y-1">
+        <p><strong>What happens on import:</strong></p>
+        <ul class="list-disc pl-5 space-y-1">
+          <li><strong>Yes responses</strong> — the (connector → target) path gets marked as <em>intro requested</em> in the same flow as the Mark-as-requested button on connector cards.</li>
+          <li><strong>No responses</strong> — the path stays in the database (we still know the connector knows them) but its score is forced to 0 wherever it renders. Effectively de-prioritizes the path without losing data.</li>
+          <li>Re-importing the same file is safe. Both writes are idempotent.</li>
+        </ul>
+      </div>
+    </section>
+
+    {% if recent_overrides %}
+      <section class="mt-8 bg-white border border-slate-200 rounded-lg p-5 shadow-sm">
+        <h2 class="text-sm font-semibold text-slate-900">
+          Recent shortlist-driven path overrides
+          <span class="ml-1 text-slate-400 font-normal">({{ recent_overrides|length }})</span>
+        </h2>
+        <ul class="mt-3 divide-y divide-slate-100">
+          {% for o in recent_overrides %}
+            <li class="py-2 text-xs">
+              <div class="flex items-center justify-between gap-3">
+                <code class="text-slate-700 truncate">{{ o.connector_key }}</code>
+                <span class="text-slate-400 flex-shrink-0">→</span>
+                <code class="text-slate-700 truncate flex-1">{{ o.target_id }}</code>
+                <span class="text-slate-400 flex-shrink-0">{{ o.override_type }}</span>
+              </div>
+              {% if o.note %}
+                <div class="mt-1 px-2 py-1 bg-slate-50 border border-slate-200 rounded text-slate-700">
+                  <span class="font-semibold">Note:</span> {{ o.note }}
+                </div>
+              {% endif %}
+            </li>
+          {% endfor %}
+        </ul>
+      </section>
+    {% endif %}
+
+    <footer class="mt-10 text-xs text-slate-400 text-center">
+      Draftboard API starter · Import shortlist responses
+    </footer>
+  </div>
+
+  {# Template editor modal — hidden until "✏️ Edit email template" is
+     clicked. Saves to /settings/shortlist-template. The saved template
+     is used as the starting point for every yes-row on the next
+     import. Per-row edits don't write back here. #}
+  <div id="template-modal" class="hidden fixed inset-0 bg-slate-900/60 z-50 flex items-center justify-center px-4">
+    <div class="bg-white rounded-lg shadow-xl max-w-xl w-full max-h-[90vh] overflow-y-auto">
+      <header class="px-5 py-4 border-b border-slate-200 flex items-start justify-between gap-3">
+        <div>
+          <h2 class="text-base font-semibold text-slate-900">Default shortlist email template</h2>
+          <p class="mt-0.5 text-xs text-slate-500">
+            Used for every yes-target on import. Placeholders get filled in per-row:
+            <code>{connector_first}</code>, <code>{target_name}</code>, <code>{customer_name}</code>.
+          </p>
+        </div>
+        <button type="button" id="template-modal-close" class="text-slate-400 hover:text-slate-600 text-xl leading-none">×</button>
+      </header>
+      <div class="px-5 py-4 space-y-3">
+        <label class="block">
+          <span class="text-[10px] uppercase tracking-wider text-slate-500">Subject</span>
+          <input id="tpl-subject" type="text"
+                 class="mt-0.5 w-full text-sm rounded-md border border-slate-300 px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500"
+                 value="{{ shortlist_template.subject }}" />
+        </label>
+        <label class="block">
+          <span class="text-[10px] uppercase tracking-wider text-slate-500">Body</span>
+          <textarea id="tpl-body" rows="10"
+                    class="mt-0.5 w-full text-sm rounded-md border border-slate-300 px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500 font-sans">{{ shortlist_template.body }}</textarea>
+        </label>
+        <div id="tpl-status" class="text-xs"></div>
+      </div>
+      <footer class="px-5 py-3 border-t border-slate-200 flex items-center justify-between gap-3">
+        <button type="button" id="tpl-reset"
+                class="text-xs text-slate-500 hover:text-slate-800">
+          Reset to default
+        </button>
+        <div class="flex items-center gap-2">
+          <button type="button" id="tpl-cancel"
+                  class="text-xs px-3 py-1.5 rounded-md border border-slate-300 bg-white text-slate-700 hover:bg-slate-50">
+            Cancel
+          </button>
+          <button type="button" id="tpl-save"
+                  class="text-xs px-3 py-1.5 rounded-md bg-indigo-600 text-white font-medium hover:bg-indigo-700">
+            Save template
+          </button>
+        </div>
+      </footer>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      // ----- Per-row live Gmail URL update -----
+      function gmailUrl(to, subject, body) {
+        const parts = [
+          'https://mail.google.com/mail/?view=cm&fs=1',
+          '&su=' + encodeURIComponent(subject || ''),
+          '&body=' + encodeURIComponent(body || ''),
+        ];
+        if (to) parts.push('&to=' + encodeURIComponent(to));
+        return parts.join('');
+      }
+
+      document.querySelectorAll('#compose-list > li').forEach(function (li) {
+        const toEl = li.querySelector('.compose-to');
+        const subjEl = li.querySelector('.compose-subject');
+        const bodyEl = li.querySelector('.compose-body');
+        const link = li.querySelector('.compose-open');
+        if (!toEl || !subjEl || !bodyEl || !link) return;
+        function refresh() {
+          link.href = gmailUrl(toEl.value.trim(), subjEl.value, bodyEl.value);
+        }
+        toEl.addEventListener('input', refresh);
+        subjEl.addEventListener('input', refresh);
+        bodyEl.addEventListener('input', refresh);
+      });
+
+      // ----- Template editor modal -----
+      const modal = document.getElementById('template-modal');
+      const openBtn = document.getElementById('edit-template-btn');
+      const closeBtn = document.getElementById('template-modal-close');
+      const cancelBtn = document.getElementById('tpl-cancel');
+      const saveBtn = document.getElementById('tpl-save');
+      const resetBtn = document.getElementById('tpl-reset');
+      const subjInput = document.getElementById('tpl-subject');
+      const bodyInput = document.getElementById('tpl-body');
+      const statusEl = document.getElementById('tpl-status');
+      const defaultSubject = {{ shortlist_template_defaults.subject | tojson }};
+      const defaultBody = {{ shortlist_template_defaults.body | tojson }};
+
+      function show() { modal.classList.remove('hidden'); statusEl.textContent = ''; }
+      function hide() { modal.classList.add('hidden'); }
+
+      openBtn.addEventListener('click', show);
+      closeBtn.addEventListener('click', hide);
+      cancelBtn.addEventListener('click', hide);
+      modal.addEventListener('click', function (e) { if (e.target === modal) hide(); });
+      resetBtn.addEventListener('click', function () {
+        subjInput.value = defaultSubject;
+        bodyInput.value = defaultBody;
+        statusEl.textContent = 'Reset to default (not saved yet — click Save template).';
+        statusEl.className = 'text-xs text-slate-500';
+      });
+
+      saveBtn.addEventListener('click', function () {
+        const subject = subjInput.value.trim();
+        const body = bodyInput.value;
+        if (!subject) {
+          statusEl.textContent = 'Subject required.';
+          statusEl.className = 'text-xs text-rose-700';
+          return;
+        }
+        if (!body.trim()) {
+          statusEl.textContent = 'Body required.';
+          statusEl.className = 'text-xs text-rose-700';
+          return;
+        }
+        saveBtn.disabled = true;
+        saveBtn.textContent = 'Saving…';
+        fetch('/settings/shortlist-template', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ subject: subject, body: body }),
+        }).then(function (r) {
+          return r.json().then(function (d) { return { ok: r.ok, data: d }; });
+        }).then(function (res) {
+          saveBtn.disabled = false;
+          saveBtn.textContent = 'Save template';
+          if (!res.ok || !res.data.ok) {
+            statusEl.textContent = 'Save failed: ' + (res.data.error || 'unknown error');
+            statusEl.className = 'text-xs text-rose-700';
+            return;
+          }
+          statusEl.textContent = 'Saved. Next import will use this template.';
+          statusEl.className = 'text-xs text-emerald-700';
+          setTimeout(hide, 900);
+        }).catch(function (e) {
+          saveBtn.disabled = false;
+          saveBtn.textContent = 'Save template';
+          statusEl.textContent = 'Save failed: ' + String(e);
+          statusEl.className = 'text-xs text-rose-700';
+        });
+      });
+    })();
+  </script>
+</body>
+</html>
