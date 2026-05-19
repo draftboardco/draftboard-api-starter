@@ -58,6 +58,10 @@
     <a href="/import/triage-responses" class="block px-4 py-1.5 transition {% if active == 'import_triage_responses' %}bg-indigo-50 text-indigo-900 font-medium border-l-4 border-indigo-600 pl-3{% else %}text-slate-600 hover:bg-slate-100 border-l-4 border-transparent{% endif %}">Import shortlist responses</a>
     <a href="/import/sales-nav" class="block px-4 py-1.5 transition {% if active == 'import_sales_nav' %}bg-indigo-50 text-indigo-900 font-medium border-l-4 border-indigo-600 pl-3{% else %}text-slate-600 hover:bg-slate-100 border-l-4 border-transparent{% endif %}">Import from Sales Nav</a>
 
+    {# --- PROSPECTING --- #}
+    <div class="px-3 mt-4 mb-1 text-[10px] uppercase tracking-wider text-slate-400 font-semibold">Prospecting</div>
+    <a href="/prospecting/lookalikes" class="block px-4 py-1.5 transition {% if active == 'prospecting_lookalikes' %}bg-indigo-50 text-indigo-900 font-medium border-l-4 border-indigo-600 pl-3{% else %}text-slate-600 hover:bg-slate-100 border-l-4 border-transparent{% endif %}">Lookalike accounts</a>
+
     {# --- SETTINGS --- #}
     <div class="px-3 mt-4 mb-1 text-[10px] uppercase tracking-wider text-slate-400 font-semibold">Settings</div>
     <a href="/settings/profile" class="block px-4 py-1.5 transition {% if active == 'settings_profile' %}bg-indigo-50 text-indigo-900 font-medium border-l-4 border-indigo-600 pl-3{% else %}text-slate-600 hover:bg-slate-100 border-l-4 border-transparent{% endif %}">Your profile</a>
@@ -66,6 +70,7 @@
     <a href="/settings/slack" class="block px-4 py-1.5 transition {% if active == 'settings_slack' %}bg-indigo-50 text-indigo-900 font-medium border-l-4 border-indigo-600 pl-3{% else %}text-slate-600 hover:bg-slate-100 border-l-4 border-transparent{% endif %}">Slack</a>
     <a href="/settings/google" class="block px-4 py-1.5 transition {% if active == 'settings_google' %}bg-indigo-50 text-indigo-900 font-medium border-l-4 border-indigo-600 pl-3{% else %}text-slate-600 hover:bg-slate-100 border-l-4 border-transparent{% endif %}">Google Workspace</a>
     <a href="/settings/api-keys" class="block px-4 py-1.5 transition {% if active in ('settings_api_keys', 'settings_linkedin_resolver') %}bg-indigo-50 text-indigo-900 font-medium border-l-4 border-indigo-600 pl-3{% else %}text-slate-600 hover:bg-slate-100 border-l-4 border-transparent{% endif %}">API keys</a>
+    <a href="/settings/icp" class="block px-4 py-1.5 transition {% if active == 'settings_icp' %}bg-indigo-50 text-indigo-900 font-medium border-l-4 border-indigo-600 pl-3{% else %}text-slate-600 hover:bg-slate-100 border-l-4 border-transparent{% endif %}">Ideal Customer Profile</a>
     <a href="/settings/team" class="block px-4 py-1.5 transition {% if active == 'settings' %}bg-indigo-50 text-indigo-900 font-medium border-l-4 border-indigo-600 pl-3{% else %}text-slate-600 hover:bg-slate-100 border-l-4 border-transparent{% endif %}">Team</a>
   </nav>
 
