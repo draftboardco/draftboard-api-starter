@@ -4824,15 +4824,24 @@ def shortlist_template_settings():
 # and let the user crank it up via the form.
 
 SCRUPP_API_BASE = os.environ.get("SCRUPP_API_BASE", "https://api.scrupp.com")
+SCRUPP_SEARCH_PATH = "/api/v1/sn/search"
 SCRUPP_SEARCH_DEFAULT_MAX = 25
 SCRUPP_SEARCH_HARD_MAX = 100
 
 
 def _scrupp_call_search(api_key: str, sales_nav_url: str, max_results: int) -> tuple[list[dict], str | None]:
-    """POST to Scrupp's /sn/search. Returns (leads, error_message).
-    Each lead is a dict with whichever of name/title/company/linkedin we
-    could extract — different Scrupp endpoint versions emit slightly
-    different field names so we normalize here.
+    """POST to Scrupp's /api/v1/sn/search. Returns (leads, error_message).
+
+    Per Scrupp's docs (https://scrupp.com/docs/api/sales-navigator):
+      - Auth is `?api_key=...` as a query parameter, NOT a Bearer header.
+      - Synchronous: returns data immediately, no polling.
+      - Response shape: {total: int, items: [{first_name, last_name,
+        linkedin, position, location, company, company_linkedin,
+        company_domain, email}]}
+
+    We still normalize multiple possible field names per item because
+    the docs may drift and the sales-repo stub anticipated older field
+    names. Defense in depth.
     """
     if not api_key:
         return [], "No Scrupp API key configured. Add one on /settings/api-keys."
@@ -4840,14 +4849,16 @@ def _scrupp_call_search(api_key: str, sales_nav_url: str, max_results: int) -> t
         return [], "Paste a Sales Navigator search URL first."
     # Clamp to Scrupp's published hard cap so we don't 400.
     max_results = max(1, min(SCRUPP_SEARCH_HARD_MAX, int(max_results or SCRUPP_SEARCH_DEFAULT_MAX)))
+    from urllib.parse import quote as _q
     try:
         r = requests.post(
-            f"{SCRUPP_API_BASE}/sn/search",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
+            f"{SCRUPP_API_BASE}{SCRUPP_SEARCH_PATH}?api_key={_q(api_key)}",
+            headers={"Content-Type": "application/json"},
+            json={
+                "url": sales_nav_url.strip(),
+                "max": max_results,
+                "page": 1,
             },
-            json={"url": sales_nav_url.strip(), "max": max_results},
             timeout=180,
         )
     except requests.Timeout:
@@ -4867,14 +4878,22 @@ def _scrupp_call_search(api_key: str, sales_nav_url: str, max_results: int) -> t
     except ValueError:
         return [], "Scrupp returned non-JSON. Their API may be down."
 
-    # Different Scrupp builds wrap results under "results", "leads", or
-    # the bare list. Handle all three. Surface explicit error envelopes
-    # so a 200-with-error doesn't render as a silent 0-leads result.
+    # Per docs: top-level shape is {total, items: [...]}. Older builds
+    # may have used {results}/{leads}/{data} so we fall back to those.
+    # Surface explicit error envelopes so a 200-with-error doesn't
+    # render as a silent 0-leads result.
     if isinstance(body, dict):
         explicit_error = body.get("error") or body.get("message")
-        if explicit_error and not (body.get("results") or body.get("leads") or body.get("data")):
+        if explicit_error and not (body.get("items") or body.get("results")
+                                   or body.get("leads") or body.get("data")):
             return [], f"Scrupp: {explicit_error}"
-        raw_items = body.get("results") or body.get("leads") or body.get("data") or []
+        raw_items = (
+            body.get("items")
+            or body.get("results")
+            or body.get("leads")
+            or body.get("data")
+            or []
+        )
     elif isinstance(body, list):
         raw_items = body
     else:
@@ -4884,8 +4903,11 @@ def _scrupp_call_search(api_key: str, sales_nav_url: str, max_results: int) -> t
     for item in raw_items:
         if not isinstance(item, dict):
             continue
+        # Scrupp's documented field is just `linkedin` (the profile URL).
+        # We accept several legacy variants in case the docs drift.
         linkedin = (
-            item.get("linkedin_url")
+            item.get("linkedin")
+            or item.get("linkedin_url")
             or item.get("linkedinUrl")
             or item.get("profile_url")
             or item.get("profileUrl")
@@ -4904,7 +4926,9 @@ def _scrupp_call_search(api_key: str, sales_nav_url: str, max_results: int) -> t
             first = (item.get("first_name") or item.get("firstName") or "").strip()
             last = (item.get("last_name") or item.get("lastName") or "").strip()
             name = (first + " " + last).strip()
-        title = (item.get("title") or item.get("position") or item.get("headline") or "").strip()
+        # Scrupp's documented field is `position`; legacy variants kept
+        # as fallback in case the docs drift.
+        title = (item.get("position") or item.get("title") or item.get("headline") or "").strip()
         company = (
             item.get("company")
             or item.get("company_name")
