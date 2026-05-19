@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Draftboard — Import from Sales Navigator</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    {% include "_nav.html" %}
+
+    <header class="mb-6">
+      <h1 class="text-2xl font-semibold tracking-tight">Import from Sales Navigator</h1>
+      <p class="text-sm text-slate-500 mt-1">
+        Paste a Sales Navigator search URL. Scrupp scrapes the results and we import each lead as a Draftboard target so you can see who in your network can intro you.
+      </p>
+    </header>
+
+    {% if not scrupp_configured %}
+      <div class="mb-6 rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+        <strong>Scrupp API key required.</strong> Sign up at
+        <a class="underline" href="https://scrupp.com" target="_blank" rel="noopener">scrupp.com</a>
+        (free tier includes 500 leads/month), grab your API key, then paste it on the
+        <a class="underline" href="/settings/api-keys">API keys page</a>.
+      </div>
+    {% endif %}
+
+    {% if not api_key_set %}
+      <div class="mb-6 rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">
+        <strong>Draftboard API key not set.</strong> Without it, we can pull leads from Scrupp but can't write them back into your Draftboard workspace as targets. Set <code>DRAFTBOARD_API_KEY</code> first.
+      </div>
+    {% endif %}
+
+    <section class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm">
+      <div class="space-y-4">
+        <label class="block">
+          <span class="text-xs uppercase tracking-wider text-slate-500">Sales Navigator search URL</span>
+          <input
+            type="url"
+            id="sn-url"
+            placeholder="https://www.linkedin.com/sales/search/people?keywords=…"
+            class="mt-1 w-full text-sm rounded-md border border-slate-300 px-3 py-2 font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+          />
+          <p class="mt-1 text-xs text-slate-500">
+            Open Sales Navigator → run any search (keywords, titles, companies, lists, saved searches) → copy the URL from your browser's address bar.
+          </p>
+        </label>
+
+        <div class="grid grid-cols-2 gap-3">
+          <label class="block">
+            <span class="text-xs uppercase tracking-wider text-slate-500">Max leads to fetch</span>
+            <input
+              type="number"
+              id="sn-max"
+              value="{{ default_max }}"
+              min="1"
+              max="{{ hard_max }}"
+              class="mt-1 w-full text-sm rounded-md border border-slate-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+            />
+            <p class="mt-1 text-xs text-slate-500">Scrupp's per-search hard cap is {{ hard_max }}. Each lead counts toward your monthly Scrupp quota.</p>
+          </label>
+          <label class="block">
+            <span class="text-xs uppercase tracking-wider text-slate-500">Tags (optional)</span>
+            <input
+              type="text"
+              id="sn-tags"
+              placeholder="e.g. q2-outbound, sales-nav"
+              class="mt-1 w-full text-sm rounded-md border border-slate-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+            />
+            <p class="mt-1 text-xs text-slate-500">Comma-separated. We auto-add <code>scrupp</code> so you can filter on this batch later.</p>
+          </label>
+        </div>
+
+        <button
+          type="button"
+          id="search-btn"
+          class="inline-flex items-center justify-center rounded-md bg-indigo-600 hover:bg-indigo-700 px-4 py-2 text-sm font-medium text-white shadow disabled:opacity-50 disabled:cursor-not-allowed"
+          {% if not scrupp_configured %}disabled{% endif %}
+        >
+          Fetch leads from Scrupp
+        </button>
+        <span id="search-status" class="ml-3 text-xs text-slate-500"></span>
+        <p class="text-xs text-slate-500 mt-2">
+          <strong>Heads up - this is async.</strong> Scrupp scrapes in the background; small searches (~25 leads) typically finish in 10-30 seconds, bigger ones can take up to ~3 minutes. You'll see live status updates after clicking - safe to leave the tab open.
+        </p>
+      </div>
+    </section>
+
+    <section id="preview" class="hidden mt-6 bg-white border border-indigo-200 rounded-lg p-5 shadow-sm">
+      <header class="flex items-center justify-between gap-3 mb-3">
+        <h2 class="text-sm font-semibold text-slate-900">
+          Preview <span id="preview-count" class="text-slate-500 font-normal"></span>
+        </h2>
+        <div class="flex items-center gap-2">
+          <button type="button" id="select-all" class="text-xs text-indigo-700 hover:underline">Select all</button>
+          <button type="button" id="select-none" class="text-xs text-slate-500 hover:underline">Clear</button>
+        </div>
+      </header>
+      <ul id="lead-list" class="divide-y divide-slate-100 max-h-96 overflow-y-auto border border-slate-100 rounded"></ul>
+      <div class="mt-4 flex items-center justify-between gap-3">
+        <p class="text-xs text-slate-500">
+          <span id="picked-count">0</span> selected. Each becomes a Draftboard target tagged with <code>scrupp</code>.
+        </p>
+        <button
+          type="button"
+          id="import-btn"
+          class="inline-flex items-center justify-center rounded-md bg-emerald-600 hover:bg-emerald-700 px-4 py-2 text-sm font-medium text-white shadow disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          Import selected as targets
+        </button>
+      </div>
+    </section>
+
+    <section id="result" class="hidden mt-6"></section>
+
+    <section class="mt-8 bg-white border border-slate-200 rounded-lg p-5 shadow-sm">
+      <h2 class="text-sm font-semibold text-slate-900 mb-2">How this works</h2>
+      <ul class="list-disc pl-5 text-xs text-slate-500 space-y-1">
+        <li>We never store the Scrupp output server-side — fetched leads live only in this tab until you click Import.</li>
+        <li>Imported leads land in Draftboard via the same <code>/targets/import</code> endpoint as the manual paste-URLs flow. Path data shows up after Draftboard finishes resolving each LinkedIn URL (usually a minute).</li>
+        <li>Re-running the same search re-imports the same URLs. Draftboard's import is idempotent — duplicate URLs no-op.</li>
+        <li>Free Scrupp tier: 500 leads/month, 100 max per search. Heavier usage needs a paid plan.</li>
+      </ul>
+    </section>
+
+    <footer class="mt-10 text-xs text-slate-400 text-center">
+      Draftboard API starter · Sales Nav import (Scrupp)
+    </footer>
+  </div>
+
+  <script>
+    (function () {
+      var urlEl = document.getElementById('sn-url');
+      var maxEl = document.getElementById('sn-max');
+      var tagsEl = document.getElementById('sn-tags');
+      var searchBtn = document.getElementById('search-btn');
+      var searchStatus = document.getElementById('search-status');
+      var preview = document.getElementById('preview');
+      var previewCount = document.getElementById('preview-count');
+      var leadList = document.getElementById('lead-list');
+      var pickedCount = document.getElementById('picked-count');
+      var importBtn = document.getElementById('import-btn');
+      var resultEl = document.getElementById('result');
+      var selectAllBtn = document.getElementById('select-all');
+      var selectNoneBtn = document.getElementById('select-none');
+
+      // Holds the Scrupp results between Search and Import. Cleared on
+      // every new Search.
+      var lastLeads = [];
+
+      function escapeHtml(s) {
+        return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+          return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
+        });
+      }
+      // Defense-in-depth XSS guard. Server-side _scrupp_call_search
+      // already rejects non-LinkedIn URLs; this stops anything weird
+      // from rendering as a clickable href in the preview anyway.
+      function safeHref(url) {
+        var s = String(url == null ? '' : url).trim();
+        return /^https?:\/\/(www\.)?linkedin\.com\//i.test(s) ? s : '';
+      }
+
+      function refreshPickedCount() {
+        var n = leadList.querySelectorAll('input[type=checkbox]:checked').length;
+        pickedCount.textContent = n;
+        importBtn.disabled = n === 0;
+      }
+
+      function renderLeads(leads) {
+        leadList.innerHTML = '';
+        leads.forEach(function (lead, i) {
+          var li = document.createElement('li');
+          li.className = 'flex items-start gap-3 px-3 py-2 hover:bg-slate-50';
+          li.innerHTML =
+            '<label class="flex items-start gap-3 cursor-pointer flex-1 min-w-0">' +
+              '<input type="checkbox" data-idx="' + i + '" checked class="mt-1 w-4 h-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500" />' +
+              '<div class="flex-1 min-w-0">' +
+                '<div class="text-sm font-medium text-slate-900 truncate">' + escapeHtml(lead.name) + '</div>' +
+                ((lead.title || lead.company)
+                  ? '<div class="text-xs text-slate-600 truncate">' +
+                      escapeHtml(lead.title) +
+                      (lead.title && lead.company ? ' · ' : '') +
+                      escapeHtml(lead.company) +
+                    '</div>'
+                  : '') +
+                ((safeHref(lead.linkedin_url))
+                  ? '<a href="' + escapeHtml(safeHref(lead.linkedin_url)) + '" target="_blank" rel="noopener" class="text-[11px] text-indigo-600 hover:underline">↗ LinkedIn</a>'
+                  : '') +
+              '</div>' +
+            '</label>';
+          leadList.appendChild(li);
+        });
+        leadList.querySelectorAll('input[type=checkbox]').forEach(function (cb) {
+          cb.addEventListener('change', refreshPickedCount);
+        });
+        previewCount.textContent = '(' + leads.length + ' total)';
+        preview.classList.remove('hidden');
+        refreshPickedCount();
+      }
+
+      // Async Scrupp workflow:
+      //   1. POST /import/sales-nav/search → returns process_id immediately
+      //   2. Poll /import/sales-nav/status?id=PID every 3s until ready
+      //   3. GET /import/sales-nav/leads?id=PID → parsed leads → render preview
+      //
+      // Why three calls instead of one: Scrupp's API is async (jobs take
+      // 10-180s). A single blocking server-side endpoint would tie up a
+      // Flask worker the whole time and the user would see no progress
+      // indicator. With three calls the user sees live status (queued →
+      // processing → ready) and the elapsed seconds tick up.
+      var POLL_INTERVAL_MS = 3000;   // 3s between status checks
+      var POLL_MAX_ATTEMPTS = 60;    // 60 * 3s = 3min max wait
+      var pollTimer = null;
+      var pollStartedAt = null;
+      var currentProcessId = null;
+
+      function resetSearchButton() {
+        searchBtn.disabled = false;
+        searchBtn.textContent = 'Fetch leads from Scrupp';
+        if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+      }
+      function setStatus(msg, cls) {
+        searchStatus.textContent = msg;
+        searchStatus.className = 'ml-3 text-xs ' + (cls || 'text-slate-500');
+      }
+      function elapsedSec() {
+        return pollStartedAt ? Math.round((Date.now() - pollStartedAt) / 1000) : 0;
+      }
+      function statusLabel(status) {
+        if (status === 'queued') return 'Queued at Scrupp';
+        if (status === 'processing' || status === 'running' || status === 'pending') return 'Scrupp is scraping';
+        if (status === 'ready' || status === 'completed' || status === 'finished' || status === 'done') return 'Done';
+        return status || 'Working';
+      }
+
+      function pollStatus(attempt) {
+        attempt = attempt || 0;
+        if (attempt >= POLL_MAX_ATTEMPTS) {
+          resetSearchButton();
+          setStatus(
+            'Scrupp job didn\'t finish in 3 minutes. It may still be running - check your Scrupp dashboard.',
+            'text-rose-700'
+          );
+          return;
+        }
+        fetch('/import/sales-nav/status?id=' + encodeURIComponent(currentProcessId), {
+          credentials: 'same-origin',
+        })
+          .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+          .then(function (resp) {
+            var b = resp.body || {};
+            if (!b.ok) {
+              resetSearchButton();
+              setStatus('Status check failed: ' + (b.error || 'unknown'), 'text-rose-700');
+              return;
+            }
+            if (b.failed) {
+              resetSearchButton();
+              setStatus('Scrupp job failed: ' + (b.status || 'unknown'), 'text-rose-700');
+              return;
+            }
+            var label = statusLabel(b.status);
+            var recordsPart = b.records ? (' · ' + b.records + ' records found') : '';
+            setStatus(label + ' · ' + elapsedSec() + 's elapsed' + recordsPart, 'text-slate-600');
+            if (b.ready) {
+              fetchLeads();
+              return;
+            }
+            pollTimer = setTimeout(function () { pollStatus(attempt + 1); }, POLL_INTERVAL_MS);
+          })
+          .catch(function (err) {
+            // Transient network error during polling - retry on next tick.
+            pollTimer = setTimeout(function () { pollStatus(attempt + 1); }, POLL_INTERVAL_MS);
+          });
+      }
+
+      function fetchLeads() {
+        setStatus('Fetching results... ' + elapsedSec() + 's total', 'text-slate-600');
+        fetch('/import/sales-nav/leads?id=' + encodeURIComponent(currentProcessId), {
+          credentials: 'same-origin',
+        })
+          .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+          .then(function (resp) {
+            resetSearchButton();
+            var b = resp.body || {};
+            if (!b.ok) {
+              setStatus(b.error || 'Fetch failed', 'text-rose-700');
+              return;
+            }
+            lastLeads = b.leads || [];
+            if (lastLeads.length === 0) {
+              setStatus(
+                'Scrupp completed but returned 0 leads after ' + elapsedSec() + 's. ' +
+                'Double-check the URL or widen the search.',
+                'text-amber-700'
+              );
+              return;
+            }
+            setStatus(
+              'Done in ' + elapsedSec() + 's - ' + lastLeads.length + ' lead' +
+              (lastLeads.length === 1 ? '' : 's') + ' ready to review.',
+              'text-emerald-700'
+            );
+            renderLeads(lastLeads);
+          })
+          .catch(function (err) {
+            resetSearchButton();
+            setStatus('Network error fetching results: ' + (err && err.message ? err.message : 'unknown'), 'text-rose-700');
+          });
+      }
+
+      searchBtn.addEventListener('click', function () {
+        var url = (urlEl.value || '').trim();
+        if (!url) {
+          setStatus('Paste a Sales Navigator URL first.', 'text-rose-700');
+          return;
+        }
+        var max = parseInt(maxEl.value, 10) || {{ default_max }};
+        searchBtn.disabled = true;
+        searchBtn.textContent = 'Submitting...';
+        preview.classList.add('hidden');
+        resultEl.classList.add('hidden');
+        lastLeads = [];
+        pollStartedAt = Date.now();
+        currentProcessId = null;
+        setStatus('Submitting job to Scrupp...', 'text-slate-500');
+        fetch('/import/sales-nav/search', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ url: url, max: max }),
+        })
+          .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+          .then(function (resp) {
+            var b = resp.body || {};
+            if (!b.ok) {
+              resetSearchButton();
+              setStatus(b.error || 'Submit failed', 'text-rose-700');
+              return;
+            }
+            currentProcessId = b.process_id;
+            searchBtn.textContent = 'Waiting for Scrupp...';
+            setStatus(
+              'Submitted (job #' + currentProcessId + '). Scrupp is starting the scrape...',
+              'text-slate-600'
+            );
+            pollStatus(0);
+          })
+          .catch(function (err) {
+            resetSearchButton();
+            setStatus('Network error: ' + (err && err.message ? err.message : 'unknown'), 'text-rose-700');
+          });
+      });
+
+      selectAllBtn.addEventListener('click', function () {
+        leadList.querySelectorAll('input[type=checkbox]').forEach(function (cb) { cb.checked = true; });
+        refreshPickedCount();
+      });
+      selectNoneBtn.addEventListener('click', function () {
+        leadList.querySelectorAll('input[type=checkbox]').forEach(function (cb) { cb.checked = false; });
+        refreshPickedCount();
+      });
+
+      importBtn.addEventListener('click', function () {
+        var picked = [];
+        leadList.querySelectorAll('input[type=checkbox]:checked').forEach(function (cb) {
+          var idx = parseInt(cb.getAttribute('data-idx'), 10);
+          if (lastLeads[idx]) picked.push(lastLeads[idx].linkedin_url);
+        });
+        if (picked.length === 0) return;
+        importBtn.disabled = true;
+        importBtn.textContent = 'Importing…';
+        resultEl.classList.add('hidden');
+        fetch('/import/sales-nav/import', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({
+            linkedin_urls: picked,
+            tags: (tagsEl.value || '').trim(),
+          }),
+        })
+          .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+          .then(function (resp) {
+            importBtn.disabled = false;
+            importBtn.textContent = 'Import selected as targets';
+            var b = resp.body || {};
+            if (!b.ok) {
+              resultEl.innerHTML = '<div class="rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">Import failed: ' + escapeHtml(b.error || 'unknown') + '</div>';
+              resultEl.classList.remove('hidden');
+              return;
+            }
+            var imported = b.imported == null ? b.submitted : b.imported;
+            var skipped = (b.submitted || 0) - imported;
+            resultEl.innerHTML =
+              '<div class="rounded-md border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">' +
+                '<strong>Imported ' + imported + ' lead' + (imported === 1 ? '' : 's') + '</strong> as Draftboard targets' +
+                (skipped > 0 ? ' (' + skipped + ' skipped as duplicates or invalid)' : '') + '. ' +
+                'Tags: ' + escapeHtml((b.tags_used || []).join(', ')) + '. ' +
+                '<a href="/targets" class="underline">View on the Targets page →</a>' +
+              '</div>';
+            resultEl.classList.remove('hidden');
+          })
+          .catch(function (err) {
+            importBtn.disabled = false;
+            importBtn.textContent = 'Import selected as targets';
+            resultEl.innerHTML = '<div class="rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">Network error: ' + escapeHtml(err && err.message ? err.message : 'unknown') + '</div>';
+            resultEl.classList.remove('hidden');
+          });
+      });
+    })();
+  </script>
+</body>
+</html>

@@ -55,12 +55,16 @@ TRIAGE_API_URL = os.environ.get(
 RESOLVER_SECRETS_PATH = os.path.expanduser(
     "~/.draftboard-secrets/draftboard-api-starter-resolver.json"
 )
-RESOLVER_KEY_NAMES = ("apollo_api_key", "google_cse_api_key", "google_cse_id", "openai_api_key")
+RESOLVER_KEY_NAMES = (
+    "apollo_api_key", "google_cse_api_key", "google_cse_id", "openai_api_key",
+    "scrupp_api_key",
+)
 RESOLVER_ENV_MAP = {
     "apollo_api_key":     "APOLLO_API_KEY",
     "google_cse_api_key": "GOOGLE_CSE_API_KEY",
     "google_cse_id":      "GOOGLE_CSE_ID",
     "openai_api_key":     "OPENAI_API_KEY",
+    "scrupp_api_key":     "SCRUPP_API_KEY",
 }
 # Cache hits within this window skip re-paying for Apollo/CSE/OpenAI calls.
 RESOLUTION_CACHE_TTL = 30 * 24 * 3600  # 30 days
@@ -4801,6 +4805,353 @@ def shortlist_template_settings():
 
     db_set_shortlist_template(subject, body)
     return jsonify({"ok": True, "subject": subject, "body": body})
+
+
+# =====================================================================
+# Scrupp Sales-Navigator URL import
+# =====================================================================
+# Scrupp (scrupp.io) is a Sales Navigator scraping service. The flow:
+#   1. User saves their Scrupp API key on /settings/api-keys.
+#   2. User pastes a Sales Nav search URL on /import/sales-nav.
+#   3. We POST to https://api.scrupp.com/sn/search; Scrupp returns up to
+#      `max` leads with linkedinUrl/name/title/company.
+#   4. We render a preview with checkboxes (all selected by default).
+#   5. User clicks Import → we POST the chosen URLs to Draftboard's
+#      /targets/import (same path as the manual paste-LinkedIn-URLs flow).
+#
+# Scrupp's published quota was 500 results/month with a cap of 100
+# per search. We default the per-search cap to 25 to be conservative
+# and let the user crank it up via the form.
+
+SCRUPP_API_BASE = os.environ.get("SCRUPP_API_BASE", "https://api.scrupp.com")
+SCRUPP_SEARCH_PATH = "/api/v1/sn/search"
+SCRUPP_SEARCH_DEFAULT_MAX = 25
+SCRUPP_SEARCH_HARD_MAX = 100
+# How long to wait for an async Scrupp scrape before giving up. Small
+# searches (~25 records) typically finish in seconds; large ones can
+# take longer. 3 min is generous + matches the Scrupp's recommendation
+# in their general async docs.
+SCRUPP_POLL_INTERVAL_SEC = 5
+SCRUPP_POLL_MAX_ATTEMPTS = 36  # 36 * 5s = 180s
+
+
+def _scrupp_submit_job(api_key: str, sales_nav_url: str, max_results: int) -> tuple[str, str | None]:
+    """POST a Sales Nav URL to Scrupp's scrape endpoint. Returns
+    (process_id, error). Returns immediately - Scrupp's API is async."""
+    if not api_key:
+        return "", "No Scrupp API key configured. Add one on /settings/api-keys."
+    if not sales_nav_url.strip():
+        return "", "Paste a Sales Navigator search URL first."
+    max_results = max(1, min(SCRUPP_SEARCH_HARD_MAX, int(max_results or SCRUPP_SEARCH_DEFAULT_MAX)))
+    from urllib.parse import quote as _q
+    try:
+        r = requests.post(
+            f"{SCRUPP_API_BASE}{SCRUPP_SEARCH_PATH}?api_key={_q(api_key)}",
+            headers={"Content-Type": "application/json"},
+            json={
+                "url": sales_nav_url.strip(),
+                "max": max_results,
+                "page": 1,
+                # Required by Scrupp's API. False = only fetch profile data,
+                # not emails. Saves credits since the kit only needs URLs.
+                "with_emails": False,
+            },
+            timeout=30,
+        )
+    except requests.Timeout:
+        return "", "Scrupp timed out submitting the job. Retry in a minute."
+    except requests.RequestException as e:
+        return "", f"Network error submitting to Scrupp: {type(e).__name__}"
+    if r.status_code != 200:
+        snippet = (r.text or "")[:300].replace("\n", " ")
+        return "", f"Scrupp returned HTTP {r.status_code}: {snippet}"
+    try:
+        job = r.json()
+    except ValueError:
+        return "", "Scrupp returned non-JSON on job submission."
+    process_id = job.get("process_id") or job.get("processId") or job.get("id")
+    if not process_id:
+        explicit_error = job.get("error") or job.get("message")
+        if explicit_error:
+            return "", f"Scrupp: {explicit_error}"
+        return "", f"Scrupp didn't return a process_id. Body: {str(job)[:200]}"
+    return str(process_id), None
+
+
+def _scrupp_poll_status(api_key: str, process_id: str) -> tuple[dict, str | None]:
+    """One status check. Returns (status_dict, error). status_dict has:
+      status: 'queued' | 'processing' | 'ready' | 'failed' (lowercased)
+      records: int (only meaningful once Scrupp knows the count)
+      raw: the original Scrupp body for debugging
+    """
+    if not api_key or not process_id:
+        return {}, "missing api_key or process_id"
+    from urllib.parse import quote as _q
+    try:
+        s = requests.get(
+            f"{SCRUPP_API_BASE}/api/v1/task/{process_id}/status?api_key={_q(api_key)}",
+            timeout=20,
+        )
+    except requests.RequestException as e:
+        return {}, f"Network error: {type(e).__name__}"
+    if s.status_code != 200:
+        return {}, f"Scrupp status returned HTTP {s.status_code}"
+    try:
+        body = s.json()
+    except ValueError:
+        return {}, "Scrupp returned non-JSON on status check."
+    status = str(body.get("status") or body.get("state") or "").lower()
+    return {
+        "status": status,
+        "records": body.get("records") or 0,
+        "raw": body,
+    }, None
+
+
+def _scrupp_fetch_data(api_key: str, process_id: str) -> tuple[list[dict], str | None]:
+    """GET parsed leads for a finished Scrupp job. Returns (leads, error).
+    Same field normalization as the kit's older sync wrapper."""
+    if not api_key or not process_id:
+        return [], "missing api_key or process_id"
+    from urllib.parse import quote as _q
+    try:
+        d = requests.get(
+            f"{SCRUPP_API_BASE}/api/v1/task/{process_id}/data?api_key={_q(api_key)}",
+            timeout=30,
+        )
+    except requests.RequestException as e:
+        return [], f"Network error fetching Scrupp results: {type(e).__name__}"
+    if d.status_code != 200:
+        snippet = (d.text or "")[:300].replace("\n", " ")
+        return [], f"Scrupp /task/{process_id}/data returned HTTP {d.status_code}: {snippet}"
+    try:
+        body = d.json()
+    except ValueError:
+        return [], "Scrupp returned non-JSON on the data fetch."
+
+    if isinstance(body, dict):
+        explicit_error = body.get("error") or body.get("message")
+        if explicit_error and not (body.get("items") or body.get("results")
+                                   or body.get("leads") or body.get("data")):
+            return [], f"Scrupp: {explicit_error}"
+        raw_items = (
+            body.get("items")
+            or body.get("results")
+            or body.get("leads")
+            or body.get("data")
+            or []
+        )
+    elif isinstance(body, list):
+        raw_items = body
+    else:
+        raw_items = []
+
+    leads: list[dict] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        # Scrupp's `linkedin` field is the profile SLUG (e.g. "zachroseman"),
+        # not a full URL. The legacy variant fields are full URLs. Handle
+        # both: if there's no linkedin.com in the value, treat it as a
+        # slug and build the canonical https URL.
+        linkedin_raw = (
+            item.get("linkedin")
+            or item.get("linkedin_url")
+            or item.get("linkedinUrl")
+            or item.get("profile_url")
+            or item.get("profileUrl")
+            or ""
+        ).strip()
+        if not linkedin_raw:
+            continue
+        if "linkedin.com" in linkedin_raw.lower():
+            linkedin = linkedin_raw
+        else:
+            # Slug-only — Scrupp gives bare strings like "zachroseman".
+            # Strip any leading slash or "in/" prefix defensively, then
+            # build the canonical /in/ URL.
+            slug = linkedin_raw.lstrip("/").removeprefix("in/").strip("/")
+            if not slug:
+                continue
+            linkedin = f"https://www.linkedin.com/in/{slug}"
+        # Defense-in-depth: drop anything that doesn't look like a real
+        # LinkedIn profile URL. Stops a hostile or buggy Scrupp response
+        # from injecting javascript:/data: URLs into the preview's
+        # rendered <a href>.
+        if not _LI_RE.search(linkedin):
+            continue
+        name = (item.get("name") or item.get("full_name") or item.get("fullName") or "").strip()
+        if not name:
+            first = (item.get("first_name") or item.get("firstName") or "").strip()
+            last = (item.get("last_name") or item.get("lastName") or "").strip()
+            name = (first + " " + last).strip()
+        # Scrupp's documented field is `position`; legacy variants kept
+        # as fallback in case the docs drift.
+        title = (item.get("position") or item.get("title") or item.get("headline") or "").strip()
+        company = (
+            item.get("company")
+            or item.get("company_name")
+            or item.get("companyName")
+            or item.get("current_company")
+            or ""
+        ).strip()
+        leads.append({
+            "name": name or "(unnamed)",
+            "title": title,
+            "company": company,
+            "linkedin_url": linkedin,
+        })
+    return leads, None
+
+
+@app.route("/import/sales-nav", methods=["GET"])
+def import_sales_nav_view():
+    """Render the Sales Nav URL → Scrupp → import flow. The page is
+    a single SPA-ish form with JS handling the two POSTs (search +
+    import) inline so the user sees results + checkboxes before
+    committing to Draftboard."""
+    keys = _load_resolver_keys()
+    return render_template(
+        "import_sales_nav.html",
+        active="import_sales_nav",
+        api_key_set=bool(API_KEY),
+        scrupp_configured=bool(keys.get("scrupp_api_key")),
+        default_max=SCRUPP_SEARCH_DEFAULT_MAX,
+        hard_max=SCRUPP_SEARCH_HARD_MAX,
+    )
+
+
+@app.route("/import/sales-nav/search", methods=["POST"])
+def import_sales_nav_search():
+    """Submit a Sales Nav URL to Scrupp and return the job's process_id
+    immediately. The browser polls /import/sales-nav/status next, then
+    fetches /import/sales-nav/leads when the job is ready. Async by
+    design - blocks Flask for ~1s instead of ~30-180s, and the user
+    sees live status updates while Scrupp scrapes."""
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+    body = request.get_json(silent=True) or {}
+    sales_nav_url = (body.get("url") or "").strip()
+    try:
+        max_results = int(body.get("max") or SCRUPP_SEARCH_DEFAULT_MAX)
+    except (TypeError, ValueError):
+        max_results = SCRUPP_SEARCH_DEFAULT_MAX
+    keys = _load_resolver_keys()
+    process_id, err = _scrupp_submit_job(
+        keys.get("scrupp_api_key") or "", sales_nav_url, max_results,
+    )
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    return jsonify({
+        "ok": True,
+        "process_id": process_id,
+        "max_requested": max_results,
+    })
+
+
+@app.route("/import/sales-nav/status", methods=["GET"])
+def import_sales_nav_status():
+    """One status check on a Scrupp job. Browser polls this every few
+    seconds during a search. Returns the job's current status (queued
+    / processing / ready / failed) plus the records count once Scrupp
+    knows it. We don't sleep here - one status call per request - so
+    Flask workers stay free."""
+    process_id = (request.args.get("id") or "").strip()
+    if not process_id:
+        return jsonify({"ok": False, "error": "process_id required"}), 400
+    keys = _load_resolver_keys()
+    sdata, err = _scrupp_poll_status(keys.get("scrupp_api_key") or "", process_id)
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    status = sdata.get("status") or ""
+    is_ready = status in ("ready", "completed", "finished", "done", "success")
+    is_failed = status in ("failed", "error", "cancelled", "canceled")
+    return jsonify({
+        "ok": True,
+        "process_id": process_id,
+        "status": status,
+        "records": sdata.get("records") or 0,
+        "ready": is_ready,
+        "failed": is_failed,
+    })
+
+
+@app.route("/import/sales-nav/leads", methods=["GET"])
+def import_sales_nav_leads():
+    """Fetch the parsed leads for a finished Scrupp job. The browser
+    calls this once status flips to ready."""
+    process_id = (request.args.get("id") or "").strip()
+    if not process_id:
+        return jsonify({"ok": False, "error": "process_id required"}), 400
+    keys = _load_resolver_keys()
+    leads, err = _scrupp_fetch_data(keys.get("scrupp_api_key") or "", process_id)
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    return jsonify({"ok": True, "leads": leads, "count": len(leads)})
+
+
+@app.route("/import/sales-nav/import", methods=["POST"])
+def import_sales_nav_import():
+    """Take the user-selected LinkedIn URLs from the preview step and
+    POST them to Draftboard's /targets/import. Same path the manual
+    paste-URLs flow uses — re-use rather than re-implement."""
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+    if not _current_api_key():
+        return jsonify({
+            "ok": False,
+            "error": "DRAFTBOARD_API_KEY not set. Add it before importing.",
+        }), 400
+    body = request.get_json(silent=True) or {}
+    raw_urls = body.get("linkedin_urls") or []
+    if not isinstance(raw_urls, list):
+        return jsonify({"ok": False, "error": "linkedin_urls must be a list"}), 400
+    # De-dupe + normalize through the same helper the manual flow uses
+    # so we get matching behavior for /in/foo vs https://...
+    cleaned = normalize_linkedin_urls("\n".join(u for u in raw_urls if isinstance(u, str)))
+    if not cleaned:
+        return jsonify({"ok": False, "error": "No valid LinkedIn URLs in selection."}), 400
+
+    tags_raw = body.get("tags") or ""
+    tags = [t.strip() for t in re.split(r"[\n,]+", tags_raw) if t.strip()] if isinstance(tags_raw, str) else []
+    # Auto-tag every Scrupp import so the user can filter on it later.
+    if "scrupp" not in {t.lower() for t in tags}:
+        tags.append("scrupp")
+
+    try:
+        payload = {"linkedinUrls": cleaned}
+        if tags:
+            payload["tags"] = tags
+        r = requests.post(
+            f"{API_BASE}/targets/import",
+            headers=_auth_headers(),
+            json=payload,
+            timeout=60,
+        )
+    except requests.RequestException as e:
+        return jsonify({"ok": False, "error": f"Network error: {type(e).__name__}"}), 502
+
+    try:
+        data = r.json()
+    except ValueError:
+        data = {"raw": r.text}
+    if r.status_code != 200:
+        return jsonify({
+            "ok": False,
+            "error": f"Draftboard /targets/import returned {r.status_code}",
+            "detail": data,
+        }), r.status_code
+
+    return jsonify({
+        "ok": True,
+        "submitted": len(cleaned),
+        "imported": data.get("imported"),
+        "notImported": data.get("notImported"),
+        "errors": data.get("errors") or [],
+        "tags_used": tags,
+    })
 
 
 @app.route("/triage/mint", methods=["POST"])
@@ -9934,6 +10285,11 @@ def _resolver_status(keys: dict) -> dict:
         "cse_key_present": bool(keys.get("google_cse_api_key")),
         "cse_id_present": bool(keys.get("google_cse_id")),
         "openai_present": bool(keys.get("openai_api_key")),
+        # Scrupp powers the Sales Navigator URL import flow at
+        # /import/sales-nav. Status-only (presence flag) so the template
+        # never re-renders the secret value.
+        "scrupp_present": bool(keys.get("scrupp_api_key")),
+        "scrupp_ready": bool(keys.get("scrupp_api_key")),
     }
 
 
