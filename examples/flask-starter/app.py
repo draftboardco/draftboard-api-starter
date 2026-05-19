@@ -4966,9 +4966,11 @@ def _scrupp_call_search(api_key: str, sales_nav_url: str, max_results: int) -> t
     for item in raw_items:
         if not isinstance(item, dict):
             continue
-        # Scrupp's documented field is just `linkedin` (the profile URL).
-        # We accept several legacy variants in case the docs drift.
-        linkedin = (
+        # Scrupp's `linkedin` field is the profile SLUG (e.g. "zachroseman"),
+        # not a full URL. The legacy variant fields are full URLs. Handle
+        # both: if there's no linkedin.com in the value, treat it as a
+        # slug and build the canonical https URL.
+        linkedin_raw = (
             item.get("linkedin")
             or item.get("linkedin_url")
             or item.get("linkedinUrl")
@@ -4976,8 +4978,18 @@ def _scrupp_call_search(api_key: str, sales_nav_url: str, max_results: int) -> t
             or item.get("profileUrl")
             or ""
         ).strip()
-        if not linkedin:
+        if not linkedin_raw:
             continue
+        if "linkedin.com" in linkedin_raw.lower():
+            linkedin = linkedin_raw
+        else:
+            # Slug-only — Scrupp gives bare strings like "zachroseman".
+            # Strip any leading slash or "in/" prefix defensively, then
+            # build the canonical /in/ URL.
+            slug = linkedin_raw.lstrip("/").removeprefix("in/").strip("/")
+            if not slug:
+                continue
+            linkedin = f"https://www.linkedin.com/in/{slug}"
         # Defense-in-depth: drop anything that doesn't look like a real
         # LinkedIn profile URL. Stops a hostile or buggy Scrupp response
         # from injecting javascript:/data: URLs into the preview's
