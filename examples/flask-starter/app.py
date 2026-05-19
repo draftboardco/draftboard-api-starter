@@ -4835,102 +4835,88 @@ SCRUPP_POLL_INTERVAL_SEC = 5
 SCRUPP_POLL_MAX_ATTEMPTS = 36  # 36 * 5s = 180s
 
 
-def _scrupp_call_search(api_key: str, sales_nav_url: str, max_results: int) -> tuple[list[dict], str | None]:
-    """Run Scrupp's async scrape workflow end-to-end. Returns (leads,
-    error_message). Workflow per https://scrupp.com/docs/api/tasks:
-      1. POST /api/v1/sn/search?api_key=...  → {process_id: N}
-      2. Poll GET /api/v1/task/{N}/status?api_key=... every few seconds
-         until status reads "ready" (or one of the synonyms).
-      3. GET /api/v1/task/{N}/data?api_key=... → {total, items: [...]}
-
-    The kit blocks on the polling loop so the user's browser shows a
-    single "Fetching from Scrupp…" state through the whole job. Small
-    searches complete in 10-30s; this stays under typical Flask worker
-    timeouts.
-    """
+def _scrupp_submit_job(api_key: str, sales_nav_url: str, max_results: int) -> tuple[str, str | None]:
+    """POST a Sales Nav URL to Scrupp's scrape endpoint. Returns
+    (process_id, error). Returns immediately - Scrupp's API is async."""
     if not api_key:
-        return [], "No Scrupp API key configured. Add one on /settings/api-keys."
+        return "", "No Scrupp API key configured. Add one on /settings/api-keys."
     if not sales_nav_url.strip():
-        return [], "Paste a Sales Navigator search URL first."
-
+        return "", "Paste a Sales Navigator search URL first."
     max_results = max(1, min(SCRUPP_SEARCH_HARD_MAX, int(max_results or SCRUPP_SEARCH_DEFAULT_MAX)))
     from urllib.parse import quote as _q
-    qk = _q(api_key)
-
-    # --- Step 1: submit the job ----------------------------------------
     try:
         r = requests.post(
-            f"{SCRUPP_API_BASE}{SCRUPP_SEARCH_PATH}?api_key={qk}",
+            f"{SCRUPP_API_BASE}{SCRUPP_SEARCH_PATH}?api_key={_q(api_key)}",
             headers={"Content-Type": "application/json"},
             json={
                 "url": sales_nav_url.strip(),
                 "max": max_results,
                 "page": 1,
-                # Scrupp requires this field; we set false because the kit
-                # only needs LinkedIn profile URLs. Saves credits.
+                # Required by Scrupp's API. False = only fetch profile data,
+                # not emails. Saves credits since the kit only needs URLs.
                 "with_emails": False,
             },
             timeout=30,
         )
     except requests.Timeout:
-        return [], "Scrupp timed out submitting the job. Retry in a minute."
+        return "", "Scrupp timed out submitting the job. Retry in a minute."
     except requests.RequestException as e:
-        return [], f"Network error submitting to Scrupp: {type(e).__name__}"
-
+        return "", f"Network error submitting to Scrupp: {type(e).__name__}"
     if r.status_code != 200:
         snippet = (r.text or "")[:300].replace("\n", " ")
-        return [], f"Scrupp returned HTTP {r.status_code}: {snippet}"
+        return "", f"Scrupp returned HTTP {r.status_code}: {snippet}"
     try:
         job = r.json()
     except ValueError:
-        return [], "Scrupp returned non-JSON on job submission."
-
+        return "", "Scrupp returned non-JSON on job submission."
     process_id = job.get("process_id") or job.get("processId") or job.get("id")
     if not process_id:
-        # Surface their error envelope cleanly if they returned 200 + an error.
         explicit_error = job.get("error") or job.get("message")
         if explicit_error:
-            return [], f"Scrupp: {explicit_error}"
-        return [], f"Scrupp didn't return a process_id. Body: {str(job)[:200]}"
+            return "", f"Scrupp: {explicit_error}"
+        return "", f"Scrupp didn't return a process_id. Body: {str(job)[:200]}"
+    return str(process_id), None
 
-    # --- Step 2: poll status -------------------------------------------
-    final_status = ""
-    for _ in range(SCRUPP_POLL_MAX_ATTEMPTS):
-        time.sleep(SCRUPP_POLL_INTERVAL_SEC)
-        try:
-            s = requests.get(
-                f"{SCRUPP_API_BASE}/api/v1/task/{process_id}/status?api_key={qk}",
-                timeout=20,
-            )
-        except requests.RequestException:
-            # One transient network blip during polling shouldn't kill
-            # the whole job. Just retry on the next iteration.
-            continue
-        if s.status_code != 200:
-            continue
-        try:
-            sdata = s.json()
-        except ValueError:
-            continue
-        status = str(sdata.get("status") or sdata.get("state") or "").lower()
-        if status in ("ready", "completed", "finished", "done", "success"):
-            final_status = status
-            break
-        if status in ("failed", "error", "cancelled", "canceled"):
-            err_msg = sdata.get("error") or sdata.get("message") or status
-            return [], f"Scrupp job failed: {err_msg}"
-        # else: queued / running / pending — keep polling
 
-    if not final_status:
-        return [], (
-            f"Scrupp job didn't finish in {SCRUPP_POLL_INTERVAL_SEC * SCRUPP_POLL_MAX_ATTEMPTS}s. "
-            f"It may still be running on their side - check your Scrupp dashboard."
+def _scrupp_poll_status(api_key: str, process_id: str) -> tuple[dict, str | None]:
+    """One status check. Returns (status_dict, error). status_dict has:
+      status: 'queued' | 'processing' | 'ready' | 'failed' (lowercased)
+      records: int (only meaningful once Scrupp knows the count)
+      raw: the original Scrupp body for debugging
+    """
+    if not api_key or not process_id:
+        return {}, "missing api_key or process_id"
+    from urllib.parse import quote as _q
+    try:
+        s = requests.get(
+            f"{SCRUPP_API_BASE}/api/v1/task/{process_id}/status?api_key={_q(api_key)}",
+            timeout=20,
         )
+    except requests.RequestException as e:
+        return {}, f"Network error: {type(e).__name__}"
+    if s.status_code != 200:
+        return {}, f"Scrupp status returned HTTP {s.status_code}"
+    try:
+        body = s.json()
+    except ValueError:
+        return {}, "Scrupp returned non-JSON on status check."
+    status = str(body.get("status") or body.get("state") or "").lower()
+    return {
+        "status": status,
+        "records": body.get("records") or 0,
+        "raw": body,
+    }, None
 
-    # --- Step 3: fetch the data ----------------------------------------
+
+def _scrupp_fetch_data(api_key: str, process_id: str) -> tuple[list[dict], str | None]:
+    """GET parsed leads for a finished Scrupp job. Returns (leads, error).
+    Same field normalization as the kit's older sync wrapper."""
+    if not api_key or not process_id:
+        return [], "missing api_key or process_id"
+    from urllib.parse import quote as _q
     try:
         d = requests.get(
-            f"{SCRUPP_API_BASE}/api/v1/task/{process_id}/data?api_key={qk}",
+            f"{SCRUPP_API_BASE}/api/v1/task/{process_id}/data?api_key={_q(api_key)}",
             timeout=30,
         )
     except requests.RequestException as e:
@@ -4943,8 +4929,6 @@ def _scrupp_call_search(api_key: str, sales_nav_url: str, max_results: int) -> t
     except ValueError:
         return [], "Scrupp returned non-JSON on the data fetch."
 
-    # Per docs: {total, items: [...]}. Surface explicit error envelopes
-    # in case the data endpoint returns 200 + an error message.
     if isinstance(body, dict):
         explicit_error = body.get("error") or body.get("message")
         if explicit_error and not (body.get("items") or body.get("results")
@@ -5039,9 +5023,11 @@ def import_sales_nav_view():
 
 @app.route("/import/sales-nav/search", methods=["POST"])
 def import_sales_nav_search():
-    """Hit Scrupp's /sn/search and return JSON leads for the preview UI.
-    Doesn't touch Draftboard's /targets/import yet — the user picks which
-    leads to import on the preview step."""
+    """Submit a Sales Nav URL to Scrupp and return the job's process_id
+    immediately. The browser polls /import/sales-nav/status next, then
+    fetches /import/sales-nav/leads when the job is ready. Async by
+    design - blocks Flask for ~1s instead of ~30-180s, and the user
+    sees live status updates while Scrupp scrapes."""
     blocked = _reject_cross_site_form()
     if blocked is not None:
         return blocked
@@ -5052,7 +5038,54 @@ def import_sales_nav_search():
     except (TypeError, ValueError):
         max_results = SCRUPP_SEARCH_DEFAULT_MAX
     keys = _load_resolver_keys()
-    leads, err = _scrupp_call_search(keys.get("scrupp_api_key") or "", sales_nav_url, max_results)
+    process_id, err = _scrupp_submit_job(
+        keys.get("scrupp_api_key") or "", sales_nav_url, max_results,
+    )
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    return jsonify({
+        "ok": True,
+        "process_id": process_id,
+        "max_requested": max_results,
+    })
+
+
+@app.route("/import/sales-nav/status", methods=["GET"])
+def import_sales_nav_status():
+    """One status check on a Scrupp job. Browser polls this every few
+    seconds during a search. Returns the job's current status (queued
+    / processing / ready / failed) plus the records count once Scrupp
+    knows it. We don't sleep here - one status call per request - so
+    Flask workers stay free."""
+    process_id = (request.args.get("id") or "").strip()
+    if not process_id:
+        return jsonify({"ok": False, "error": "process_id required"}), 400
+    keys = _load_resolver_keys()
+    sdata, err = _scrupp_poll_status(keys.get("scrupp_api_key") or "", process_id)
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    status = sdata.get("status") or ""
+    is_ready = status in ("ready", "completed", "finished", "done", "success")
+    is_failed = status in ("failed", "error", "cancelled", "canceled")
+    return jsonify({
+        "ok": True,
+        "process_id": process_id,
+        "status": status,
+        "records": sdata.get("records") or 0,
+        "ready": is_ready,
+        "failed": is_failed,
+    })
+
+
+@app.route("/import/sales-nav/leads", methods=["GET"])
+def import_sales_nav_leads():
+    """Fetch the parsed leads for a finished Scrupp job. The browser
+    calls this once status flips to ready."""
+    process_id = (request.args.get("id") or "").strip()
+    if not process_id:
+        return jsonify({"ok": False, "error": "process_id required"}), 400
+    keys = _load_resolver_keys()
+    leads, err = _scrupp_fetch_data(keys.get("scrupp_api_key") or "", process_id)
     if err:
         return jsonify({"ok": False, "error": err}), 400
     return jsonify({"ok": True, "leads": leads, "count": len(leads)})

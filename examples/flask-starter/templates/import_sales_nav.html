@@ -82,7 +82,7 @@
         </button>
         <span id="search-status" class="ml-3 text-xs text-slate-500"></span>
         <p class="text-xs text-slate-500 mt-2">
-          Scrupp scrapes asynchronously. Small searches (~25 leads) usually finish in 30-60 seconds; bigger ones can take up to ~3 minutes. Don't close the tab.
+          <strong>Heads up - this is async.</strong> Scrupp scrapes in the background; small searches (~25 leads) typically finish in 10-30 seconds, bigger ones can take up to ~3 minutes. You'll see live status updates after clicking - safe to leave the tab open.
         </p>
       </div>
     </section>
@@ -200,20 +200,132 @@
         refreshPickedCount();
       }
 
+      // Async Scrupp workflow:
+      //   1. POST /import/sales-nav/search → returns process_id immediately
+      //   2. Poll /import/sales-nav/status?id=PID every 3s until ready
+      //   3. GET /import/sales-nav/leads?id=PID → parsed leads → render preview
+      //
+      // Why three calls instead of one: Scrupp's API is async (jobs take
+      // 10-180s). A single blocking server-side endpoint would tie up a
+      // Flask worker the whole time and the user would see no progress
+      // indicator. With three calls the user sees live status (queued →
+      // processing → ready) and the elapsed seconds tick up.
+      var POLL_INTERVAL_MS = 3000;   // 3s between status checks
+      var POLL_MAX_ATTEMPTS = 60;    // 60 * 3s = 3min max wait
+      var pollTimer = null;
+      var pollStartedAt = null;
+      var currentProcessId = null;
+
+      function resetSearchButton() {
+        searchBtn.disabled = false;
+        searchBtn.textContent = 'Fetch leads from Scrupp';
+        if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+      }
+      function setStatus(msg, cls) {
+        searchStatus.textContent = msg;
+        searchStatus.className = 'ml-3 text-xs ' + (cls || 'text-slate-500');
+      }
+      function elapsedSec() {
+        return pollStartedAt ? Math.round((Date.now() - pollStartedAt) / 1000) : 0;
+      }
+      function statusLabel(status) {
+        if (status === 'queued') return 'Queued at Scrupp';
+        if (status === 'processing' || status === 'running' || status === 'pending') return 'Scrupp is scraping';
+        if (status === 'ready' || status === 'completed' || status === 'finished' || status === 'done') return 'Done';
+        return status || 'Working';
+      }
+
+      function pollStatus(attempt) {
+        attempt = attempt || 0;
+        if (attempt >= POLL_MAX_ATTEMPTS) {
+          resetSearchButton();
+          setStatus(
+            'Scrupp job didn\'t finish in 3 minutes. It may still be running - check your Scrupp dashboard.',
+            'text-rose-700'
+          );
+          return;
+        }
+        fetch('/import/sales-nav/status?id=' + encodeURIComponent(currentProcessId), {
+          credentials: 'same-origin',
+        })
+          .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+          .then(function (resp) {
+            var b = resp.body || {};
+            if (!b.ok) {
+              resetSearchButton();
+              setStatus('Status check failed: ' + (b.error || 'unknown'), 'text-rose-700');
+              return;
+            }
+            if (b.failed) {
+              resetSearchButton();
+              setStatus('Scrupp job failed: ' + (b.status || 'unknown'), 'text-rose-700');
+              return;
+            }
+            var label = statusLabel(b.status);
+            var recordsPart = b.records ? (' · ' + b.records + ' records found') : '';
+            setStatus(label + ' · ' + elapsedSec() + 's elapsed' + recordsPart, 'text-slate-600');
+            if (b.ready) {
+              fetchLeads();
+              return;
+            }
+            pollTimer = setTimeout(function () { pollStatus(attempt + 1); }, POLL_INTERVAL_MS);
+          })
+          .catch(function (err) {
+            // Transient network error during polling - retry on next tick.
+            pollTimer = setTimeout(function () { pollStatus(attempt + 1); }, POLL_INTERVAL_MS);
+          });
+      }
+
+      function fetchLeads() {
+        setStatus('Fetching results... ' + elapsedSec() + 's total', 'text-slate-600');
+        fetch('/import/sales-nav/leads?id=' + encodeURIComponent(currentProcessId), {
+          credentials: 'same-origin',
+        })
+          .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+          .then(function (resp) {
+            resetSearchButton();
+            var b = resp.body || {};
+            if (!b.ok) {
+              setStatus(b.error || 'Fetch failed', 'text-rose-700');
+              return;
+            }
+            lastLeads = b.leads || [];
+            if (lastLeads.length === 0) {
+              setStatus(
+                'Scrupp completed but returned 0 leads after ' + elapsedSec() + 's. ' +
+                'Double-check the URL or widen the search.',
+                'text-amber-700'
+              );
+              return;
+            }
+            setStatus(
+              'Done in ' + elapsedSec() + 's - ' + lastLeads.length + ' lead' +
+              (lastLeads.length === 1 ? '' : 's') + ' ready to review.',
+              'text-emerald-700'
+            );
+            renderLeads(lastLeads);
+          })
+          .catch(function (err) {
+            resetSearchButton();
+            setStatus('Network error fetching results: ' + (err && err.message ? err.message : 'unknown'), 'text-rose-700');
+          });
+      }
+
       searchBtn.addEventListener('click', function () {
         var url = (urlEl.value || '').trim();
         if (!url) {
-          searchStatus.textContent = 'Paste a Sales Navigator URL first.';
-          searchStatus.className = 'ml-3 text-xs text-rose-700';
+          setStatus('Paste a Sales Navigator URL first.', 'text-rose-700');
           return;
         }
         var max = parseInt(maxEl.value, 10) || {{ default_max }};
         searchBtn.disabled = true;
-        searchBtn.textContent = 'Fetching from Scrupp…';
-        searchStatus.textContent = '';
+        searchBtn.textContent = 'Submitting...';
         preview.classList.add('hidden');
         resultEl.classList.add('hidden');
         lastLeads = [];
+        pollStartedAt = Date.now();
+        currentProcessId = null;
+        setStatus('Submitting job to Scrupp...', 'text-slate-500');
         fetch('/import/sales-nav/search', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -222,29 +334,23 @@
         })
           .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
           .then(function (resp) {
-            searchBtn.disabled = false;
-            searchBtn.textContent = 'Fetch leads from Scrupp';
             var b = resp.body || {};
             if (!b.ok) {
-              searchStatus.textContent = b.error || 'Search failed';
-              searchStatus.className = 'ml-3 text-xs text-rose-700';
+              resetSearchButton();
+              setStatus(b.error || 'Submit failed', 'text-rose-700');
               return;
             }
-            lastLeads = b.leads || [];
-            if (lastLeads.length === 0) {
-              searchStatus.textContent = 'Scrupp returned 0 leads. Double-check the URL or widen the search.';
-              searchStatus.className = 'ml-3 text-xs text-amber-700';
-              return;
-            }
-            searchStatus.textContent = 'Fetched ' + lastLeads.length + ' lead' + (lastLeads.length === 1 ? '' : 's') + '. Review + import below.';
-            searchStatus.className = 'ml-3 text-xs text-emerald-700';
-            renderLeads(lastLeads);
+            currentProcessId = b.process_id;
+            searchBtn.textContent = 'Waiting for Scrupp...';
+            setStatus(
+              'Submitted (job #' + currentProcessId + '). Scrupp is starting the scrape...',
+              'text-slate-600'
+            );
+            pollStatus(0);
           })
           .catch(function (err) {
-            searchBtn.disabled = false;
-            searchBtn.textContent = 'Fetch leads from Scrupp';
-            searchStatus.textContent = 'Network error: ' + (err && err.message ? err.message : 'unknown');
-            searchStatus.className = 'ml-3 text-xs text-rose-700';
+            resetSearchButton();
+            setStatus('Network error: ' + (err && err.message ? err.message : 'unknown'), 'text-rose-700');
           });
       });
 
