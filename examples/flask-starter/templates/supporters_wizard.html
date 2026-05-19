@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Draftboard — Supporter wizard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    {% include "_nav.html" %}
+
+    <header class="mb-6">
+      <h1 class="text-2xl font-semibold tracking-tight">Who can vouch for you?</h1>
+      <p class="text-sm text-slate-500 mt-1">
+        Type the names of people most likely to make warm intros for you. We'll match each name against your Draftboard network ({{ network_size }} connections) and pre-tag them as supporters so they show up prominently when you're picking who to ask.
+      </p>
+    </header>
+
+    {% if network_size == 0 %}
+      <div class="mb-6 rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+        <strong>Your network is empty.</strong> Run a Draftboard sync first so we have connections to match against.
+      </div>
+    {% endif %}
+
+    <!-- STEP 1: name entry -->
+    <section id="step-entry" class="space-y-6">
+      {% for prompt in prompts %}
+        <div class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm">
+          <h2 class="text-base font-semibold text-slate-900">{{ prompt.title }}</h2>
+          <p class="text-xs text-slate-500 mt-1 mb-3">{{ prompt.hint }}</p>
+          <textarea
+            data-bucket="{{ prompt.key }}"
+            rows="4"
+            class="w-full text-sm rounded-md border border-slate-300 px-3 py-2 font-sans focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+            placeholder="{{ prompt.placeholder }}"></textarea>
+          <p class="mt-1 text-[11px] text-slate-400">One name per line. First + last works best.</p>
+        </div>
+      {% endfor %}
+
+      <div class="flex items-center justify-between gap-3">
+        <p class="text-xs text-slate-500">
+          We'll fuzzy-match each name against your network. You confirm which match is right before anyone gets tagged.
+        </p>
+        <button
+          type="button"
+          id="find-btn"
+          class="inline-flex items-center justify-center rounded-md bg-indigo-600 hover:bg-indigo-700 px-4 py-2 text-sm font-medium text-white shadow disabled:opacity-50 disabled:cursor-not-allowed"
+          {% if network_size == 0 %}disabled{% endif %}
+        >
+          Find them in my network →
+        </button>
+      </div>
+    </section>
+
+    <!-- STEP 2: review matches -->
+    <section id="step-review" class="hidden">
+      <div class="mb-4 flex items-start justify-between gap-3">
+        <div>
+          <h2 class="text-lg font-semibold text-slate-900">Confirm the matches</h2>
+          <p class="text-xs text-slate-500 mt-1" id="match-summary"></p>
+        </div>
+        <button
+          type="button"
+          id="back-btn"
+          class="text-xs text-slate-500 hover:text-slate-900 underline"
+        >
+          ← Edit names
+        </button>
+      </div>
+
+      <div id="match-results" class="space-y-4"></div>
+
+      <div class="mt-6 flex items-center justify-between gap-3 sticky bottom-0 bg-slate-50 py-3 border-t border-slate-200">
+        <p class="text-xs text-slate-500">
+          <span id="picked-count">0</span> selected — they'll be marked as supporters when you click below.
+        </p>
+        <button
+          type="button"
+          id="mark-btn"
+          disabled
+          class="inline-flex items-center justify-center rounded-md bg-emerald-600 hover:bg-emerald-700 px-4 py-2 text-sm font-medium text-white shadow disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          Mark selected as supporters
+        </button>
+      </div>
+    </section>
+
+    <!-- STEP 3: result -->
+    <section id="step-done" class="hidden">
+      <div class="rounded-md border border-emerald-300 bg-emerald-50 px-4 py-4 text-sm text-emerald-900">
+        <strong id="done-title"></strong>
+        <p class="mt-1" id="done-detail"></p>
+      </div>
+      <div class="mt-4 flex items-center gap-3">
+        <a href="/supporters/candidates" class="text-sm text-indigo-700 underline">View all supporters →</a>
+        <button
+          type="button"
+          id="restart-btn"
+          class="text-xs text-slate-500 underline hover:text-slate-900"
+        >
+          Add more names
+        </button>
+      </div>
+    </section>
+
+    <footer class="mt-10 text-xs text-slate-400 text-center">
+      Draftboard API starter · Supporter wizard
+    </footer>
+  </div>
+
+  <script>
+    (function () {
+      var stepEntry = document.getElementById('step-entry');
+      var stepReview = document.getElementById('step-review');
+      var stepDone = document.getElementById('step-done');
+      var findBtn = document.getElementById('find-btn');
+      var backBtn = document.getElementById('back-btn');
+      var markBtn = document.getElementById('mark-btn');
+      var restartBtn = document.getElementById('restart-btn');
+      var resultsEl = document.getElementById('match-results');
+      var summaryEl = document.getElementById('match-summary');
+      var pickedCountEl = document.getElementById('picked-count');
+      var doneTitle = document.getElementById('done-title');
+      var doneDetail = document.getElementById('done-detail');
+
+      function escapeHtml(s) {
+        return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+          return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
+        });
+      }
+      function safeHttpHref(url) {
+        var s = String(url == null ? '' : url).trim();
+        return /^https?:\/\//i.test(s) ? s : '';
+      }
+      function showStep(which) {
+        stepEntry.classList.toggle('hidden', which !== 'entry');
+        stepReview.classList.toggle('hidden', which !== 'review');
+        stepDone.classList.toggle('hidden', which !== 'done');
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      }
+
+      function confidencePill(conf) {
+        var map = {
+          exact:  ['Exact match',        'bg-emerald-100 text-emerald-800'],
+          high:   ['High confidence',    'bg-emerald-50 text-emerald-700'],
+          medium: ['Possible match',     'bg-amber-50 text-amber-800'],
+          low:    ['Weak match',         'bg-slate-100 text-slate-600'],
+        };
+        var spec = map[conf] || map.low;
+        return '<span class="text-[10px] px-1.5 py-0.5 rounded ' + spec[1] + '">' + spec[0] + '</span>';
+      }
+
+      function refreshPickedCount() {
+        var checked = resultsEl.querySelectorAll('input[type=checkbox][data-pick]:checked').length;
+        pickedCountEl.textContent = checked;
+        markBtn.disabled = checked === 0;
+      }
+
+      function renderResults(buckets) {
+        var totalNames = 0;
+        var totalCandidates = 0;
+        var totalUnmatched = 0;
+        var anyAlready = 0;
+        var html = '';
+        buckets.forEach(function (bucket) {
+          if (!bucket.rows || !bucket.rows.length) return;
+          html += '<section class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm">';
+          html += '<h3 class="text-sm font-semibold text-slate-900 mb-3">' + escapeHtml(bucket.title) + '</h3>';
+          html += '<ul class="divide-y divide-slate-100">';
+          bucket.rows.forEach(function (row) {
+            totalNames++;
+            html += '<li class="py-3">';
+            html += '<div class="text-sm font-medium text-slate-900">' + escapeHtml(row.name) + '</div>';
+            if (!row.candidates || row.candidates.length === 0) {
+              totalUnmatched++;
+              html += '<div class="mt-1 text-xs text-rose-700">No match found in your Draftboard network. ';
+              html += 'You can add them manually via the <a class="underline" href="/import/supporters">Import supporters</a> page.</div>';
+            } else {
+              row.candidates.forEach(function (c, idx) {
+                totalCandidates++;
+                var alreadyTag = c.already_supporter ? ' <span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-500">already a supporter</span>' : '';
+                if (c.already_supporter) anyAlready++;
+                var liHref = safeHttpHref(c.linkedin);
+                // Auto-check the top-confidence candidate of each row by
+                // default if it's exact or high; user can uncheck or
+                // pick a different candidate.
+                var defaultChecked = (idx === 0 && (c.confidence === 'exact' || c.confidence === 'high') && !c.already_supporter);
+                html += '<label class="mt-2 flex items-start gap-2 px-2 py-2 rounded hover:bg-slate-50 cursor-pointer">';
+                html += '<input type="checkbox" data-pick'
+                  + ' data-linkedin="' + escapeHtml(c.linkedin) + '"'
+                  + ' data-display="' + escapeHtml(c.name) + '"'
+                  + (defaultChecked ? ' checked' : '')
+                  + (c.already_supporter ? ' disabled' : '')
+                  + ' class="mt-1 w-4 h-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500" />';
+                html += '<div class="flex-1 min-w-0">';
+                html += '<div class="text-sm flex items-center gap-2">' + escapeHtml(c.name) + ' ' + confidencePill(c.confidence) + alreadyTag + '</div>';
+                var sub = [c.title, c.company].filter(function(x){return x;}).map(escapeHtml).join(' · ');
+                if (sub) html += '<div class="text-xs text-slate-600 truncate">' + sub + '</div>';
+                if (liHref) html += '<a href="' + escapeHtml(liHref) + '" target="_blank" rel="noopener" class="text-[11px] text-indigo-600 hover:underline">↗ LinkedIn</a>';
+                html += '</div></label>';
+              });
+            }
+            html += '</li>';
+          });
+          html += '</ul>';
+          html += '</section>';
+        });
+
+        if (totalNames === 0) {
+          summaryEl.innerHTML = '<span class="text-rose-700">No names entered. Go back and type some.</span>';
+          resultsEl.innerHTML = '';
+          return;
+        }
+        var alreadyPart = anyAlready ? ' · ' + anyAlready + ' already a supporter' : '';
+        summaryEl.textContent =
+          totalNames + ' name' + (totalNames === 1 ? '' : 's') + ' · ' +
+          totalCandidates + ' match' + (totalCandidates === 1 ? '' : 'es') + ' found · ' +
+          totalUnmatched + ' not in your network' + alreadyPart + '.';
+        resultsEl.innerHTML = html;
+        resultsEl.querySelectorAll('input[type=checkbox][data-pick]').forEach(function (cb) {
+          cb.addEventListener('change', refreshPickedCount);
+        });
+        refreshPickedCount();
+      }
+
+      findBtn.addEventListener('click', function () {
+        var buckets = {};
+        document.querySelectorAll('textarea[data-bucket]').forEach(function (ta) {
+          var key = ta.getAttribute('data-bucket');
+          buckets[key] = ta.value || '';
+        });
+        var anyText = Object.values(buckets).some(function (v) { return (v || '').trim(); });
+        if (!anyText) {
+          alert('Type at least one name first.');
+          return;
+        }
+        findBtn.disabled = true;
+        var orig = findBtn.textContent;
+        findBtn.textContent = 'Matching…';
+        fetch('/supporters/wizard/match', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ buckets: buckets }),
+        })
+          .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+          .then(function (resp) {
+            findBtn.disabled = false;
+            findBtn.textContent = orig;
+            var b = resp.body || {};
+            if (!b.ok) {
+              alert(b.error || 'Matching failed');
+              return;
+            }
+            renderResults(b.buckets || []);
+            showStep('review');
+          })
+          .catch(function (err) {
+            findBtn.disabled = false;
+            findBtn.textContent = orig;
+            alert('Network error: ' + (err && err.message ? err.message : 'unknown'));
+          });
+      });
+
+      backBtn.addEventListener('click', function () { showStep('entry'); });
+
+      markBtn.addEventListener('click', function () {
+        var selections = [];
+        resultsEl.querySelectorAll('input[type=checkbox][data-pick]:checked').forEach(function (cb) {
+          selections.push({
+            linkedin_url: cb.getAttribute('data-linkedin') || '',
+            display_name: cb.getAttribute('data-display') || '',
+          });
+        });
+        if (selections.length === 0) return;
+        markBtn.disabled = true;
+        var orig = markBtn.textContent;
+        markBtn.textContent = 'Marking…';
+        fetch('/supporters/wizard/mark', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ selections: selections }),
+        })
+          .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+          .then(function (resp) {
+            markBtn.disabled = false;
+            markBtn.textContent = orig;
+            var b = resp.body || {};
+            if (!b.ok) {
+              alert(b.error || 'Mark failed');
+              return;
+            }
+            doneTitle.textContent = '✓ Marked ' + b.added + ' new supporter' + (b.added === 1 ? '' : 's');
+            var detailBits = [];
+            if (b.already_supporter) detailBits.push(b.already_supporter + ' were already tagged');
+            if (b.errors && b.errors.length) detailBits.push(b.errors.length + ' had errors');
+            doneDetail.textContent = detailBits.length ? '(' + detailBits.join(', ') + ')' : '';
+            showStep('done');
+          })
+          .catch(function (err) {
+            markBtn.disabled = false;
+            markBtn.textContent = orig;
+            alert('Network error: ' + (err && err.message ? err.message : 'unknown'));
+          });
+      });
+
+      restartBtn.addEventListener('click', function () {
+        // Clear textareas so the user can start fresh.
+        document.querySelectorAll('textarea[data-bucket]').forEach(function (ta) { ta.value = ''; });
+        showStep('entry');
+      });
+    })();
+  </script>
+</body>
+</html>

@@ -9221,6 +9221,258 @@ def google_sync_status():
     return jsonify(google_sync_progress_snapshot())
 
 
+# =====================================================================
+# Supporter wizard
+# =====================================================================
+# A guided onboarding flow that asks the user for the people most likely
+# to make warm intros for them (investors, advisors, top coworkers, best
+# friends, prior intro-makers). User types names; the kit fuzzy-matches
+# each against the connector index (built from connector_paths) and
+# returns probable matches with confidence. User confirms which match
+# is right and the kit bulk-tags them as manual_supporters.
+#
+# Why this exists: identifying supporters by Gmail/Calendar requires an
+# OAuth flow that scares users. Names-first wizard sidesteps the whole
+# OAuth concern - they type 30-50 names in 5 minutes and the kit pairs
+# them up with the LinkedIn URLs we already have on file.
+
+# Hardcoded prompt buckets. Order matters - we lead with the strongest
+# signal of "this person will help" (investors / advisors are by
+# definition signed-up backers) and finish with looser signals.
+SUPPORTER_WIZARD_PROMPTS = [
+    {
+        "key": "investors",
+        "title": "Investors",
+        "hint": "Anyone who has put money into your company (angels, GPs at funds, etc.). They're signed up to help you.",
+        "placeholder": "Sarah Tavel\nReid Hoffman\n...",
+    },
+    {
+        "key": "advisors",
+        "title": "Advisors and mentors",
+        "hint": "Formal advisors, board members, executive coaches, people you go to for career advice.",
+        "placeholder": "Lenny Rachitsky\n...",
+    },
+    {
+        "key": "coworkers",
+        "title": "Closest coworkers (current + past)",
+        "hint": "The 10-15 colleagues from each of your past companies you'd happily grab coffee with tomorrow.",
+        "placeholder": "Tim Cook\n...",
+    },
+    {
+        "key": "friends",
+        "title": "Close friends",
+        "hint": "People in your network you'd ask for a real favor without thinking twice.",
+        "placeholder": "Your best friends, college roommate, etc.",
+    },
+    {
+        "key": "prior_intros",
+        "title": "People who've already made you intros",
+        "hint": "If they've vouched for you once, they'll do it again. Strongest signal of all.",
+        "placeholder": "...",
+    },
+]
+
+
+def _wizard_normalize_name(name: str) -> str:
+    """Lowercase + strip + collapse whitespace. Drops punctuation that
+    commonly appears in pasted names ('Dr.', 'PhD', commas) so 'Tim
+    Smith, PhD' matches 'Tim Smith'."""
+    if not name:
+        return ""
+    s = str(name).strip().lower()
+    # Drop common suffix noise.
+    for suffix in (", phd", ", md", ", esq", ", cpa", ", jr", ", sr", " jr.", " sr."):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)]
+    # Collapse internal whitespace + strip remaining punctuation.
+    s = re.sub(r"[^\w\s'-]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _build_connector_index() -> list[dict]:
+    """One-shot index of every connector the kit knows about, built from
+    connector_paths. Returns deduped list keyed by connector_key.
+
+    Each entry has: connector_key, name (full), first, last, linkedin,
+    title, company, name_norm (lowercased for fuzzy match).
+    """
+    by_key: dict[str, dict] = {}
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT connector_key, connector_first, connector_last, connector_linkedin, "
+            "connector_title, connector_company "
+            "FROM connector_paths"
+        )
+        for row in cur.fetchall():
+            ckey = row[0]
+            if not ckey or ckey in by_key:
+                continue
+            first = row[1] or ""
+            last = row[2] or ""
+            full = (first + " " + last).strip()
+            if not full:
+                continue
+            by_key[ckey] = {
+                "connector_key": ckey,
+                "name": full,
+                "first": first,
+                "last": last,
+                "linkedin": row[3] or "",
+                "title": row[4] or "",
+                "company": row[5] or "",
+                "name_norm": _wizard_normalize_name(full),
+            }
+    return list(by_key.values())
+
+
+def _wizard_match_one(query: str, index: list[dict]) -> list[dict]:
+    """Find candidate matches for one user-typed name. Returns a list of
+    up to 5 candidates sorted by confidence descending.
+
+    confidence: 'exact' | 'high' | 'medium' | (omitted for no-match)
+    """
+    qnorm = _wizard_normalize_name(query)
+    if not qnorm:
+        return []
+    qparts = qnorm.split()
+    qfirst = qparts[0] if qparts else ""
+    qlast = qparts[-1] if len(qparts) > 1 else ""
+
+    # Pass 1: exact full-name match (case-insensitive, normalized).
+    exacts = [c for c in index if c["name_norm"] == qnorm]
+    if exacts:
+        return [
+            {**c, "confidence": "exact"}
+            for c in exacts[:5]
+        ]
+
+    # Pass 2: difflib ratio against the full normalized name.
+    import difflib
+    scored = []
+    for c in index:
+        ratio = difflib.SequenceMatcher(None, qnorm, c["name_norm"]).ratio()
+        # Bonus when both first + last appear (in any order) — handles
+        # "John Smith" matching "Smith, John" or "John A. Smith".
+        cparts = c["name_norm"].split()
+        if qfirst and qlast and qfirst in cparts and qlast in cparts:
+            ratio = max(ratio, 0.92)
+        if ratio >= 0.7:
+            scored.append((ratio, c))
+    scored.sort(key=lambda t: t[0], reverse=True)
+
+    out = []
+    for ratio, c in scored[:5]:
+        if ratio >= 0.92:
+            conf = "high"
+        elif ratio >= 0.8:
+            conf = "medium"
+        else:
+            conf = "low"
+        out.append({**c, "confidence": conf, "ratio": round(ratio, 3)})
+    return out
+
+
+@app.route("/supporters/wizard", methods=["GET"])
+def supporters_wizard_view():
+    """Render the empty wizard form. Five textareas, one per prompt
+    bucket; the JS handles the find-matches step inline."""
+    network_size = 0
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute("SELECT COUNT(DISTINCT connector_key) FROM connector_paths")
+        network_size = (cur.fetchone() or [0])[0]
+    return render_template(
+        "supporters_wizard.html",
+        active="supporters_wizard",
+        api_key_set=bool(API_KEY),
+        prompts=SUPPORTER_WIZARD_PROMPTS,
+        network_size=network_size,
+    )
+
+
+@app.route("/supporters/wizard/match", methods=["POST"])
+def supporters_wizard_match():
+    """Take the user's pasted name list (per bucket) and return fuzzy
+    matches against the connector index. Doesn't write anything - the
+    user reviews the matches and then submits the chosen ones via
+    /supporters/wizard/mark."""
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+    body = request.get_json(silent=True) or {}
+    buckets = body.get("buckets") or {}
+    if not isinstance(buckets, dict):
+        return jsonify({"ok": False, "error": "buckets must be an object"}), 400
+
+    index = _build_connector_index()
+    already_supporters = db_manual_supporter_urls_norm()
+
+    out_buckets = []
+    for prompt in SUPPORTER_WIZARD_PROMPTS:
+        key = prompt["key"]
+        raw = buckets.get(key) or ""
+        names = [n.strip() for n in str(raw).splitlines() if n.strip()]
+        bucket_rows = []
+        for name in names[:50]:  # cap per bucket to keep response bounded
+            candidates = _wizard_match_one(name, index)
+            for c in candidates:
+                norm_li = _normalize_linkedin(c["linkedin"])
+                c["already_supporter"] = bool(norm_li and norm_li in already_supporters)
+            bucket_rows.append({"name": name, "candidates": candidates})
+        out_buckets.append({
+            "key": key,
+            "title": prompt["title"],
+            "rows": bucket_rows,
+        })
+
+    return jsonify({"ok": True, "buckets": out_buckets})
+
+
+@app.route("/supporters/wizard/mark", methods=["POST"])
+def supporters_wizard_mark():
+    """Bulk-mark a list of LinkedIn URLs as supporters with source="wizard".
+    Body: {selections: [{linkedin_url, display_name}, ...]}"""
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+    body = request.get_json(silent=True) or {}
+    selections = body.get("selections") or []
+    if not isinstance(selections, list):
+        return jsonify({"ok": False, "error": "selections must be a list"}), 400
+
+    added = 0
+    already = 0
+    errors: list[str] = []
+    for sel in selections:
+        if not isinstance(sel, dict):
+            continue
+        linkedin_raw = (sel.get("linkedin_url") or "").strip()
+        display_name = (sel.get("display_name") or "").strip()
+        if not linkedin_raw:
+            continue
+        if db_manual_supporter_get(_normalize_linkedin(linkedin_raw) or linkedin_raw):
+            already += 1
+            continue
+        was_new, err = db_manual_supporter_upsert(
+            linkedin_url_raw=linkedin_raw,
+            display_name=display_name,
+            source="wizard",
+        )
+        if err:
+            errors.append(f"{display_name or linkedin_raw}: {err}")
+            continue
+        if was_new:
+            added += 1
+        else:
+            already += 1
+    return jsonify({
+        "ok": True,
+        "added": added,
+        "already_supporter": already,
+        "errors": errors,
+    })
+
+
 @app.route("/supporters/candidates", methods=["GET"])
 def supporters_candidates_view():
     """Ranked list of high-engagement contacts from the local user's Gmail
