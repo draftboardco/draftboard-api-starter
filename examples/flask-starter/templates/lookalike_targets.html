@@ -13,7 +13,7 @@
     <header class="mb-6">
       <h1 class="text-2xl font-semibold tracking-tight">Lookalike targets</h1>
       <p class="text-sm text-slate-500 mt-1">
-        Find more people at the same accounts as your existing targets. The kit round-robins through your accounts, expands each one's seed titles with GPT, and surfaces ranked candidates you can add to Draftboard with one click. Results persist — close the tab and come back.
+        Find more people at the same accounts as your existing targets. Pick a tag (so the kit only scans the accounts you care about), set how many new candidates per run, then click <strong>Run today's batch</strong>. Results are saved — close the tab and they'll be here when you're back.
       </p>
     </header>
 
@@ -24,11 +24,30 @@
       </div>
     {% endif %}
 
-    {# ---- Cadence + run controls ---- #}
+    {# ---- Run controls ---- #}
     <section class="mb-6 bg-white border border-slate-200 rounded-lg p-5 shadow-sm">
-      <div class="flex items-end gap-4 flex-wrap">
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
         <div>
-          <label class="text-xs uppercase tracking-wider text-slate-500 block mb-1">New targets per run</label>
+          <label class="text-xs uppercase tracking-wider text-slate-500 block mb-1">Scope: only scan accounts whose targets carry tag…</label>
+          <div class="flex items-center gap-2">
+            <select id="tag-select"
+                    class="flex-1 text-sm rounded-md border border-slate-300 px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-500">
+              <option value="">— Pick a tag (required) —</option>
+              {% for tag, count in all_tags %}
+                <option value="{{ tag }}" {% if tag == current_tag %}selected{% endif %}>{{ tag }} ({{ count }} target{{ '' if count == 1 else 's' }})</option>
+              {% endfor %}
+            </select>
+          </div>
+          <p class="mt-1 text-[11px] text-slate-500">
+            {% if all_tags %}
+              Tag a few targets on your <a class="underline" href="/">Targets page</a> first if you don't see the right one.
+            {% else %}
+              No tags found yet. Add tags to your targets so you can scope this scan to specific companies.
+            {% endif %}
+          </p>
+        </div>
+        <div>
+          <label class="text-xs uppercase tracking-wider text-slate-500 block mb-1">New candidates per run</label>
           <div class="flex items-center gap-2">
             <select id="cadence-select"
                     class="text-sm rounded-md border border-slate-300 px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-500">
@@ -42,72 +61,157 @@
             </button>
             <span id="cadence-status" class="text-xs"></span>
           </div>
+          <p class="mt-1 text-[11px] text-slate-500">
+            Higher cadence = scans more accounts before stopping. ~5-15s per account.
+          </p>
         </div>
-        <div class="flex-1"></div>
+      </div>
+
+      <div class="flex items-center gap-3">
         <button type="button" id="run-btn"
                 class="text-sm px-4 py-2 rounded-md bg-emerald-600 hover:bg-emerald-700 text-white font-medium disabled:opacity-50 disabled:cursor-not-allowed"
                 {% if not keys_ready %}disabled{% endif %}>
-          Run today's batch →
+          🔍 Run today's batch →
         </button>
+        <span id="run-status" class="text-xs text-slate-500"></span>
       </div>
-      <p class="mt-3 text-xs text-slate-500">
-        v0: synchronous run, takes 20-60s for cadence 10. Don't close the tab while it's running.
+      <p class="mt-2 text-[11px] text-slate-400">
+        Synchronous v0 — keep this tab open during the run (typically 30-120s).
       </p>
-      <p id="run-status" class="mt-2 text-xs"></p>
     </section>
 
     {# ---- Stats strip ---- #}
     <section class="mb-4 flex items-center gap-4 text-xs text-slate-500">
       <span><strong class="text-slate-900" id="count-pending">{{ counts.pending }}</strong> pending</span>
       <span>·</span>
-      <span><strong class="text-emerald-700" id="count-added">{{ counts.added }}</strong> added to Draftboard</span>
+      <span><strong class="text-emerald-700" id="count-added">{{ counts.added }}</strong> added</span>
       <span>·</span>
       <span><strong class="text-slate-500" id="count-skipped">{{ counts.skipped }}</strong> skipped</span>
+      <span class="text-slate-400">· Persists across sessions; each decision is sticky.</span>
     </section>
 
-    {# ---- Pending discoveries table ---- #}
-    <section id="pending-list" class="space-y-2">
-      {% if pending %}
-        {% for c in pending %}
-          <article class="bg-white border border-slate-200 rounded-lg p-4 shadow-sm flex items-start gap-3"
-                   data-row data-linkedin="{{ c.linkedin_url }}">
-            <div class="flex-shrink-0">
-              {% if c.ai_confidence >= 0.7 %}
-                <span class="inline-flex items-center justify-center w-8 h-8 rounded-full text-sm font-bold bg-emerald-100 text-emerald-800">{{ (c.ai_confidence * 10) | round(0) | int }}</span>
-              {% elif c.ai_confidence >= 0.4 %}
-                <span class="inline-flex items-center justify-center w-8 h-8 rounded-full text-sm font-bold bg-amber-100 text-amber-800">{{ (c.ai_confidence * 10) | round(0) | int }}</span>
-              {% else %}
-                <span class="inline-flex items-center justify-center w-8 h-8 rounded-full text-xs bg-slate-100 text-slate-500">?</span>
-              {% endif %}
-            </div>
-            <div class="flex-1 min-w-0">
-              <div class="text-sm font-semibold text-slate-900 truncate">{{ c.name or '(unnamed)' }}</div>
-              <div class="text-xs text-slate-600 truncate">
-                {{ c.title }}{% if c.title and c.account_display_name %} · {% endif %}{{ c.account_display_name }}
+    {# ---- Pending grouped by account ---- #}
+    <section id="pending-section" class="space-y-4">
+      {% if pending_by_account %}
+        {% for account in pending_by_account %}
+          <article class="bg-white border border-slate-200 rounded-lg shadow-sm overflow-hidden"
+                   data-account="{{ account.account_key }}">
+            <header class="px-5 py-3 bg-indigo-50 border-b border-indigo-100 flex items-center justify-between gap-3">
+              <div>
+                <h3 class="text-sm font-semibold text-slate-900">{{ account.display_name }}</h3>
+                <p class="text-[11px] text-slate-600 mt-0.5">
+                  <strong>{{ account.candidates|length }}</strong> new candidate{{ '' if account.candidates|length == 1 else 's' }}
+                  · <strong>{{ account.existing_targets|length }}</strong> existing target{{ '' if account.existing_targets|length == 1 else 's' }} you already track
+                </p>
               </div>
-              {% if c.ai_reason %}
-                <div class="mt-1 text-[11px] text-slate-500 line-clamp-2">{{ c.ai_reason }}</div>
-              {% endif %}
-              <a href="{{ c.linkedin_url }}" target="_blank" rel="noopener" class="mt-1 inline-block text-[11px] text-indigo-600 hover:underline">↗ LinkedIn</a>
-            </div>
-            <div class="flex flex-col items-stretch gap-1.5 flex-shrink-0">
-              <button type="button" data-action="add"
-                      class="text-xs px-3 py-1.5 rounded-md bg-indigo-600 hover:bg-indigo-700 text-white font-medium">
-                + Add as target
-              </button>
-              <button type="button" data-action="skip"
-                      class="text-xs px-3 py-1.5 rounded-md border border-slate-300 bg-white hover:bg-slate-50 text-slate-700">
-                Skip
-              </button>
-            </div>
+              <div class="flex items-center gap-1.5">
+                <button type="button" data-account-action="add-all" class="text-xs px-3 py-1.5 rounded-md bg-indigo-600 hover:bg-indigo-700 text-white font-medium">
+                  + Add all {{ account.candidates|length }}
+                </button>
+                <button type="button" data-account-action="skip-all" class="text-xs px-3 py-1.5 rounded-md border border-slate-300 bg-white hover:bg-slate-50 text-slate-700">
+                  Skip all
+                </button>
+              </div>
+            </header>
+
+            {% if account.existing_targets %}
+              <details class="px-5 py-2 border-b border-slate-100 text-[11px] text-slate-500">
+                <summary class="cursor-pointer hover:text-slate-700">Your existing targets at this account ({{ account.existing_targets|length }})</summary>
+                <ul class="mt-1.5 space-y-0.5">
+                  {% for t in account.existing_targets[:10] %}
+                    <li class="truncate">· <strong class="text-slate-700">{{ t.name }}</strong>{% if t.title %} · {{ t.title }}{% endif %}</li>
+                  {% endfor %}
+                  {% if account.existing_targets|length > 10 %}
+                    <li class="text-slate-400">… and {{ account.existing_targets|length - 10 }} more</li>
+                  {% endif %}
+                </ul>
+              </details>
+            {% endif %}
+
+            <ul class="divide-y divide-slate-100">
+              {% for c in account.candidates %}
+                {# Compute a cleaner display: drop title when it duplicates the account name #}
+                {% set show_title = c.title and (c.title|lower) != (account.display_name|lower) and (c.title|lower) != (account.account_key|lower) %}
+                <li class="px-5 py-3 flex items-start gap-3" data-row data-linkedin="{{ c.linkedin_url }}">
+                  <div class="flex-shrink-0">
+                    {% if c.ai_confidence >= 0.7 %}
+                      <span class="inline-flex items-center justify-center w-7 h-7 rounded-full text-xs font-bold bg-emerald-100 text-emerald-800">{{ (c.ai_confidence * 10) | round(0) | int }}</span>
+                    {% elif c.ai_confidence >= 0.4 %}
+                      <span class="inline-flex items-center justify-center w-7 h-7 rounded-full text-xs font-bold bg-amber-100 text-amber-800">{{ (c.ai_confidence * 10) | round(0) | int }}</span>
+                    {% else %}
+                      <span class="inline-flex items-center justify-center w-7 h-7 rounded-full text-xs bg-slate-100 text-slate-500">?</span>
+                    {% endif %}
+                  </div>
+                  <div class="flex-1 min-w-0">
+                    <div class="text-sm font-semibold text-slate-900 truncate">{{ c.name or '(unnamed)' }}</div>
+                    {% if show_title %}
+                      <div class="text-xs text-slate-600 truncate">{{ c.title }}</div>
+                    {% endif %}
+                    {% if c.ai_reason %}
+                      <div class="mt-1 text-[11px] text-slate-500 line-clamp-2">{{ c.ai_reason }}</div>
+                    {% endif %}
+                    <a href="{{ c.linkedin_url }}" target="_blank" rel="noopener" class="mt-1 inline-block text-[11px] text-indigo-600 hover:underline">↗ LinkedIn</a>
+                  </div>
+                  <div class="flex flex-col items-stretch gap-1 flex-shrink-0">
+                    <button type="button" data-action="add" class="text-xs px-3 py-1.5 rounded-md bg-indigo-600 hover:bg-indigo-700 text-white font-medium">
+                      + Add
+                    </button>
+                    <button type="button" data-action="skip" class="text-xs px-3 py-1.5 rounded-md border border-slate-300 bg-white hover:bg-slate-50 text-slate-700">
+                      Skip
+                    </button>
+                  </div>
+                </li>
+              {% endfor %}
+            </ul>
           </article>
         {% endfor %}
       {% else %}
         <div class="rounded-md border border-slate-200 bg-white px-4 py-6 text-sm text-slate-500 text-center">
-          No pending lookalikes yet. Click <strong>Run today's batch →</strong> above to find some.
+          No pending lookalikes yet. Pick a tag above + click <strong>Run today's batch →</strong> to find some.
         </div>
       {% endif %}
     </section>
+
+    {# ---- History (collapsed) ---- #}
+    {% if added_rows or skipped_rows %}
+      <details class="mt-8 bg-white border border-slate-200 rounded-lg p-5 shadow-sm">
+        <summary class="cursor-pointer text-sm font-semibold text-slate-900">
+          History <span class="font-normal text-slate-500">({{ added_rows|length }} added · {{ skipped_rows|length }} skipped)</span>
+        </summary>
+        <div class="mt-4 grid grid-cols-1 md:grid-cols-2 gap-5">
+          <div>
+            <h4 class="text-xs uppercase tracking-wider text-emerald-700 font-semibold mb-2">✓ Added to Draftboard</h4>
+            {% if added_rows %}
+              <ul class="divide-y divide-slate-100 text-xs">
+                {% for r in added_rows %}
+                  <li class="py-2">
+                    <div class="font-medium text-slate-900 truncate">{{ r.name }}</div>
+                    <div class="text-[11px] text-slate-500 truncate">{{ r.title }}{% if r.title and r.account_display_name %} · {% endif %}{{ r.account_display_name }}</div>
+                  </li>
+                {% endfor %}
+              </ul>
+            {% else %}
+              <p class="text-xs text-slate-400">None yet.</p>
+            {% endif %}
+          </div>
+          <div>
+            <h4 class="text-xs uppercase tracking-wider text-slate-500 font-semibold mb-2">Skipped</h4>
+            {% if skipped_rows %}
+              <ul class="divide-y divide-slate-100 text-xs">
+                {% for r in skipped_rows %}
+                  <li class="py-2">
+                    <div class="font-medium text-slate-700 truncate">{{ r.name }}</div>
+                    <div class="text-[11px] text-slate-500 truncate">{{ r.title }}{% if r.title and r.account_display_name %} · {% endif %}{{ r.account_display_name }}</div>
+                  </li>
+                {% endfor %}
+              </ul>
+            {% else %}
+              <p class="text-xs text-slate-400">None yet.</p>
+            {% endif %}
+          </div>
+        </div>
+      </details>
+    {% endif %}
 
     <footer class="mt-10 text-xs text-slate-400 text-center">
       Draftboard API starter · Lookalike targets
@@ -119,6 +223,7 @@
       var runBtn = document.getElementById('run-btn');
       var runStatus = document.getElementById('run-status');
       var cadenceSelect = document.getElementById('cadence-select');
+      var tagSelect = document.getElementById('tag-select');
       var saveBtn = document.getElementById('save-cadence-btn');
       var cadenceStatus = document.getElementById('cadence-status');
 
@@ -161,26 +266,50 @@
           });
       });
 
+      // Live elapsed-time tick during a run (no real progress signal from
+      // the synchronous engine, but the user gets a moving "Xs elapsed"
+      // count so they know the page isn't frozen).
+      var elapsedTimer = null;
+      function startElapsedTick(prefix) {
+        var startedAt = Date.now();
+        if (elapsedTimer) clearInterval(elapsedTimer);
+        elapsedTimer = setInterval(function () {
+          var sec = Math.floor((Date.now() - startedAt) / 1000);
+          runStatus.textContent = prefix + ' · ' + sec + 's elapsed';
+        }, 1000);
+      }
+      function stopElapsedTick() {
+        if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
+      }
+
       // Run batch
       runBtn.addEventListener('click', function () {
+        var tag = tagSelect.value;
+        if (!tag) {
+          runStatus.textContent = 'Pick a tag first — we don\'t want to scan your whole database.';
+          runStatus.className = 'text-xs text-rose-700';
+          return;
+        }
         runBtn.disabled = true;
         var orig = runBtn.textContent;
         runBtn.textContent = 'Running…';
-        runStatus.textContent = 'Scanning accounts + asking GPT to expand seed titles…';
-        runStatus.className = 'mt-2 text-xs text-slate-500';
+        startElapsedTick('Scanning accounts tagged "' + tag + '"');
+        runStatus.className = 'text-xs text-slate-500';
         fetch('/prospecting/lookalike-targets/run', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           credentials: 'same-origin',
+          body: JSON.stringify({ tag: tag }),
         })
           .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
           .then(function (resp) {
+            stopElapsedTick();
             runBtn.disabled = false;
             runBtn.textContent = orig;
             var b = resp.body || {};
             if (!b.ok) {
               runStatus.textContent = b.error || 'Run failed';
-              runStatus.className = 'mt-2 text-xs text-rose-700';
+              runStatus.className = 'text-xs text-rose-700';
               return;
             }
             var bits = [
@@ -189,18 +318,47 @@
             ];
             if (b.accounts_skipped_no_seed) bits.push(b.accounts_skipped_no_seed + ' had no seed titles');
             runStatus.textContent = bits.join(' · ') + '. Reloading the queue…';
-            runStatus.className = 'mt-2 text-xs text-emerald-700';
+            runStatus.className = 'text-xs text-emerald-700';
             setTimeout(function () { window.location.reload(); }, 700);
           })
           .catch(function (err) {
+            stopElapsedTick();
             runBtn.disabled = false;
             runBtn.textContent = orig;
             runStatus.textContent = 'Network error: ' + (err && err.message ? err.message : 'unknown');
-            runStatus.className = 'mt-2 text-xs text-rose-700';
+            runStatus.className = 'text-xs text-rose-700';
           });
       });
 
-      // Add / Skip per row
+      function postAction(action, linkedin) {
+        return fetch('/prospecting/lookalike-targets/action', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ action: action, linkedin_url: linkedin }),
+        }).then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); });
+      }
+
+      function fadeOutRow(row, action) {
+        row.style.transition = 'opacity 0.3s';
+        row.style.opacity = '0';
+        setTimeout(function () {
+          row.remove();
+          // If the parent account card now has no rows left, drop it too
+          var card = row.closest('[data-account]');
+          if (card && !card.querySelector('[data-row]')) {
+            card.style.transition = 'opacity 0.3s';
+            card.style.opacity = '0';
+            setTimeout(function () { card.remove(); }, 300);
+          }
+        }, 300);
+        var pendEl = document.getElementById('count-pending');
+        var doneEl = document.getElementById('count-' + (action === 'add' ? 'added' : 'skipped'));
+        if (pendEl) pendEl.textContent = Math.max(0, parseInt(pendEl.textContent, 10) - 1);
+        if (doneEl) doneEl.textContent = parseInt(doneEl.textContent, 10) + 1;
+      }
+
+      // Per-row Add / Skip
       document.querySelectorAll('[data-row]').forEach(function (row) {
         var linkedin = row.getAttribute('data-linkedin');
         row.querySelectorAll('[data-action]').forEach(function (btn) {
@@ -209,36 +367,56 @@
             row.querySelectorAll('button').forEach(function (b) { b.disabled = true; });
             var orig = btn.textContent;
             btn.textContent = action === 'add' ? 'Adding…' : 'Skipping…';
-            fetch('/prospecting/lookalike-targets/action', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              credentials: 'same-origin',
-              body: JSON.stringify({ action: action, linkedin_url: linkedin }),
-            })
-              .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+            postAction(action, linkedin)
               .then(function (resp) {
                 var b = resp.body || {};
                 if (!b.ok) {
-                  row.querySelectorAll('button').forEach(function (b) { b.disabled = false; });
+                  row.querySelectorAll('button').forEach(function (bt) { bt.disabled = false; });
                   btn.textContent = orig;
                   alert(b.error || 'Action failed');
                   return;
                 }
-                // Fade the row out + update stats
-                row.style.transition = 'opacity 0.3s';
-                row.style.opacity = '0';
-                setTimeout(function () { row.remove(); }, 300);
-                var pendEl = document.getElementById('count-pending');
-                var doneEl = document.getElementById('count-' + (action === 'add' ? 'added' : 'skipped'));
-                if (pendEl) pendEl.textContent = Math.max(0, parseInt(pendEl.textContent, 10) - 1);
-                if (doneEl) doneEl.textContent = parseInt(doneEl.textContent, 10) + 1;
+                fadeOutRow(row, action);
               })
               .catch(function () {
-                row.querySelectorAll('button').forEach(function (b) { b.disabled = false; });
+                row.querySelectorAll('button').forEach(function (bt) { bt.disabled = false; });
                 btn.textContent = orig;
                 alert('Network error');
               });
           });
+        });
+      });
+
+      // Per-account "Add all" / "Skip all"
+      document.querySelectorAll('[data-account-action]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var action = btn.getAttribute('data-account-action') === 'add-all' ? 'add' : 'skip';
+          var card = btn.closest('[data-account]');
+          if (!card) return;
+          var rows = Array.from(card.querySelectorAll('[data-row]'));
+          if (rows.length === 0) return;
+          if (action === 'skip' && !confirm('Skip all ' + rows.length + ' candidates at this account?')) return;
+          btn.disabled = true;
+          var orig = btn.textContent;
+          btn.textContent = action === 'add' ? 'Adding all…' : 'Skipping all…';
+          // Run sequentially so we don't blast Draftboard's API in parallel.
+          var i = 0;
+          function next() {
+            if (i >= rows.length) {
+              btn.disabled = false;
+              btn.textContent = orig;
+              return;
+            }
+            var row = rows[i++];
+            var linkedin = row.getAttribute('data-linkedin');
+            postAction(action, linkedin)
+              .then(function (resp) {
+                if (resp.body && resp.body.ok) fadeOutRow(row, action);
+                next();
+              })
+              .catch(function () { next(); });
+          }
+          next();
         });
       });
     })();

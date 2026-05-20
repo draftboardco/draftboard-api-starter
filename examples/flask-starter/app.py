@@ -5757,18 +5757,29 @@ def db_lookalike_set_status(linkedin_url: str, new_status: str) -> bool:
         return cur.rowcount > 0
 
 
-def _lookalike_run_batch(target_count: int) -> dict:
+def _lookalike_run_batch(target_count: int, tag_filter: str = "") -> dict:
     """Run discovery across the user's account list until we've added
     `target_count` NEW pending candidates (or run out of accounts to
     scan). Round-robin by `lookalike_targets_last_account_idx` saved in
-    app_state so consecutive runs hit different accounts."""
+    app_state so consecutive runs hit different accounts.
+
+    When `tag_filter` is set, only accounts that have at least one
+    target carrying that tag get scanned. Lets the user constrain the
+    blast radius ("only auto-prospect on my Q2 target list").
+    """
     keys = _load_resolver_keys()
     if not (keys.get("apollo_api_key") or (keys.get("google_cse_api_key") and keys.get("google_cse_id"))):
         return {"ok": False, "error": "Need Apollo or Google CSE configured. Set up on /settings/integrations."}
 
     # Build the list of account keys from the user's targets. Each unique
-    # company name becomes one source account.
+    # company name becomes one source account. Optional tag filter
+    # narrows to only accounts where ≥1 target carries the tag.
     targets_all, _ = fetch_all_targets()
+    if tag_filter:
+        tagged_target_ids = db_target_ids_with_tag(tag_filter)
+        targets_all = [t for t in targets_all if t.get("id") in tagged_target_ids]
+        if not targets_all:
+            return {"ok": False, "error": f"No targets carry the tag '{tag_filter}'. Tag some targets first."}
     seen: set = set()
     account_keys: list[str] = []
     for t in targets_all:
@@ -5781,7 +5792,7 @@ def _lookalike_run_batch(target_count: int) -> dict:
         seen.add(k)
         account_keys.append(k)
     if not account_keys:
-        return {"ok": False, "error": "No accounts in your Draftboard data to scan. Add some targets first."}
+        return {"ok": False, "error": "No accounts to scan. Add some targets first."}
 
     # Round-robin index — start where we left off last run.
     try:
@@ -5874,16 +5885,61 @@ def _lookalike_run_batch(target_count: int) -> dict:
     }
 
 
+def _group_lookalikes_by_account(rows: list[dict], targets_all: list[dict]) -> list[dict]:
+    """Pivot the flat list into one entry per account, with the account's
+    candidates + the user's EXISTING targets at that account inline so
+    the user can see context without leaving the page.
+    """
+    # Index existing targets by normalized company name for fast lookup
+    targets_by_company: dict[str, list[dict]] = {}
+    for t in targets_all:
+        comp = (_target_company_with_fallback(t) or "").strip().lower()
+        if not comp:
+            continue
+        pos = t.get("position") or {}
+        first = (t.get("firstName") or "").strip()
+        last = (t.get("lastName") or "").strip()
+        name = (first + " " + last).strip()
+        targets_by_company.setdefault(comp, []).append({
+            "name": name or "(unnamed)",
+            "title": pos.get("title") or "",
+            "linkedin": t.get("linkedinUrl") or "",
+        })
+
+    by_account: dict[str, dict] = {}
+    for row in rows:
+        key = (row.get("account_key") or "").lower()
+        display = row.get("account_display_name") or key
+        if key not in by_account:
+            by_account[key] = {
+                "account_key": key,
+                "display_name": display,
+                "candidates": [],
+                "existing_targets": targets_by_company.get(key, []),
+            }
+        by_account[key]["candidates"].append(row)
+    # Sort accounts by candidate count desc (more interesting first)
+    return sorted(by_account.values(), key=lambda a: -len(a["candidates"]))
+
+
 @app.route("/prospecting/lookalike-targets", methods=["GET"])
 def prospecting_lookalike_targets_view():
-    """Standalone lookalike-targets page. Cadence picker + run button +
-    persistent discovery queue."""
+    """Standalone lookalike-targets page. Cadence picker + tag filter +
+    run button + persistent discovery queue grouped by account."""
     try:
         cadence = int(db_app_state_get("lookalike_targets_per_day") or LOOKALIKE_CADENCE_DEFAULT)
     except ValueError:
         cadence = LOOKALIKE_CADENCE_DEFAULT
     keys = _load_resolver_keys()
     keys_ready = bool(keys.get("apollo_api_key") or (keys.get("google_cse_api_key") and keys.get("google_cse_id")))
+
+    pending = db_lookalike_list("pending", limit=500)
+    added = db_lookalike_list("added", limit=200)
+    skipped = db_lookalike_list("skipped", limit=200)
+
+    targets_all, _ = fetch_all_targets()
+    pending_by_account = _group_lookalikes_by_account(pending, targets_all)
+
     return render_template(
         "lookalike_targets.html",
         active="prospecting_lookalike_targets",
@@ -5891,8 +5947,12 @@ def prospecting_lookalike_targets_view():
         cadence=cadence,
         cadence_options=LOOKALIKE_CADENCE_OPTIONS,
         keys_ready=keys_ready,
-        pending=db_lookalike_list("pending", limit=200),
+        pending_by_account=pending_by_account,
+        added_rows=added,
+        skipped_rows=skipped,
         counts=db_lookalike_counts(),
+        all_tags=db_all_tags_with_counts(),
+        current_tag=(db_app_state_get("lookalike_targets_tag_filter") or "").strip(),
     )
 
 
@@ -5915,16 +5975,27 @@ def prospecting_lookalike_save_cadence():
 @app.route("/prospecting/lookalike-targets/run", methods=["POST"])
 def prospecting_lookalike_run():
     """Synchronous v0: blocks the worker while we scan accounts. Small
-    cadences (10/30) finish in 20-60s typical. v1 wires this into a
+    cadences (10/30) finish in 20-90s typical. v1 wires this into a
     background job + a poll endpoint."""
     blocked = _reject_cross_site_form()
     if blocked is not None:
         return blocked
+    body = request.get_json(silent=True) or {}
     try:
         cadence = int(db_app_state_get("lookalike_targets_per_day") or LOOKALIKE_CADENCE_DEFAULT)
     except ValueError:
         cadence = LOOKALIKE_CADENCE_DEFAULT
-    result = _lookalike_run_batch(cadence)
+    tag_filter = (body.get("tag") or "").strip()
+    if not tag_filter:
+        return jsonify({
+            "ok": False,
+            "error": "Pick a tag to scope the scan to specific accounts. "
+                     "Whole-database scans aren't supported in this version.",
+        }), 400
+    # Persist the most recent tag filter so the page restores the
+    # selection on next visit.
+    db_app_state_set("lookalike_targets_tag_filter", tag_filter)
+    result = _lookalike_run_batch(cadence, tag_filter=tag_filter)
     return jsonify(result)
 
 
