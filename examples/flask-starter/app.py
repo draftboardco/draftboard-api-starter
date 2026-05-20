@@ -6535,6 +6535,204 @@ def tags_json():
     return jsonify({"tags": tags, "error": err})
 
 
+# Column order matches the production-app export spec
+# (Google Sheet 12zgxIPnqh6NQzXgLnGvAKD18wAeHh8LhWlvFCUY7RFg).
+# Fields the kit doesn't have access to from the Draftboard API ship
+# as empty cells so the column order stays consistent with whatever
+# downstream pipeline the customer is feeding this CSV into.
+_EXPORT_CSV_HEADERS = [
+    "Target First Name", "Target Last Name", "Target Headline",
+    "Target Primary Job Title", "Target LinkedIn Profile URL",
+    "Account Name", "Account Website", "Account LinkedIn URL",
+    "Connection First Name", "Connection Last Name",
+    "Connection Primary Job Title", "Connection Headline",
+    "Connection LinkedIn Profile URL",
+    "Educational Institution Overlap Name",
+    "Educational Institution Overlap Length (months)",
+    "Educational Institution Overlap End Date (Year)",
+    "Educational Institution Overlap Location",
+    "Work Overlap 1 Name", "Work Overlap 1 Length (months)",
+    "Work Overlap 1 End Date (Year)", "Work Overlap 1 End Location",
+    "Work Overlap 2 Name", "Work Overlap 2 Length (months)",
+    "Work Overlap 2 End Date (Year)", "Work Overlap 2 End Location",
+    "Work Overlap 3 Name", "Work Overlap 3 Length (months)",
+    "Work Overlap 3 End Date (Year)", "Work Overlap 3 End Location",
+    "Mutual Connections", "Team Member Owner Full Name",
+    "Relationship Score", "Connection is Supporter",
+    "Connection is Team Member Supporter", "Draftboard Tags",
+    "Draftboard Date Added", "Connection Degree",
+]
+
+
+def _parse_scoredetails_for_csv(details: list) -> tuple[str, list[tuple], str]:
+    """Best-effort extract structured (school, work_overlaps, mutuals)
+    from the human-readable scoreDetails strings the Draftboard API
+    returns. Re-uses the existing card-rendering regexes.
+
+    Returns (school_name, [(company, months, year, location), ...] up to
+    3 work overlaps, mutual_count_str).
+    """
+    school = ""
+    works: list[tuple[str, str, str, str]] = []
+    mutuals = ""
+    for d in details or []:
+        if not isinstance(d, str):
+            continue
+        m = _OVERLAP_RE.match(d)
+        if m:
+            company = (m.group(2) or "").strip()
+            duration_str = (m.group(1) or "")
+            months_m = re.search(r"(\d+)\s*months?", duration_str)
+            months = months_m.group(1) if months_m else ""
+            tail = " ".join(filter(None, [m.group(3) or "", m.group(4) or ""]))
+            year_m = re.search(r"\b(\d{4})\b", tail)
+            year = year_m.group(1) if year_m else ""
+            location = (m.group(3) or "").strip()
+            works.append((company, months, year, location))
+            continue
+        m = _SCHOOL_RE.match(d)
+        if m and not school:
+            school = (m.group(1) or "").strip()
+            continue
+        m = _MUTUALS_RE.match(d)
+        if m and not mutuals:
+            mutuals = m.group(1) or ""
+    # Pad to exactly 3 work-overlap slots
+    while len(works) < 3:
+        works.append(("", "", "", ""))
+    return school, works[:3], mutuals
+
+
+@app.route("/export/targets.csv", methods=["GET"])
+def export_targets_csv():
+    """Stream a CSV with one row per (target × connection) path. Column
+    schema matches the production-app spec (see _EXPORT_CSV_HEADERS).
+
+    Targets without any cached connections still emit one row so the user
+    sees every target in their workspace - they can re-sync paths and
+    re-export when ready.
+    """
+    if not _current_api_key():
+        return jsonify({"ok": False, "error": "DRAFTBOARD_API_KEY required to export"}), 400
+
+    targets, err = fetch_all_targets()
+    if err:
+        return jsonify({"ok": False, "error": f"failed to load targets: {err}"}), 502
+
+    tags_map = db_target_tags_map()
+    supporter_urls_norm = db_manual_supporter_urls_norm()
+
+    # Owner attribution per target (which Draftboard customer "owns" the
+    # path). Captured from each connection sync into target_owners.
+    owners_map: dict[str, list[str]] = {}
+    upload_dates_map: dict[str, str] = {}
+    with _db_lock, _db_connect() as conn:
+        for tid, of, ol in conn.execute(
+            "SELECT target_id, owner_first, owner_last FROM target_owners"
+        ).fetchall():
+            full = f"{(of or '').strip()} {(ol or '').strip()}".strip()
+            if full:
+                owners_map.setdefault(tid, []).append(full)
+        for tid, tag in conn.execute(
+            "SELECT target_id, tag FROM target_tags WHERE tag_type = 'upload_date'"
+        ).fetchall():
+            # One upload-date per target by design; last write wins if
+            # somehow there are duplicates.
+            upload_dates_map[tid] = tag
+
+    import csv as _csv
+    import io as _io
+    buf = _io.StringIO()
+    writer = _csv.writer(buf)
+    writer.writerow(_EXPORT_CSV_HEADERS)
+
+    rows_written = 0
+    for t in targets:
+        tid = t.get("id")
+        if not tid:
+            continue
+        t_first = (t.get("firstName") or "").strip()
+        t_last = (t.get("lastName") or "").strip()
+        t_pos = t.get("position") or {}
+        t_title = (t_pos.get("title") or "").strip()
+        t_company = (t_pos.get("companyName") or "").strip()
+        t_linkedin = (t.get("linkedinUrl") or "").strip()
+        owners = ", ".join(owners_map.get(tid, []))
+        tag_list = tags_map.get(tid, []) or []
+        # Filter out date tags from the user-tag list
+        tags_str = "; ".join([t for t in tag_list if t])
+        date_added = upload_dates_map.get(tid, "")
+
+        # Read cached connections — don't trigger fetches (this endpoint
+        # would otherwise spend minutes hitting the Draftboard API).
+        conns_data, _, _ = db_get_connections(tid)
+        conns = conns_data or []
+
+        if not conns:
+            # Target row with empty connection columns so the export
+            # still surfaces the target itself.
+            writer.writerow([
+                t_first, t_last, "",
+                t_title, t_linkedin,
+                t_company, "", "",
+                "", "", "", "", "",
+                "", "", "", "",
+                "", "", "", "",
+                "", "", "", "",
+                "", "", "", "",
+                "", owners, "", "no", "no",
+                tags_str, date_added, "",
+            ])
+            rows_written += 1
+            continue
+
+        for c in conns:
+            c_first = (c.get("firstName") or "").strip()
+            c_last = (c.get("lastName") or "").strip()
+            c_pos = c.get("position") or {}
+            c_title = (c_pos.get("title") or "").strip()
+            c_linkedin = (c.get("linkedinUrl") or "").strip()
+            c_norm = _normalize_linkedin(c_linkedin)
+            is_supporter = "yes" if c_norm and c_norm in supporter_urls_norm else "no"
+            score = c.get("score") or 0
+
+            school, works, mutuals = _parse_scoredetails_for_csv(c.get("scoreDetails") or [])
+
+            writer.writerow([
+                t_first, t_last, "",
+                t_title, t_linkedin,
+                t_company, "", "",
+                c_first, c_last,
+                c_title, "",
+                c_linkedin,
+                school, "", "", "",
+                works[0][0], works[0][1], works[0][2], works[0][3],
+                works[1][0], works[1][1], works[1][2], works[1][3],
+                works[2][0], works[2][1], works[2][2], works[2][3],
+                mutuals,
+                owners,
+                score,
+                is_supporter,
+                "no",  # team-member-supporter distinction not surfaced in kit
+                tags_str,
+                date_added,
+                "",  # connection degree not exposed by API
+            ])
+            rows_written += 1
+
+    csv_data = buf.getvalue()
+    filename = f"draftboard-targets-export-{time.strftime('%Y-%m-%d')}.csv"
+    from flask import Response
+    return Response(
+        csv_data,
+        mimetype="text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Rows-Exported": str(rows_written),
+        },
+    )
+
+
 @app.route("/target/<target_id>/drawer", methods=["GET"])
 def target_drawer(target_id):
     """HTML fragment: target detail drawer with paths to this target."""
