@@ -11122,6 +11122,32 @@ def _resolver_status(keys: dict) -> dict:
     }
 
 
+@app.route("/settings/integrations", methods=["GET"])
+def settings_integrations_view():
+    """Unified integrations page. One card per third-party service the kit
+    talks to — API-key ones (Apollo / OpenAI / Google CSE / Scrupp) get
+    an inline paste-key form; OAuth/webhook ones (Google Workspace,
+    Slack) link to their existing config pages; the outbound stack
+    (HeyReach, Smartlead, Instantly) is stubbed for a future build."""
+    keys = _load_resolver_keys()
+    gstat = google_status()
+    slack_webhook_set = bool(db_get_slack_config("webhook_url"))
+    return render_template(
+        "settings_integrations.html",
+        active="settings_integrations",
+        keys_present={
+            "apollo": bool(keys.get("apollo_api_key")),
+            "openai": bool(keys.get("openai_api_key")),
+            "cse_key": bool(keys.get("google_cse_api_key")),
+            "cse_id": bool(keys.get("google_cse_id")),
+            "scrupp": bool(keys.get("scrupp_api_key")),
+        },
+        google_connected=bool(gstat.get("account_email")),
+        google_email=gstat.get("account_email") or "",
+        slack_connected=slack_webhook_set,
+    )
+
+
 @app.route("/settings/api-keys", methods=["GET"])
 def api_keys_settings():
     """Render the API-keys paste form. These keys power LinkedIn resolution,

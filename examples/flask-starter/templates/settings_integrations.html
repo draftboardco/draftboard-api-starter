@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Draftboard — Integrations</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+  <div class="max-w-5xl mx-auto px-6 py-10">
+    {% include "_nav.html" %}
+
+    <header class="mb-6">
+      <h1 class="text-2xl font-semibold tracking-tight">Integrations</h1>
+      <p class="text-sm text-slate-500 mt-1">
+        Third-party services the kit talks to. Each card carries its own status + setup flow. The kit works without any of them — but more integrations means more features unlock.
+      </p>
+    </header>
+
+    <div id="status-banner" class="mb-4"></div>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+
+      {# ---------- APOLLO ---------- #}
+      <section class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm flex flex-col" data-card data-field="apollo_api_key">
+        <header class="flex items-center justify-between mb-2">
+          <div>
+            <h2 class="text-base font-semibold text-slate-900">Apollo</h2>
+            <p class="text-xs text-slate-500 mt-0.5">LinkedIn resolution + people search for prospecting.</p>
+          </div>
+          <span class="text-xs px-2 py-0.5 rounded-full {% if keys_present.apollo %}bg-emerald-50 text-emerald-800 border border-emerald-200{% else %}bg-slate-100 text-slate-500 border border-slate-200{% endif %}">
+            {% if keys_present.apollo %}✓ Connected{% else %}Not set up{% endif %}
+          </span>
+        </header>
+        <p class="text-xs text-slate-500 mb-2">
+          <a class="underline" href="https://www.apollo.io/sign-up" target="_blank" rel="noopener">Sign up at apollo.io</a> · Settings → Integrations → API · copy your key.
+        </p>
+        <div class="flex items-center gap-2 mt-auto">
+          <input type="password" data-keyinput autocomplete="off"
+                 placeholder="{% if keys_present.apollo %}•••••••• (paste to replace){% else %}paste Apollo API key{% endif %}"
+                 class="flex-1 text-sm rounded-md border border-slate-300 px-2.5 py-1.5 font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500" />
+          <button type="button" data-savebtn class="text-xs px-3 py-1.5 rounded-md bg-indigo-600 hover:bg-indigo-700 text-white font-medium">Save</button>
+        </div>
+        <p data-status class="mt-1.5 text-[11px]"></p>
+      </section>
+
+      {# ---------- OPENAI ---------- #}
+      <section class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm flex flex-col" data-card data-field="openai_api_key">
+        <header class="flex items-center justify-between mb-2">
+          <div>
+            <h2 class="text-base font-semibold text-slate-900">OpenAI</h2>
+            <p class="text-xs text-slate-500 mt-0.5">gpt-4o-mini for prospecting, lookalikes, LinkedIn resolution.</p>
+          </div>
+          <span class="text-xs px-2 py-0.5 rounded-full {% if keys_present.openai %}bg-emerald-50 text-emerald-800 border border-emerald-200{% else %}bg-slate-100 text-slate-500 border border-slate-200{% endif %}">
+            {% if keys_present.openai %}✓ Connected{% else %}Not set up{% endif %}
+          </span>
+        </header>
+        <p class="text-xs text-slate-500 mb-2">
+          <a class="underline" href="https://platform.openai.com/api-keys" target="_blank" rel="noopener">Create a key at platform.openai.com/api-keys</a>. Costs ~$0.0001 per lookup.
+        </p>
+        <div class="flex items-center gap-2 mt-auto">
+          <input type="password" data-keyinput autocomplete="off"
+                 placeholder="{% if keys_present.openai %}•••••••• (paste to replace){% else %}sk-…{% endif %}"
+                 class="flex-1 text-sm rounded-md border border-slate-300 px-2.5 py-1.5 font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500" />
+          <button type="button" data-savebtn class="text-xs px-3 py-1.5 rounded-md bg-indigo-600 hover:bg-indigo-700 text-white font-medium">Save</button>
+        </div>
+        <p data-status class="mt-1.5 text-[11px]"></p>
+      </section>
+
+      {# ---------- SCRUPP ---------- #}
+      <section class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm flex flex-col" data-card data-field="scrupp_api_key">
+        <header class="flex items-center justify-between mb-2">
+          <div>
+            <h2 class="text-base font-semibold text-slate-900">Scrupp</h2>
+            <p class="text-xs text-slate-500 mt-0.5">Scrapes Sales Navigator search URLs into Draftboard targets.</p>
+          </div>
+          <span class="text-xs px-2 py-0.5 rounded-full {% if keys_present.scrupp %}bg-emerald-50 text-emerald-800 border border-emerald-200{% else %}bg-slate-100 text-slate-500 border border-slate-200{% endif %}">
+            {% if keys_present.scrupp %}✓ Connected{% else %}Not set up{% endif %}
+          </span>
+        </header>
+        <p class="text-xs text-slate-500 mb-2">
+          <a class="underline" href="https://scrupp.com" target="_blank" rel="noopener">Sign up at scrupp.com</a> · free tier: 500 leads/month, no credit card.
+        </p>
+        <div class="flex items-center gap-2 mt-auto">
+          <input type="password" data-keyinput autocomplete="off"
+                 placeholder="{% if keys_present.scrupp %}•••••••• (paste to replace){% else %}paste Scrupp API key{% endif %}"
+                 class="flex-1 text-sm rounded-md border border-slate-300 px-2.5 py-1.5 font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500" />
+          <button type="button" data-savebtn class="text-xs px-3 py-1.5 rounded-md bg-indigo-600 hover:bg-indigo-700 text-white font-medium">Save</button>
+        </div>
+        <p data-status class="mt-1.5 text-[11px]"></p>
+      </section>
+
+      {# ---------- GOOGLE CSE (two fields - simpler to handle separately) ---------- #}
+      <section class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm flex flex-col">
+        <header class="flex items-center justify-between mb-2">
+          <div>
+            <h2 class="text-base font-semibold text-slate-900">Google Custom Search</h2>
+            <p class="text-xs text-slate-500 mt-0.5">Fallback LinkedIn resolver when Apollo misses.</p>
+          </div>
+          <span class="text-xs px-2 py-0.5 rounded-full {% if keys_present.cse_key and keys_present.cse_id %}bg-emerald-50 text-emerald-800 border border-emerald-200{% else %}bg-slate-100 text-slate-500 border border-slate-200{% endif %}">
+            {% if keys_present.cse_key and keys_present.cse_id %}✓ Connected{% else %}Not set up{% endif %}
+          </span>
+        </header>
+        <p class="text-xs text-slate-500 mb-2">
+          Multi-step setup. Open the <a class="underline" href="/settings/api-keys" target="_blank">full guide on the API keys page</a> (Programmable Search Engine + Cloud Console).
+        </p>
+        <a href="/settings/api-keys" class="mt-auto text-xs text-center px-3 py-1.5 rounded-md border border-slate-300 bg-white hover:bg-slate-50 text-slate-700">
+          {% if keys_present.cse_key and keys_present.cse_id %}Manage CSE keys →{% else %}Set up CSE →{% endif %}
+        </a>
+      </section>
+
+      {# ---------- GOOGLE WORKSPACE (OAuth) ---------- #}
+      <section class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm flex flex-col">
+        <header class="flex items-center justify-between mb-2">
+          <div>
+            <h2 class="text-base font-semibold text-slate-900">Google Workspace</h2>
+            <p class="text-xs text-slate-500 mt-0.5">One-time read of Gmail + Calendar to rank supporter candidates.</p>
+          </div>
+          <span class="text-xs px-2 py-0.5 rounded-full {% if google_connected %}bg-emerald-50 text-emerald-800 border border-emerald-200{% else %}bg-slate-100 text-slate-500 border border-slate-200{% endif %}">
+            {% if google_connected %}✓ Connected{% else %}Not connected{% endif %}
+          </span>
+        </header>
+        <p class="text-xs text-slate-500 mb-2">
+          {% if google_connected %}
+            Connected as <strong>{{ google_email }}</strong>. Click Manage to re-sync or disconnect.
+          {% else %}
+            Authorize the kit to read your Gmail + Calendar once. Token isn't stored — used + thrown away in a single sync.
+          {% endif %}
+        </p>
+        <a href="/settings/google" class="mt-auto text-xs text-center px-3 py-1.5 rounded-md border border-slate-300 bg-white hover:bg-slate-50 text-slate-700">
+          {% if google_connected %}Manage Google →{% else %}Connect Google →{% endif %}
+        </a>
+      </section>
+
+      {# ---------- SLACK ---------- #}
+      <section class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm flex flex-col">
+        <header class="flex items-center justify-between mb-2">
+          <div>
+            <h2 class="text-base font-semibold text-slate-900">Slack</h2>
+            <p class="text-xs text-slate-500 mt-0.5">Outbound notifications when teammates take action on intros.</p>
+          </div>
+          <span class="text-xs px-2 py-0.5 rounded-full {% if slack_connected %}bg-emerald-50 text-emerald-800 border border-emerald-200{% else %}bg-slate-100 text-slate-500 border border-slate-200{% endif %}">
+            {% if slack_connected %}✓ Connected{% else %}Not set up{% endif %}
+          </span>
+        </header>
+        <p class="text-xs text-slate-500 mb-2">
+          Uses an incoming-webhook URL from your Slack workspace. Setup is in the dedicated Slack page (channels + test-message tooling).
+        </p>
+        <a href="/settings/slack" class="mt-auto text-xs text-center px-3 py-1.5 rounded-md border border-slate-300 bg-white hover:bg-slate-50 text-slate-700">
+          {% if slack_connected %}Manage Slack →{% else %}Set up Slack →{% endif %}
+        </a>
+      </section>
+
+      {# ---------- COMING SOON: HeyReach ---------- #}
+      <section class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm flex flex-col opacity-75">
+        <header class="flex items-center justify-between mb-2">
+          <div>
+            <h2 class="text-base font-semibold text-slate-900">HeyReach</h2>
+            <p class="text-xs text-slate-500 mt-0.5">Auto-DM supporters on LinkedIn to ask for intros.</p>
+          </div>
+          <span class="text-xs px-2 py-0.5 rounded-full bg-amber-50 text-amber-800 border border-amber-200">Coming soon</span>
+        </header>
+        <p class="text-xs text-slate-500 mb-2">
+          Generate a personalized DM per supporter (mentioning which targets you'd like intros to), schedule via HeyReach, track replies.
+        </p>
+      </section>
+
+      {# ---------- COMING SOON: Smartlead ---------- #}
+      <section class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm flex flex-col opacity-75">
+        <header class="flex items-center justify-between mb-2">
+          <div>
+            <h2 class="text-base font-semibold text-slate-900">Smartlead</h2>
+            <p class="text-xs text-slate-500 mt-0.5">Cold-email-style campaigns sent to supporters' emails.</p>
+          </div>
+          <span class="text-xs px-2 py-0.5 rounded-full bg-amber-50 text-amber-800 border border-amber-200">Coming soon</span>
+        </header>
+        <p class="text-xs text-slate-500 mb-2">
+          Same value as HeyReach but over email — needs Apollo enrichment to find supporter emails first.
+        </p>
+      </section>
+
+      {# ---------- COMING SOON: Instantly ---------- #}
+      <section class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm flex flex-col opacity-75">
+        <header class="flex items-center justify-between mb-2">
+          <div>
+            <h2 class="text-base font-semibold text-slate-900">Instantly</h2>
+            <p class="text-xs text-slate-500 mt-0.5">Smartlead alternative; same shape, same workflow.</p>
+          </div>
+          <span class="text-xs px-2 py-0.5 rounded-full bg-amber-50 text-amber-800 border border-amber-200">Coming soon</span>
+        </header>
+        <p class="text-xs text-slate-500 mb-2">
+          Pick either Instantly or Smartlead; both ship with the same campaign UI on top of their respective APIs.
+        </p>
+      </section>
+
+    </div>
+
+    <footer class="mt-10 text-xs text-slate-400 text-center">
+      Draftboard API starter · Integrations
+    </footer>
+  </div>
+
+  <script>
+    (function () {
+      // Generic save handler for the API-key cards. Each card has
+      // data-field="apollo_api_key" etc.; the handler reads that field
+      // name + the input value and POSTs to /settings/api-keys.
+      var banner = document.getElementById('status-banner');
+      function escapeHtml(s) {
+        return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+          return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
+        });
+      }
+      document.querySelectorAll('[data-card]').forEach(function (card) {
+        var field = card.getAttribute('data-field');
+        var input = card.querySelector('[data-keyinput]');
+        var btn = card.querySelector('[data-savebtn]');
+        var status = card.querySelector('[data-status]');
+        if (!field || !input || !btn) return;
+        btn.addEventListener('click', function () {
+          var v = (input.value || '').trim();
+          if (!v) {
+            status.textContent = 'Paste a key first.';
+            status.className = 'mt-1.5 text-[11px] text-rose-700';
+            return;
+          }
+          btn.disabled = true;
+          var orig = btn.textContent;
+          btn.textContent = 'Saving…';
+          status.textContent = '';
+          var body = {};
+          body[field] = v;
+          fetch('/settings/api-keys', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
+            body: JSON.stringify(body),
+          })
+            .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+            .then(function (resp) {
+              btn.disabled = false;
+              btn.textContent = orig;
+              var b = resp.body || {};
+              if (!b.ok) {
+                status.textContent = b.error || 'Save failed';
+                status.className = 'mt-1.5 text-[11px] text-rose-700';
+                return;
+              }
+              status.textContent = '✓ Saved. Reloading…';
+              status.className = 'mt-1.5 text-[11px] text-emerald-700';
+              setTimeout(function () { window.location.reload(); }, 400);
+            })
+            .catch(function (err) {
+              btn.disabled = false;
+              btn.textContent = orig;
+              status.textContent = 'Network error: ' + (err && err.message ? err.message : 'unknown');
+              status.className = 'mt-1.5 text-[11px] text-rose-700';
+            });
+        });
+      });
+    })();
+  </script>
+</body>
+</html>
