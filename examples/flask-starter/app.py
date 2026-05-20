@@ -4487,41 +4487,328 @@ def import_form():
     )
 
 
+# =====================================================================
+# CSV upload (Add targets + Add supporters)
+# =====================================================================
+# Both CSV flows reuse the same parser:
+#   1. Read upload as utf-8-sig (handles Excel's BOM-prefixed exports).
+#   2. Find the LinkedIn URL column by header-name OR by content-sniffing
+#      the first non-empty cell of each column.
+#   3. Feed all cell values through normalize_linkedin_urls which already
+#      handles http/https/www/slug-only/trailing-slash + dedupes.
+#
+# Why content-sniff after header-match: real-world CSVs from Apollo,
+# Sales Nav exports, LinkedIn data downloads, and HubSpot all use
+# different column names. Sniffing is the safety net when the header is
+# something we haven't seen before (e.g. "URL" or "Person LinkedIn").
+
+# Synonyms we accept for the LinkedIn URL header. Matched case-
+# insensitively after stripping punctuation, so "LinkedIn URL",
+# "linkedinurl", and "LinkedIn-URL" all hit.
+_CSV_LINKEDIN_HEADER_SYNONYMS = {
+    "linkedin", "linkedin url", "linkedin profile", "linkedin profile url",
+    "profile url", "profile", "profile link", "li url",
+    "linkedinurl", "linkedinprofile", "linkedinprofileurl",
+    "linkedin_url", "linkedin_profile", "linkedin_profile_url",
+    "profile_url", "profileurl",
+    # Sales Nav exports
+    "sales nav url", "sales navigator url",
+    # Apollo
+    "linkedin url 1", "person linkedin url",
+}
+
+
+def _csv_detect_linkedin_column(headers: list[str], sniff_rows: list[list[str]]) -> tuple[int | None, str]:
+    """Find which column contains LinkedIn URLs. Returns (column_index,
+    detection_method). Pass 1 matches header synonyms; pass 2 sniffs
+    cell contents for the linkedin.com/in/ pattern across the first
+    handful of rows.
+    """
+    norm_headers = [
+        re.sub(r"[^\w\s]", " ", (h or "").lower()).strip()
+        for h in headers
+    ]
+    # Pass 1: exact-synonym header match.
+    for i, h in enumerate(norm_headers):
+        if h in _CSV_LINKEDIN_HEADER_SYNONYMS:
+            return i, f"header '{headers[i]}' matched"
+    # Pass 1b: substring match — "person_linkedin", "linkedin_url_1", etc.
+    for i, h in enumerate(norm_headers):
+        if "linkedin" in h or "profile url" in h or "profile_url" in h:
+            return i, f"header '{headers[i]}' contains 'linkedin' / 'profile_url'"
+    # Pass 2: sniff cell contents.
+    for col in range(len(headers)):
+        for row in sniff_rows:
+            if col < len(row):
+                cell = (row[col] or "").lower()
+                if "linkedin.com/in/" in cell:
+                    return col, f"sniffed column {col} for linkedin.com/in/ in cell content"
+    return None, "no LinkedIn column found in headers or first rows"
+
+
+def _csv_detect_name_column(headers: list[str]) -> int | None:
+    """Find a 'name' column for supporter imports. Returns index or
+    None — name is optional, the kit can render the LinkedIn slug if
+    we don't find one."""
+    norm = [
+        re.sub(r"[^\w\s]", " ", (h or "").lower()).strip()
+        for h in headers
+    ]
+    # Prefer full name; fall back to first+last.
+    for i, h in enumerate(norm):
+        if h in ("name", "full name", "fullname", "display name", "displayname"):
+            return i
+    for i, h in enumerate(norm):
+        if "name" in h and "first" not in h and "last" not in h:
+            return i
+    return None
+
+
+def _parse_csv_for_linkedin(file_storage) -> tuple[list[dict], dict]:
+    """Read uploaded CSV, find the LinkedIn URL column, return cleaned
+    rows. Each returned row is {linkedin_url, display_name?}.
+
+    Returns (rows, meta) where meta has:
+      detected_column     - the column header we picked
+      detection_method    - "header '...' matched" or "sniffed column ..."
+      name_column         - the column header we picked for display_name (or None)
+      total_rows          - total data rows (excluding header)
+      kept_rows           - rows that produced a valid LinkedIn URL
+      error               - present iff we couldn't parse
+    """
+    import csv as _csv
+    import io as _io
+    try:
+        raw = file_storage.read().decode("utf-8-sig", errors="replace")
+    except Exception as e:  # noqa: BLE001
+        return [], {"error": f"Couldn't read upload: {type(e).__name__}"}
+    if not raw.strip():
+        return [], {"error": "CSV is empty."}
+
+    reader = _csv.reader(_io.StringIO(raw))
+    all_rows = list(reader)
+    if not all_rows:
+        return [], {"error": "CSV has no rows."}
+
+    headers = all_rows[0]
+    body = all_rows[1:]
+    if not body:
+        return [], {"error": "CSV only contains a header row."}
+
+    sniff = body[:10]  # first 10 data rows used for content-sniff fallback
+    col_idx, method = _csv_detect_linkedin_column(headers, sniff)
+    if col_idx is None:
+        return [], {
+            "error": "Couldn't find a LinkedIn URL column. Headers we saw: "
+                     + ", ".join(repr(h) for h in headers[:10])
+        }
+
+    name_idx = _csv_detect_name_column(headers)
+
+    # Feed all cell values through normalize_linkedin_urls, which handles
+    # every URL variant + dedupes. We process row-by-row so we can pair
+    # each canonical URL with its display name on the same row.
+    out_rows: list[dict] = []
+    seen_norm: set = set()
+    for row in body:
+        if col_idx >= len(row):
+            continue
+        raw_url = (row[col_idx] or "").strip()
+        if not raw_url:
+            continue
+        # normalize_linkedin_urls expects free text + returns canonical URLs
+        canonical = normalize_linkedin_urls(raw_url)
+        if not canonical:
+            continue
+        url = canonical[0]
+        norm = _normalize_linkedin(url)
+        if not norm or norm in seen_norm:
+            continue
+        seen_norm.add(norm)
+        display_name = ""
+        if name_idx is not None and name_idx < len(row):
+            display_name = (row[name_idx] or "").strip()
+        out_rows.append({
+            "linkedin_url": url,
+            "display_name": display_name,
+        })
+
+    return out_rows, {
+        "detected_column": headers[col_idx],
+        "detection_method": method,
+        "name_column": headers[name_idx] if name_idx is not None else None,
+        "total_rows": len(body),
+        "kept_rows": len(out_rows),
+    }
+
+
 @app.route("/add/targets/csv", methods=["GET"])
-def add_targets_csv_stub():
-    """Stub page for the future CSV-upload-targets feature."""
+def add_targets_csv_view():
     return render_template(
-        "hub_stub.html",
+        "add_data_csv.html",
         active="add_targets",
         hub_tabs=_hub_tabs_for_targets("csv"),
         hub_title="Add targets",
         hub_intro="Pick how you want to add new prospects to your Draftboard workspace.",
-        feature_title="Upload CSV (coming soon)",
+        feature_title="Upload a CSV",
         feature_body=(
-            "Drop in a CSV exported from LinkedIn Sales Navigator, Apollo, or "
-            "any other prospect tool. We'll match the columns we need "
-            "(LinkedIn URL, name, company) and import each row as a target. "
-            "Use Paste URLs or Sales Navigator for now."
+            "Drop in a CSV from Apollo, Sales Nav, HubSpot, or any other tool. "
+            "We auto-detect the LinkedIn URL column and import each row as a "
+            "Draftboard target."
         ),
+        upload_endpoint="/add/targets/csv/upload",
+        result_link_label="View your Targets",
+        result_link_url="/",
+        accepts_tags=True,
+        accepts_teammate=False,
     )
 
 
 @app.route("/add/supporters/csv", methods=["GET"])
-def add_supporters_csv_stub():
+def add_supporters_csv_view():
     return render_template(
-        "hub_stub.html",
+        "add_data_csv.html",
         active="add_supporters",
         hub_tabs=_hub_tabs_for_supporters("csv"),
         hub_title="Add supporters",
         hub_intro="Pick how you want to identify the people in your network most likely to make warm intros.",
-        feature_title="Upload CSV (coming soon)",
+        feature_title="Upload a CSV",
         feature_body=(
-            "Drop in a CSV of supporter contacts (LinkedIn URL + display "
-            "name, optionally tagged to a teammate). We'll bulk-create the "
-            "manual_supporters rows in one shot. Use Type names or Paste URLs "
-            "in the meantime."
+            "Drop in a CSV of supporter contacts (LinkedIn URL + optional name). "
+            "We bulk-mark each as a supporter so they show up with the ⭐ badge."
         ),
+        upload_endpoint="/add/supporters/csv/upload",
+        result_link_label="View your supporters",
+        result_link_url="/add/supporters/scan",
+        accepts_tags=False,
+        accepts_teammate=True,
+        owners=db_unique_owners(),
     )
+
+
+@app.route("/add/targets/csv/upload", methods=["POST"])
+def add_targets_csv_upload():
+    """Take an uploaded CSV → extract LinkedIn URLs → POST to Draftboard's
+    /targets/import. Same end behavior as the paste-URLs flow."""
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+    upload = request.files.get("csv_file")
+    if not upload or not upload.filename:
+        return jsonify({"ok": False, "error": "No file uploaded."}), 400
+    rows, meta = _parse_csv_for_linkedin(upload)
+    if meta.get("error"):
+        return jsonify({"ok": False, "error": meta["error"], "meta": meta}), 400
+    if not rows:
+        return jsonify({
+            "ok": False,
+            "error": "Parsed CSV but found no valid LinkedIn URLs.",
+            "meta": meta,
+        }), 400
+    if not _current_api_key():
+        return jsonify({
+            "ok": False,
+            "error": "DRAFTBOARD_API_KEY not set. Add it before importing.",
+            "meta": meta,
+        }), 400
+
+    tags_raw = request.form.get("tags", "")
+    tags = [t.strip() for t in re.split(r"[\n,]+", tags_raw or "") if t.strip()]
+
+    urls = [r["linkedin_url"] for r in rows]
+    payload = {"linkedinUrls": urls}
+    if tags:
+        payload["tags"] = tags
+    try:
+        r = requests.post(
+            f"{API_BASE}/targets/import",
+            headers=_auth_headers(),
+            json=payload,
+            timeout=60,
+        )
+    except requests.RequestException as e:
+        return jsonify({"ok": False, "error": f"Network error reaching Draftboard: {type(e).__name__}", "meta": meta}), 502
+    try:
+        data = r.json()
+    except ValueError:
+        data = {"raw": r.text}
+    if r.status_code != 200:
+        return jsonify({
+            "ok": False,
+            "error": f"Draftboard /targets/import returned {r.status_code}",
+            "detail": data,
+            "meta": meta,
+        }), r.status_code
+    return jsonify({
+        "ok": True,
+        "meta": meta,
+        "imported": data.get("imported"),
+        "notImported": data.get("notImported"),
+        "errors": data.get("errors") or [],
+        "tags_used": tags,
+        "submitted": len(urls),
+    })
+
+
+@app.route("/add/supporters/csv/upload", methods=["POST"])
+def add_supporters_csv_upload():
+    """Take an uploaded CSV → extract LinkedIn URLs + names → write to
+    manual_supporters with source='csv'."""
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+    upload = request.files.get("csv_file")
+    if not upload or not upload.filename:
+        return jsonify({"ok": False, "error": "No file uploaded."}), 400
+    rows, meta = _parse_csv_for_linkedin(upload)
+    if meta.get("error"):
+        return jsonify({"ok": False, "error": meta["error"], "meta": meta}), 400
+    if not rows:
+        return jsonify({
+            "ok": False,
+            "error": "Parsed CSV but found no valid LinkedIn URLs.",
+            "meta": meta,
+        }), 400
+
+    # Optional teammate attribution. The form posts owner_id; resolve to
+    # the matching teammate's name + email for downstream attribution.
+    teammate_email = ""
+    teammate_name = ""
+    owner_id = (request.form.get("teammate") or "").strip()
+    if owner_id:
+        for o in db_unique_owners():
+            if str(o.get("owner_id") or "") == owner_id:
+                teammate_email = o.get("owner_email") or ""
+                teammate_name = o.get("owner_name") or ""
+                break
+
+    added = 0
+    skipped_existing = 0
+    errors: list[str] = []
+    for row in rows:
+        url = row["linkedin_url"]
+        was_new, err = db_manual_supporter_upsert(
+            linkedin_url_raw=url,
+            display_name=row.get("display_name") or "",
+            teammate_email=teammate_email,
+            teammate_name=teammate_name,
+            source="csv",
+        )
+        if err:
+            errors.append(f"{url}: {err}")
+            continue
+        if was_new:
+            added += 1
+        else:
+            skipped_existing += 1
+    return jsonify({
+        "ok": True,
+        "meta": meta,
+        "added": added,
+        "already_supporter": skipped_existing,
+        "errors": errors,
+        "teammate_name": teammate_name,
+    })
 
 
 @app.route("/import/supporters", methods=["GET", "POST"])

@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Draftboard — {{ hub_title }} · Upload CSV</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    {% include "_nav.html" %}
+
+    <header class="mb-4">
+      <h1 class="text-2xl font-semibold tracking-tight">{{ hub_title }}</h1>
+      <p class="text-sm text-slate-500 mt-1">{{ hub_intro }}</p>
+    </header>
+
+    {% include "_hub_tabs.html" %}
+
+    <section class="mb-6">
+      <h2 class="text-sm font-semibold text-slate-900 mb-1">{{ feature_title }}</h2>
+      <p class="text-xs text-slate-500">{{ feature_body }}</p>
+    </section>
+
+    <section class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm">
+      <div class="space-y-4">
+        <label class="block">
+          <span class="text-xs uppercase tracking-wider text-slate-500">CSV file</span>
+          <input type="file" id="csv-file" accept=".csv,text/csv"
+                 class="mt-1 w-full text-sm file:mr-3 file:px-3 file:py-1.5 file:rounded-md file:border-0 file:bg-indigo-600 file:text-white file:cursor-pointer hover:file:bg-indigo-700" />
+          <p class="mt-1 text-xs text-slate-500">
+            We auto-detect the LinkedIn URL column from the header (synonyms like <code>linkedin_url</code>, <code>profile</code>, <code>li_url</code>) or by sniffing cell content. URL casing, scheme (<code>http</code>/<code>https</code>), <code>www</code>, and slug-only formats all work.
+          </p>
+        </label>
+
+        {% if accepts_tags %}
+          <label class="block">
+            <span class="text-xs uppercase tracking-wider text-slate-500">Tags (optional)</span>
+            <input type="text" id="csv-tags" placeholder="e.g. q2-outbound, csv-import"
+                   class="mt-1 w-full text-sm rounded-md border border-slate-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500" />
+            <p class="mt-1 text-xs text-slate-500">Comma-separated. Lands on every target in this batch.</p>
+          </label>
+        {% endif %}
+
+        {% if accepts_teammate %}
+          <label class="block">
+            <span class="text-xs uppercase tracking-wider text-slate-500">Whose network are these from?</span>
+            <select id="csv-teammate"
+                    class="mt-1 w-full text-sm rounded-md border border-slate-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500">
+              <option value="">(Your own network)</option>
+              {% for o in owners %}
+                <option value="{{ o.owner_id }}">{{ o.owner_name or o.owner_email }}</option>
+              {% endfor %}
+            </select>
+            <p class="mt-1 text-xs text-slate-500">Attribution flows through to the ⭐ badge so you see who introduced each supporter.</p>
+          </label>
+        {% endif %}
+
+        <button type="button" id="upload-btn"
+                class="inline-flex items-center justify-center rounded-md bg-emerald-600 hover:bg-emerald-700 px-4 py-2 text-sm font-medium text-white shadow disabled:opacity-50 disabled:cursor-not-allowed">
+          Upload CSV
+        </button>
+        <span id="upload-status" class="ml-3 text-xs text-slate-500"></span>
+      </div>
+    </section>
+
+    <section id="result" class="hidden mt-6"></section>
+
+    <section class="mt-8 bg-white border border-slate-200 rounded-lg p-5 shadow-sm">
+      <h2 class="text-sm font-semibold text-slate-900 mb-2">CSV format we accept</h2>
+      <ul class="list-disc pl-5 text-xs text-slate-500 space-y-1">
+        <li>First row must be a header. We try header names first ("LinkedIn URL", "profile", "li_url", etc.) then sniff cell content for <code>linkedin.com/in/</code>.</li>
+        <li>Each row needs at least a LinkedIn URL. Bare slugs like <code>zacharyroseman</code> work; we'll canonicalize to <code>https://www.linkedin.com/in/zacharyroseman</code>.</li>
+        <li>Other columns are ignored except for a "Name" column (used as display name on supporter rows).</li>
+        <li>Excel-exported CSVs with a BOM marker work. UTF-8 is preferred but most encodings will read.</li>
+        <li>Duplicates are deduped before import.</li>
+      </ul>
+    </section>
+
+    <footer class="mt-10 text-xs text-slate-400 text-center">
+      Draftboard API starter · CSV upload
+    </footer>
+  </div>
+
+  <script>
+    (function () {
+      var uploadBtn = document.getElementById('upload-btn');
+      var fileEl = document.getElementById('csv-file');
+      var tagsEl = document.getElementById('csv-tags');
+      var teammateEl = document.getElementById('csv-teammate');
+      var statusEl = document.getElementById('upload-status');
+      var resultEl = document.getElementById('result');
+      var endpoint = {{ upload_endpoint | tojson }};
+      var resultLink = {{ result_link_url | tojson }};
+      var resultLinkLabel = {{ result_link_label | tojson }};
+
+      function escapeHtml(s) {
+        return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+          return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
+        });
+      }
+
+      uploadBtn.addEventListener('click', function () {
+        var f = fileEl.files && fileEl.files[0];
+        if (!f) {
+          statusEl.textContent = 'Pick a CSV file first.';
+          statusEl.className = 'ml-3 text-xs text-rose-700';
+          return;
+        }
+        statusEl.textContent = 'Parsing + uploading…';
+        statusEl.className = 'ml-3 text-xs text-slate-500';
+        resultEl.classList.add('hidden');
+        uploadBtn.disabled = true;
+        var orig = uploadBtn.textContent;
+        uploadBtn.textContent = 'Uploading…';
+
+        var fd = new FormData();
+        fd.append('csv_file', f);
+        if (tagsEl) fd.append('tags', tagsEl.value || '');
+        if (teammateEl) fd.append('teammate', teammateEl.value || '');
+
+        fetch(endpoint, {
+          method: 'POST',
+          body: fd,
+          credentials: 'same-origin',
+          headers: { 'Sec-Fetch-Site': 'same-origin' },
+        })
+          .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+          .then(function (resp) {
+            uploadBtn.disabled = false;
+            uploadBtn.textContent = orig;
+            var b = resp.body || {};
+            if (!b.ok) {
+              statusEl.textContent = '';
+              resultEl.innerHTML =
+                '<div class="rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">' +
+                  '<strong>Upload failed:</strong> ' + escapeHtml(b.error || 'unknown') +
+                '</div>';
+              resultEl.classList.remove('hidden');
+              return;
+            }
+            statusEl.textContent = '';
+            var meta = b.meta || {};
+            var detailBits = [];
+            if (meta.detected_column) detailBits.push('LinkedIn column: <code>' + escapeHtml(meta.detected_column) + '</code>');
+            if (meta.name_column) detailBits.push('Name column: <code>' + escapeHtml(meta.name_column) + '</code>');
+            if (meta.total_rows != null) detailBits.push(meta.total_rows + ' data rows in file');
+            if (meta.kept_rows != null) detailBits.push(meta.kept_rows + ' rows with valid LinkedIn URLs');
+            var addedCount = (b.added != null ? b.added : b.imported);
+            var alreadyCount = (b.already_supporter != null ? b.already_supporter : 0);
+            var notImportedCount = (b.notImported != null ? b.notImported : 0);
+            resultEl.innerHTML =
+              '<div class="rounded-md border border-emerald-300 bg-emerald-50 px-4 py-4 text-sm text-emerald-900">' +
+                '<strong>✓ ' + (addedCount != null ? addedCount : '?') + ' imported</strong>' +
+                (alreadyCount ? ' · ' + alreadyCount + ' already on file' : '') +
+                (notImportedCount ? ' · ' + notImportedCount + ' rejected by Draftboard' : '') +
+                '<div class="mt-2 text-xs text-emerald-800">' + detailBits.join(' · ') + '</div>' +
+                (b.tags_used && b.tags_used.length
+                  ? '<div class="mt-1 text-xs text-emerald-800">Tags: ' + escapeHtml(b.tags_used.join(', ')) + '</div>'
+                  : '') +
+                '<div class="mt-3"><a class="underline" href="' + escapeHtml(resultLink) + '">' + escapeHtml(resultLinkLabel) + ' →</a></div>' +
+              '</div>';
+            resultEl.classList.remove('hidden');
+          })
+          .catch(function (err) {
+            uploadBtn.disabled = false;
+            uploadBtn.textContent = orig;
+            statusEl.textContent = '';
+            resultEl.innerHTML =
+              '<div class="rounded-md border border-rose-300 bg-rose-50 px-4 py-3 text-sm text-rose-900">' +
+                'Network error: ' + escapeHtml(err && err.message ? err.message : 'unknown') +
+              '</div>';
+            resultEl.classList.remove('hidden');
+          });
+      });
+    })();
+  </script>
+</body>
+</html>
