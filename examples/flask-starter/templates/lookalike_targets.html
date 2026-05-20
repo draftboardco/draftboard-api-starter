@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Draftboard — Lookalike targets</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+  <div class="max-w-4xl mx-auto px-6 py-10">
+    {% include "_nav.html" %}
+
+    <header class="mb-6">
+      <h1 class="text-2xl font-semibold tracking-tight">Lookalike targets</h1>
+      <p class="text-sm text-slate-500 mt-1">
+        Find more people at the same accounts as your existing targets. The kit round-robins through your accounts, expands each one's seed titles with GPT, and surfaces ranked candidates you can add to Draftboard with one click. Results persist — close the tab and come back.
+      </p>
+    </header>
+
+    {% if not keys_ready %}
+      <div class="mb-6 rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+        <strong>Apollo or Google CSE required.</strong> The engine needs at least one to search for people at each account.
+        Set up on the <a class="underline" href="/settings/integrations">Integrations page</a>.
+      </div>
+    {% endif %}
+
+    {# ---- Cadence + run controls ---- #}
+    <section class="mb-6 bg-white border border-slate-200 rounded-lg p-5 shadow-sm">
+      <div class="flex items-end gap-4 flex-wrap">
+        <div>
+          <label class="text-xs uppercase tracking-wider text-slate-500 block mb-1">New targets per run</label>
+          <div class="flex items-center gap-2">
+            <select id="cadence-select"
+                    class="text-sm rounded-md border border-slate-300 px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-500">
+              {% for n in cadence_options %}
+                <option value="{{ n }}" {% if n == cadence %}selected{% endif %}>{{ n }}</option>
+              {% endfor %}
+            </select>
+            <button type="button" id="save-cadence-btn"
+                    class="text-xs px-3 py-1.5 rounded-md border border-slate-300 bg-white hover:bg-slate-50 text-slate-700">
+              Save cadence
+            </button>
+            <span id="cadence-status" class="text-xs"></span>
+          </div>
+        </div>
+        <div class="flex-1"></div>
+        <button type="button" id="run-btn"
+                class="text-sm px-4 py-2 rounded-md bg-emerald-600 hover:bg-emerald-700 text-white font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+                {% if not keys_ready %}disabled{% endif %}>
+          Run today's batch →
+        </button>
+      </div>
+      <p class="mt-3 text-xs text-slate-500">
+        v0: synchronous run, takes 20-60s for cadence 10. Don't close the tab while it's running.
+      </p>
+      <p id="run-status" class="mt-2 text-xs"></p>
+    </section>
+
+    {# ---- Stats strip ---- #}
+    <section class="mb-4 flex items-center gap-4 text-xs text-slate-500">
+      <span><strong class="text-slate-900" id="count-pending">{{ counts.pending }}</strong> pending</span>
+      <span>·</span>
+      <span><strong class="text-emerald-700" id="count-added">{{ counts.added }}</strong> added to Draftboard</span>
+      <span>·</span>
+      <span><strong class="text-slate-500" id="count-skipped">{{ counts.skipped }}</strong> skipped</span>
+    </section>
+
+    {# ---- Pending discoveries table ---- #}
+    <section id="pending-list" class="space-y-2">
+      {% if pending %}
+        {% for c in pending %}
+          <article class="bg-white border border-slate-200 rounded-lg p-4 shadow-sm flex items-start gap-3"
+                   data-row data-linkedin="{{ c.linkedin_url }}">
+            <div class="flex-shrink-0">
+              {% if c.ai_confidence >= 0.7 %}
+                <span class="inline-flex items-center justify-center w-8 h-8 rounded-full text-sm font-bold bg-emerald-100 text-emerald-800">{{ (c.ai_confidence * 10) | round(0) | int }}</span>
+              {% elif c.ai_confidence >= 0.4 %}
+                <span class="inline-flex items-center justify-center w-8 h-8 rounded-full text-sm font-bold bg-amber-100 text-amber-800">{{ (c.ai_confidence * 10) | round(0) | int }}</span>
+              {% else %}
+                <span class="inline-flex items-center justify-center w-8 h-8 rounded-full text-xs bg-slate-100 text-slate-500">?</span>
+              {% endif %}
+            </div>
+            <div class="flex-1 min-w-0">
+              <div class="text-sm font-semibold text-slate-900 truncate">{{ c.name or '(unnamed)' }}</div>
+              <div class="text-xs text-slate-600 truncate">
+                {{ c.title }}{% if c.title and c.account_display_name %} · {% endif %}{{ c.account_display_name }}
+              </div>
+              {% if c.ai_reason %}
+                <div class="mt-1 text-[11px] text-slate-500 line-clamp-2">{{ c.ai_reason }}</div>
+              {% endif %}
+              <a href="{{ c.linkedin_url }}" target="_blank" rel="noopener" class="mt-1 inline-block text-[11px] text-indigo-600 hover:underline">↗ LinkedIn</a>
+            </div>
+            <div class="flex flex-col items-stretch gap-1.5 flex-shrink-0">
+              <button type="button" data-action="add"
+                      class="text-xs px-3 py-1.5 rounded-md bg-indigo-600 hover:bg-indigo-700 text-white font-medium">
+                + Add as target
+              </button>
+              <button type="button" data-action="skip"
+                      class="text-xs px-3 py-1.5 rounded-md border border-slate-300 bg-white hover:bg-slate-50 text-slate-700">
+                Skip
+              </button>
+            </div>
+          </article>
+        {% endfor %}
+      {% else %}
+        <div class="rounded-md border border-slate-200 bg-white px-4 py-6 text-sm text-slate-500 text-center">
+          No pending lookalikes yet. Click <strong>Run today's batch →</strong> above to find some.
+        </div>
+      {% endif %}
+    </section>
+
+    <footer class="mt-10 text-xs text-slate-400 text-center">
+      Draftboard API starter · Lookalike targets
+    </footer>
+  </div>
+
+  <script>
+    (function () {
+      var runBtn = document.getElementById('run-btn');
+      var runStatus = document.getElementById('run-status');
+      var cadenceSelect = document.getElementById('cadence-select');
+      var saveBtn = document.getElementById('save-cadence-btn');
+      var cadenceStatus = document.getElementById('cadence-status');
+
+      function escapeHtml(s) {
+        return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+          return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
+        });
+      }
+
+      // Save cadence
+      saveBtn.addEventListener('click', function () {
+        var n = parseInt(cadenceSelect.value, 10);
+        saveBtn.disabled = true;
+        var orig = saveBtn.textContent;
+        saveBtn.textContent = 'Saving…';
+        fetch('/prospecting/lookalike-targets/save-cadence', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ cadence: n }),
+        })
+          .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+          .then(function (resp) {
+            saveBtn.disabled = false;
+            saveBtn.textContent = orig;
+            if (!resp.ok || !resp.body.ok) {
+              cadenceStatus.textContent = (resp.body && resp.body.error) || 'Save failed';
+              cadenceStatus.className = 'text-xs text-rose-700';
+              return;
+            }
+            cadenceStatus.textContent = '✓ Saved';
+            cadenceStatus.className = 'text-xs text-emerald-700';
+            setTimeout(function () { cadenceStatus.textContent = ''; }, 1500);
+          })
+          .catch(function () {
+            saveBtn.disabled = false;
+            saveBtn.textContent = orig;
+            cadenceStatus.textContent = 'Network error';
+            cadenceStatus.className = 'text-xs text-rose-700';
+          });
+      });
+
+      // Run batch
+      runBtn.addEventListener('click', function () {
+        runBtn.disabled = true;
+        var orig = runBtn.textContent;
+        runBtn.textContent = 'Running…';
+        runStatus.textContent = 'Scanning accounts + asking GPT to expand seed titles…';
+        runStatus.className = 'mt-2 text-xs text-slate-500';
+        fetch('/prospecting/lookalike-targets/run', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+        })
+          .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+          .then(function (resp) {
+            runBtn.disabled = false;
+            runBtn.textContent = orig;
+            var b = resp.body || {};
+            if (!b.ok) {
+              runStatus.textContent = b.error || 'Run failed';
+              runStatus.className = 'mt-2 text-xs text-rose-700';
+              return;
+            }
+            var bits = [
+              'Found ' + b.found_new + ' new lookalike' + (b.found_new === 1 ? '' : 's'),
+              b.accounts_scanned + ' account' + (b.accounts_scanned === 1 ? '' : 's') + ' scanned',
+            ];
+            if (b.accounts_skipped_no_seed) bits.push(b.accounts_skipped_no_seed + ' had no seed titles');
+            runStatus.textContent = bits.join(' · ') + '. Reloading the queue…';
+            runStatus.className = 'mt-2 text-xs text-emerald-700';
+            setTimeout(function () { window.location.reload(); }, 700);
+          })
+          .catch(function (err) {
+            runBtn.disabled = false;
+            runBtn.textContent = orig;
+            runStatus.textContent = 'Network error: ' + (err && err.message ? err.message : 'unknown');
+            runStatus.className = 'mt-2 text-xs text-rose-700';
+          });
+      });
+
+      // Add / Skip per row
+      document.querySelectorAll('[data-row]').forEach(function (row) {
+        var linkedin = row.getAttribute('data-linkedin');
+        row.querySelectorAll('[data-action]').forEach(function (btn) {
+          btn.addEventListener('click', function () {
+            var action = btn.getAttribute('data-action');
+            row.querySelectorAll('button').forEach(function (b) { b.disabled = true; });
+            var orig = btn.textContent;
+            btn.textContent = action === 'add' ? 'Adding…' : 'Skipping…';
+            fetch('/prospecting/lookalike-targets/action', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              credentials: 'same-origin',
+              body: JSON.stringify({ action: action, linkedin_url: linkedin }),
+            })
+              .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+              .then(function (resp) {
+                var b = resp.body || {};
+                if (!b.ok) {
+                  row.querySelectorAll('button').forEach(function (b) { b.disabled = false; });
+                  btn.textContent = orig;
+                  alert(b.error || 'Action failed');
+                  return;
+                }
+                // Fade the row out + update stats
+                row.style.transition = 'opacity 0.3s';
+                row.style.opacity = '0';
+                setTimeout(function () { row.remove(); }, 300);
+                var pendEl = document.getElementById('count-pending');
+                var doneEl = document.getElementById('count-' + (action === 'add' ? 'added' : 'skipped'));
+                if (pendEl) pendEl.textContent = Math.max(0, parseInt(pendEl.textContent, 10) - 1);
+                if (doneEl) doneEl.textContent = parseInt(doneEl.textContent, 10) + 1;
+              })
+              .catch(function () {
+                row.querySelectorAll('button').forEach(function (b) { b.disabled = false; });
+                btn.textContent = orig;
+                alert('Network error');
+              });
+          });
+        });
+      });
+    })();
+  </script>
+</body>
+</html>

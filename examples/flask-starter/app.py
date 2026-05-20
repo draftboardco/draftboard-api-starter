@@ -893,6 +893,29 @@ def init_db():
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_category_rules_value ON category_rules(value)")
 
+        # Lookalike targets discovered by the standalone prospecting page.
+        # One row per person; status moves through pending → added/skipped
+        # as the user triages the queue. linkedin_url_norm is the PK so
+        # re-running the engine never re-creates rows the user has already
+        # actioned (the upsert preserves the existing row's status).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS lookalike_targets_discovered (
+                linkedin_url_norm TEXT PRIMARY KEY,
+                linkedin_url TEXT NOT NULL,
+                account_key TEXT NOT NULL,
+                account_display_name TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                ai_confidence REAL NOT NULL DEFAULT 0,
+                ai_reason TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                discovered_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_lookalike_targets_status ON lookalike_targets_discovered(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_lookalike_targets_discovered_at ON lookalike_targets_discovered(discovered_at DESC)")
+
         # Manual path lists — uploaded CSVs from external network owners
         # (typically the customer's investors). Each list is one upload;
         # owner_* columns describe the person whose connections are in the
@@ -5642,28 +5665,309 @@ def settings_icp_save():
     return jsonify({"ok": True, "description": description, "examples": examples})
 
 
+# =====================================================================
+# Lookalike targets (standalone page)
+# =====================================================================
+# Round-robins through the user's existing account list, runs the
+# prospecting engine per account, persists candidates so the user can
+# triage them across sessions. Each candidate moves through pending
+# → added or skipped; on Add we POST to Draftboard's /targets/import.
+
+LOOKALIKE_CADENCE_DEFAULT = 10
+LOOKALIKE_CADENCE_OPTIONS = (10, 30, 50)
+
+
+def db_lookalike_save(rows: list[dict]) -> int:
+    """Upsert discovered candidates. Existing rows preserve status +
+    updated_at so re-running the engine never overwrites a user's
+    Add/Skip decisions. Returns the count of NEW rows inserted."""
+    now = int(time.time())
+    inserted = 0
+    with _db_lock, _db_connect() as conn:
+        for r in rows:
+            norm = _normalize_linkedin(r.get("linkedin_url") or "")
+            if not norm:
+                continue
+            cur = conn.execute(
+                "SELECT 1 FROM lookalike_targets_discovered WHERE linkedin_url_norm = ?",
+                (norm,),
+            )
+            if cur.fetchone():
+                continue
+            conn.execute(
+                "INSERT INTO lookalike_targets_discovered "
+                "(linkedin_url_norm, linkedin_url, account_key, account_display_name, "
+                " name, title, ai_confidence, ai_reason, status, discovered_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                (
+                    norm, r.get("linkedin_url") or "",
+                    r.get("account_key") or "",
+                    r.get("account_display_name") or "",
+                    r.get("name") or "",
+                    r.get("title") or "",
+                    float(r.get("ai_confidence") or 0),
+                    (r.get("ai_reason") or "")[:500],
+                    now, now,
+                ),
+            )
+            inserted += 1
+        conn.commit()
+    return inserted
+
+
+def db_lookalike_list(status: str = "pending", limit: int = 200) -> list[dict]:
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT linkedin_url_norm, linkedin_url, account_key, account_display_name, "
+            "       name, title, ai_confidence, ai_reason, status, discovered_at "
+            "FROM lookalike_targets_discovered "
+            "WHERE status = ? "
+            "ORDER BY discovered_at DESC, ai_confidence DESC LIMIT ?",
+            (status, limit),
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def db_lookalike_counts() -> dict:
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT status, COUNT(*) FROM lookalike_targets_discovered GROUP BY status"
+        )
+        out = {"pending": 0, "added": 0, "skipped": 0}
+        for s, c in cur.fetchall():
+            out[s] = c
+        return out
+
+
+def db_lookalike_set_status(linkedin_url: str, new_status: str) -> bool:
+    if new_status not in ("pending", "added", "skipped"):
+        return False
+    norm = _normalize_linkedin(linkedin_url)
+    if not norm:
+        return False
+    now = int(time.time())
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "UPDATE lookalike_targets_discovered SET status = ?, updated_at = ? "
+            "WHERE linkedin_url_norm = ?",
+            (new_status, now, norm),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def _lookalike_run_batch(target_count: int) -> dict:
+    """Run discovery across the user's account list until we've added
+    `target_count` NEW pending candidates (or run out of accounts to
+    scan). Round-robin by `lookalike_targets_last_account_idx` saved in
+    app_state so consecutive runs hit different accounts."""
+    keys = _load_resolver_keys()
+    if not (keys.get("apollo_api_key") or (keys.get("google_cse_api_key") and keys.get("google_cse_id"))):
+        return {"ok": False, "error": "Need Apollo or Google CSE configured. Set up on /settings/integrations."}
+
+    # Build the list of account keys from the user's targets. Each unique
+    # company name becomes one source account.
+    targets_all, _ = fetch_all_targets()
+    seen: set = set()
+    account_keys: list[str] = []
+    for t in targets_all:
+        comp = (_target_company_with_fallback(t) or "").strip()
+        if not comp:
+            continue
+        k = comp.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        account_keys.append(k)
+    if not account_keys:
+        return {"ok": False, "error": "No accounts in your Draftboard data to scan. Add some targets first."}
+
+    # Round-robin index — start where we left off last run.
+    try:
+        start_idx = int(db_app_state_get("lookalike_targets_last_account_idx") or "0")
+    except ValueError:
+        start_idx = 0
+    if start_idx >= len(account_keys):
+        start_idx = 0
+
+    found_new = 0
+    accounts_scanned = 0
+    accounts_skipped_no_seed = 0
+    errors: list[str] = []
+    last_idx = start_idx
+
+    for i in range(len(account_keys)):
+        if found_new >= target_count:
+            break
+        idx = (start_idx + i) % len(account_keys)
+        key = account_keys[idx]
+        last_idx = (idx + 1) % len(account_keys)
+
+        seeds, display_name, seed_titles, company_linkedin, existing_norm = (
+            _prospecting_collect_seeds(key)
+        )
+        if not seeds or not seed_titles:
+            accounts_skipped_no_seed += 1
+            continue
+
+        # Use Apollo's resolved domain if we have it; else just pass
+        # company name and let the engine sort it out.
+        domain = ""
+        if keys.get("apollo_api_key"):
+            org, _ = _prospecting_find_org(display_name, keys.get("apollo_api_key") or "", company_linkedin)
+            if org and org.get("primary_domain"):
+                domain = org["primary_domain"]
+
+        # Expand the seed titles with the LLM (same pattern as the
+        # in-drawer flow). If no OpenAI key, just use the seeds.
+        titles = seed_titles[:]
+        if keys.get("openai_api_key"):
+            try:
+                expanded, _terr = _prospecting_generate_titles(
+                    seed_titles, display_name, keys.get("openai_api_key") or "", n=8,
+                )
+                if expanded:
+                    titles = list(dict.fromkeys(seed_titles + expanded))
+            except Exception:  # noqa: BLE001
+                pass
+
+        cands, err = _prospecting_search_people(
+            display_name, titles[:10], domain, keys,
+            company_linkedin_url=company_linkedin,
+        )
+        if err and not cands:
+            errors.append(f"{display_name}: {err}")
+            continue
+        cands = _prospecting_dedupe(cands, existing_norm)
+        accounts_scanned += 1
+
+        # Persist all NEW (non-dup) candidates from this account. Cap
+        # per-account to avoid one big company swamping the batch.
+        rows_to_save = []
+        for c in cands[:8]:
+            li = (c.get("linkedinUrl") or c.get("linkedin_url") or "").strip()
+            if not li:
+                continue
+            rows_to_save.append({
+                "linkedin_url": li,
+                "account_key": key,
+                "account_display_name": display_name,
+                "name": (c.get("name") or "").strip()
+                        or " ".join(filter(None, [(c.get("firstName") or "").strip(),
+                                                  (c.get("lastName") or "").strip()])),
+                "title": (c.get("title") or c.get("position") or "").strip(),
+                "ai_confidence": c.get("ai_confidence") or 0,
+                "ai_reason": (c.get("ai_reason") or "")[:500],
+            })
+        inserted = db_lookalike_save(rows_to_save)
+        found_new += inserted
+
+    db_app_state_set("lookalike_targets_last_account_idx", str(last_idx))
+    return {
+        "ok": True,
+        "found_new": found_new,
+        "accounts_scanned": accounts_scanned,
+        "accounts_skipped_no_seed": accounts_skipped_no_seed,
+        "errors": errors[:5],
+        "target_count": target_count,
+    }
+
+
 @app.route("/prospecting/lookalike-targets", methods=["GET"])
 def prospecting_lookalike_targets_view():
-    """Placeholder for the upcoming standalone lookalike-targets page.
-    Real implementation lands in the next PR — cadence picker, persisted
-    discovery queue, per-account round-robin, push-to-Draftboard."""
+    """Standalone lookalike-targets page. Cadence picker + run button +
+    persistent discovery queue."""
+    try:
+        cadence = int(db_app_state_get("lookalike_targets_per_day") or LOOKALIKE_CADENCE_DEFAULT)
+    except ValueError:
+        cadence = LOOKALIKE_CADENCE_DEFAULT
+    keys = _load_resolver_keys()
+    keys_ready = bool(keys.get("apollo_api_key") or (keys.get("google_cse_api_key") and keys.get("google_cse_id")))
     return render_template(
-        "hub_stub.html",
+        "lookalike_targets.html",
         active="prospecting_lookalike_targets",
-        hub_tabs=[],
-        hub_title="Lookalike targets",
-        hub_intro="Find more people at the same accounts as your existing targets.",
-        feature_title="Coming up next",
-        feature_body=(
-            "Pick a daily cadence (10 / 30 / 50 new targets per day). The kit "
-            "scans your existing account list, runs the prospecting engine on "
-            "each account in round-robin, and surfaces ranked candidates you "
-            "can add to Draftboard with one click. Results persist across "
-            "sessions so you can come back to yesterday's batch. "
-            "For now, the Find Lookalike Targets button still lives inside "
-            "the account drawer when you click any account."
-        ),
+        api_key_set=bool(API_KEY),
+        cadence=cadence,
+        cadence_options=LOOKALIKE_CADENCE_OPTIONS,
+        keys_ready=keys_ready,
+        pending=db_lookalike_list("pending", limit=200),
+        counts=db_lookalike_counts(),
     )
+
+
+@app.route("/prospecting/lookalike-targets/save-cadence", methods=["POST"])
+def prospecting_lookalike_save_cadence():
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+    body = request.get_json(silent=True) or {}
+    try:
+        n = int(body.get("cadence") or 0)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "cadence must be a number"}), 400
+    if n not in LOOKALIKE_CADENCE_OPTIONS:
+        return jsonify({"ok": False, "error": f"cadence must be one of {LOOKALIKE_CADENCE_OPTIONS}"}), 400
+    db_app_state_set("lookalike_targets_per_day", str(n))
+    return jsonify({"ok": True, "cadence": n})
+
+
+@app.route("/prospecting/lookalike-targets/run", methods=["POST"])
+def prospecting_lookalike_run():
+    """Synchronous v0: blocks the worker while we scan accounts. Small
+    cadences (10/30) finish in 20-60s typical. v1 wires this into a
+    background job + a poll endpoint."""
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+    try:
+        cadence = int(db_app_state_get("lookalike_targets_per_day") or LOOKALIKE_CADENCE_DEFAULT)
+    except ValueError:
+        cadence = LOOKALIKE_CADENCE_DEFAULT
+    result = _lookalike_run_batch(cadence)
+    return jsonify(result)
+
+
+@app.route("/prospecting/lookalike-targets/action", methods=["POST"])
+def prospecting_lookalike_action():
+    """Add a discovered candidate to Draftboard or mark it skipped.
+    Both update the row's status; Add additionally POSTs to
+    /targets/import."""
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+    body = request.get_json(silent=True) or {}
+    action = (body.get("action") or "").strip()
+    linkedin_url = (body.get("linkedin_url") or "").strip()
+    if action not in ("add", "skip"):
+        return jsonify({"ok": False, "error": "action must be add or skip"}), 400
+    if not linkedin_url:
+        return jsonify({"ok": False, "error": "linkedin_url required"}), 400
+
+    if action == "skip":
+        ok = db_lookalike_set_status(linkedin_url, "skipped")
+        return jsonify({"ok": ok})
+
+    # action == "add" → push to Draftboard
+    if not _current_api_key():
+        return jsonify({"ok": False, "error": "DRAFTBOARD_API_KEY not set."}), 400
+    try:
+        r = requests.post(
+            f"{API_BASE}/targets/import",
+            headers=_auth_headers(),
+            json={"linkedinUrls": [linkedin_url]},
+            timeout=30,
+        )
+    except requests.RequestException as e:
+        return jsonify({"ok": False, "error": f"Network error: {type(e).__name__}"}), 502
+    if r.status_code != 200:
+        snippet = (r.text or "")[:300]
+        return jsonify({
+            "ok": False,
+            "error": f"Draftboard /targets/import returned {r.status_code}: {snippet}",
+        }), r.status_code
+    db_lookalike_set_status(linkedin_url, "added")
+    return jsonify({"ok": True})
 
 
 @app.route("/prospecting/lookalikes", methods=["GET"])
