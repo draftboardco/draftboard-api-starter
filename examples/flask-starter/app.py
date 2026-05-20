@@ -9542,6 +9542,32 @@ def supporters_wizard_match():
     return jsonify({"ok": True, "buckets": out_buckets})
 
 
+@app.route("/supporters/wizard/unmark", methods=["POST"])
+def supporters_wizard_unmark():
+    """Reverse a wizard-marked supporter. Only removes rows whose source
+    is 'wizard' so an accidental Undo can't wipe out a supporter the
+    user added via a different path (star button, paste form, etc.)."""
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+    body = request.get_json(silent=True) or {}
+    linkedin_url = (body.get("linkedin_url") or "").strip()
+    if not linkedin_url:
+        return jsonify({"ok": False, "error": "linkedin_url required"}), 400
+    norm = _normalize_linkedin(linkedin_url) or linkedin_url
+    existing = db_manual_supporter_get(norm)
+    if not existing:
+        return jsonify({"ok": True, "removed": False, "reason": "not a supporter"})
+    if (existing.get("source") or "") != "wizard":
+        return jsonify({
+            "ok": True,
+            "removed": False,
+            "reason": f"added via '{existing.get('source')}' - undo only works on wizard-added supporters",
+        })
+    removed = db_manual_supporter_remove(linkedin_url)
+    return jsonify({"ok": True, "removed": removed})
+
+
 @app.route("/supporters/wizard/mark", methods=["POST"])
 def supporters_wizard_mark():
     """Bulk-mark a list of LinkedIn URLs as supporters with source="wizard".
