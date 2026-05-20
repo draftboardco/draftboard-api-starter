@@ -19,20 +19,49 @@
 
     {% include "_hub_tabs.html" %}
 
-    <section class="mb-6">
-      <h2 class="text-sm font-semibold text-slate-900 mb-1">Import from Sales Navigator</h2>
-      <p class="text-xs text-slate-500">
-        Paste a Sales Navigator search URL. Scrupp scrapes the results and we import each lead as a Draftboard target.
-      </p>
+    <section class="mb-4 flex items-start justify-between gap-3">
+      <div>
+        <h2 class="text-sm font-semibold text-slate-900 mb-1">Import from Sales Navigator</h2>
+        <p class="text-xs text-slate-500">
+          Paste a Sales Navigator search URL. Scrupp scrapes the results and we import each lead as a Draftboard target.
+        </p>
+      </div>
+      {% if scrupp_configured %}
+        <span class="flex-shrink-0 inline-flex items-center gap-1 text-xs px-2.5 py-1 rounded-full bg-emerald-50 text-emerald-800 border border-emerald-200">
+          ✓ Scrupp ready
+        </span>
+      {% endif %}
     </section>
 
     {% if not scrupp_configured %}
-      <div class="mb-6 rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
-        <strong>Scrupp API key required.</strong> Sign up at
-        <a class="underline" href="https://scrupp.com" target="_blank" rel="noopener">scrupp.com</a>
-        (free tier includes 500 leads/month), grab your API key, then paste it on the
-        <a class="underline" href="/settings/api-keys">API keys page</a>.
-      </div>
+      {# Inline Scrupp setup card. Replaces the old "go to /settings/api-keys"
+         link with a paste-key form right on this page so the user doesn't
+         lose the Sales Nav URL they were about to scrape. #}
+      <section class="mb-6 rounded-lg border border-amber-300 bg-white p-5 shadow-sm">
+        <header class="flex items-center justify-between gap-3 mb-2">
+          <h3 class="text-base font-semibold text-slate-900">Connect Scrupp to scrape Sales Navigator</h3>
+          <span class="text-xs text-amber-700">Not configured</span>
+        </header>
+        <p class="text-sm text-slate-600 mb-3">
+          We use <a class="underline text-indigo-600" href="https://scrupp.com" target="_blank" rel="noopener">Scrupp</a> to scrape Sales Navigator search results. Free tier covers 500 leads/month with no credit card.
+        </p>
+        <ol class="list-decimal list-inside text-xs text-slate-600 space-y-1 mb-4">
+          <li>Sign up at <a class="underline text-indigo-600" href="https://scrupp.com" target="_blank" rel="noopener">scrupp.com</a>.</li>
+          <li>Open the dashboard's API tab and copy your key.</li>
+          <li>Paste it below and Save — the page reloads with Scrupp ready.</li>
+        </ol>
+        <label for="scrupp-key" class="block text-xs uppercase tracking-wider text-slate-500 mb-1">Scrupp API key</label>
+        <div class="flex items-center gap-2">
+          <input type="password" id="scrupp-key" autocomplete="off"
+                 placeholder="paste your Scrupp API key"
+                 class="flex-1 text-sm rounded-md border border-slate-300 px-3 py-2 font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500" />
+          <button type="button" id="scrupp-save-btn"
+                  class="inline-flex items-center justify-center rounded-md bg-indigo-600 hover:bg-indigo-700 px-3 py-2 text-sm font-medium text-white shadow disabled:opacity-50 disabled:cursor-not-allowed">
+            Save
+          </button>
+        </div>
+        <p id="scrupp-save-status" class="mt-2 text-xs"></p>
+      </section>
     {% endif %}
 
     {% if not api_key_set %}
@@ -140,7 +169,54 @@
 
   <script>
     (function () {
+      // ----- Inline Scrupp setup form (only rendered when key missing) -----
+      var scruppSaveBtn = document.getElementById('scrupp-save-btn');
+      if (scruppSaveBtn) {
+        var scruppKeyEl = document.getElementById('scrupp-key');
+        var scruppStatusEl = document.getElementById('scrupp-save-status');
+        scruppSaveBtn.addEventListener('click', function () {
+          var key = (scruppKeyEl.value || '').trim();
+          if (!key) {
+            scruppStatusEl.textContent = 'Paste a key first.';
+            scruppStatusEl.className = 'mt-2 text-xs text-rose-700';
+            return;
+          }
+          scruppSaveBtn.disabled = true;
+          scruppSaveBtn.textContent = 'Saving…';
+          scruppStatusEl.textContent = '';
+          fetch('/settings/api-keys', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
+            body: JSON.stringify({ scrupp_api_key: key }),
+          })
+            .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+            .then(function (resp) {
+              if (!resp.ok || !resp.body.ok) {
+                scruppSaveBtn.disabled = false;
+                scruppSaveBtn.textContent = 'Save';
+                scruppStatusEl.textContent = (resp.body && resp.body.error) || 'Save failed';
+                scruppStatusEl.className = 'mt-2 text-xs text-rose-700';
+                return;
+              }
+              scruppStatusEl.textContent = '✓ Saved. Reloading…';
+              scruppStatusEl.className = 'mt-2 text-xs text-emerald-700';
+              // Full reload so the page renders with the "✓ Scrupp ready" pill
+              // and the inline setup card disappears.
+              setTimeout(function () { window.location.reload(); }, 400);
+            })
+            .catch(function (err) {
+              scruppSaveBtn.disabled = false;
+              scruppSaveBtn.textContent = 'Save';
+              scruppStatusEl.textContent = 'Network error: ' + (err && err.message ? err.message : 'unknown');
+              scruppStatusEl.className = 'mt-2 text-xs text-rose-700';
+            });
+        });
+      }
+
+      // ----- Main Sales Nav search flow -----
       var urlEl = document.getElementById('sn-url');
+      var maxEl = document.getElementById('sn-max');
       var maxEl = document.getElementById('sn-max');
       var tagsEl = document.getElementById('sn-tags');
       var searchBtn = document.getElementById('search-btn');
