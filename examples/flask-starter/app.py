@@ -9253,6 +9253,12 @@ SUPPORTER_WIZARD_PROMPTS = [
         "placeholder": "Lenny Rachitsky\n...",
     },
     {
+        "key": "happy_customers",
+        "title": "Happy customers",
+        "hint": "People who use your product and have told you they love it. Strongest sales-intro signal of all - they've already lived the value.",
+        "placeholder": "Jane Doe at Acme Corp\n...",
+    },
+    {
         "key": "coworkers",
         "title": "Closest coworkers (current + past)",
         "hint": "The 10-15 colleagues from each of your past companies you'd happily grab coffee with tomorrow.",
