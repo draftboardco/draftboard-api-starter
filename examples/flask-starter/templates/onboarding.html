@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Draftboard — Onboarding</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    {% include "_nav.html" %}
+
+    {# ---- Header + progress bar ---- #}
+    {% set steps_total = 7 %}
+    {% set steps_done = 0 %}
+    {% if status.api_key.done %}{% set steps_done = steps_done + 1 %}{% endif %}
+    {% if status.profile.done or status.profile.skipped %}{% set steps_done = steps_done + 1 %}{% endif %}
+    {% if status.targets.done or status.targets.skipped %}{% set steps_done = steps_done + 1 %}{% endif %}
+    {% if status.supporters.done or status.supporters.skipped %}{% set steps_done = steps_done + 1 %}{% endif %}
+    {% set integrations_done = status.resolver.done or status.google.done or status.slack.done %}
+    {% if integrations_done or (status.resolver.skipped and status.google.skipped and status.slack.skipped) %}
+      {% set steps_done = steps_done + 1 %}
+    {% endif %}
+    {% if status.completed %}{% set steps_done = steps_total %}{% endif %}
+
+    <header class="mb-6">
+      <h1 class="text-2xl font-semibold tracking-tight">Get the Draftboard kit set up</h1>
+      <p class="text-sm text-slate-600 mt-1">
+        ~5 minutes. Only step 2 (Draftboard API key) is strictly required — every other step has a Skip option.
+      </p>
+      <div class="mt-3 flex items-center gap-3">
+        <div class="flex-1 bg-slate-200 rounded-full h-2 overflow-hidden">
+          <div class="bg-indigo-500 h-2 transition-all" style="width: {{ ((steps_done / steps_total) * 100)|round(0, 'floor')|int }}%"></div>
+        </div>
+        <div class="text-xs text-slate-500 tabular-nums">
+          <strong class="text-slate-900">{{ steps_done }}</strong> of {{ steps_total }} done
+        </div>
+      </div>
+    </header>
+
+    {# Macro for the step header — number badge + title + ✓ if complete. #}
+    {% macro step_header(n, title, done=False, skipped=False) %}
+      <header class="flex items-center gap-3 mb-3">
+        {% if done %}
+          <span class="flex-shrink-0 w-7 h-7 rounded-full bg-emerald-500 text-white text-xs font-bold flex items-center justify-center">✓</span>
+        {% elif skipped %}
+          <span class="flex-shrink-0 w-7 h-7 rounded-full bg-slate-200 text-slate-500 text-xs flex items-center justify-center">{{ n }}</span>
+        {% else %}
+          <span class="flex-shrink-0 w-7 h-7 rounded-full bg-indigo-500 text-white text-xs font-bold flex items-center justify-center">{{ n }}</span>
+        {% endif %}
+        <h2 class="text-base font-semibold text-slate-900">{{ title }}</h2>
+        {% if skipped and not done %}
+          <span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-500">skipped</span>
+        {% endif %}
+      </header>
+    {% endmacro %}
+
+    {# =================== STEP 1: WELCOME =================== #}
+    <section class="mb-3 bg-white border border-slate-200 rounded-lg p-5 shadow-sm">
+      {{ step_header(1, "What you're about to set up", done=true) }}
+      <p class="text-sm text-slate-600">
+        Draftboard maps your network so you can spot warm-intro paths to your prospects instead of cold-emailing them. The kit is a self-hosted dashboard that talks to Draftboard's API + a few helpful third-party services (Apollo, OpenAI, Scrupp, Google).
+      </p>
+      <ul class="mt-3 text-xs text-slate-500 list-disc pl-5 space-y-1">
+        <li><strong>API key</strong> connects you to your Draftboard workspace.</li>
+        <li><strong>Profile</strong> powers the personalized intro-request templates.</li>
+        <li><strong>Targets</strong> are who you want to reach.</li>
+        <li><strong>Supporters</strong> are who can vouch for you to those targets.</li>
+        <li><strong>Integrations</strong> unlock more features (Sales Nav scraping, Gmail scan, lookalike search, etc.).</li>
+      </ul>
+    </section>
+
+    {# =================== STEP 2: DRAFTBOARD API KEY =================== #}
+    <section class="mb-3 bg-white border border-slate-200 rounded-lg p-5 shadow-sm">
+      {{ step_header(2, "Connect your Draftboard API key", done=status.api_key.done) }}
+      {% if status.api_key.done %}
+        <p class="text-sm text-slate-600">
+          ✓ Connected as <strong>
+            {%- if status.api_key.me and status.api_key.me.user_first -%}
+              {{ status.api_key.me.user_first }} {{ status.api_key.me.user_last }}
+            {%- else -%}
+              your workspace
+            {%- endif -%}
+          </strong>. Source: <code class="text-xs bg-slate-100 px-1 rounded">{{ status.api_key.source }}</code>.
+        </p>
+        {% if status.api_key.auto_sync_off %}
+          <p class="mt-2 text-xs text-amber-700">
+            Auto-sync is off. Set <code>AUTO_SYNC_ENABLED=true</code> + restart to let the kit pull fresh paths on a schedule.
+          </p>
+        {% endif %}
+      {% else %}
+        <p class="text-sm text-slate-600 mb-3">
+          Required. Get yours from your Draftboard workspace settings, or
+          <a class="underline text-indigo-600" href="{{ status.draftboard_signup_url }}" target="_blank" rel="noopener">sign up at intros.draftboard.com</a> first.
+        </p>
+        {% if api_key_error %}
+          <div class="mb-3 rounded-md border border-rose-300 bg-rose-50 px-3 py-2 text-xs text-rose-900">{{ api_key_error }}</div>
+        {% endif %}
+        <form method="POST" action="/setup/api-key" class="flex items-center gap-2">
+          <input type="text" name="api_key" required autocomplete="off"
+                 placeholder="db-api_xxxxxxxx-xxxx-…"
+                 class="flex-1 text-sm rounded-md border border-slate-300 px-3 py-2 font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500" />
+          <button type="submit" class="text-sm px-4 py-2 rounded-md bg-indigo-600 hover:bg-indigo-700 text-white font-medium">
+            Connect
+          </button>
+        </form>
+      {% endif %}
+    </section>
+
+    {# =================== STEP 3: PROFILE =================== #}
+    <section class="mb-3 bg-white border border-slate-200 rounded-lg p-5 shadow-sm" id="step-profile">
+      {{ step_header(3, "Your profile", done=status.profile.done, skipped=status.profile.skipped) }}
+      <p class="text-sm text-slate-600 mb-3">
+        Used in intro-request message drafts so the connector knows who you are + what you do. Editable anytime on <a class="underline text-indigo-600" href="/settings/profile">Your profile</a>.
+      </p>
+      <div class="grid grid-cols-2 gap-2">
+        <input type="text" id="prof-first" placeholder="First name" value="{{ status.profile.first }}"
+               class="text-sm rounded-md border border-slate-300 px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+        <input type="text" id="prof-last" placeholder="Last name" value="{{ status.profile.last }}"
+               class="text-sm rounded-md border border-slate-300 px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+      </div>
+      <input type="text" id="prof-company" placeholder="Company name" value="{{ status.profile.company }}"
+             class="mt-2 w-full text-sm rounded-md border border-slate-300 px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+      <textarea id="prof-desc" rows="2" placeholder="One-sentence description of what your company does (helps personalize intro asks)"
+                class="mt-2 w-full text-sm rounded-md border border-slate-300 px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-500">{{ status.profile.company_desc }}</textarea>
+      <div class="mt-3 flex items-center gap-2">
+        <button type="button" data-savebtn="profile" class="text-sm px-4 py-2 rounded-md bg-indigo-600 hover:bg-indigo-700 text-white font-medium">
+          Save profile
+        </button>
+        {% if not status.profile.done %}
+          <button type="button" data-skipbtn="profile" class="text-xs text-slate-500 underline hover:text-slate-900">
+            Skip for now
+          </button>
+        {% endif %}
+        <span data-status="profile" class="text-xs"></span>
+      </div>
+    </section>
+
+    {# =================== STEP 4: ADD TARGETS =================== #}
+    <section class="mb-3 bg-white border border-slate-200 rounded-lg p-5 shadow-sm">
+      {{ step_header(4, "Add your first targets", done=status.targets.done, skipped=status.targets.skipped) }}
+      {% if status.targets.done %}
+        <p class="text-sm text-slate-600">
+          ✓ <strong>{{ status.targets.count }}</strong> target{{ '' if status.targets.count == 1 else 's' }} loaded.
+          <a class="underline text-indigo-600 ml-1" href="/">View your Targets →</a>
+        </p>
+        <p class="mt-1 text-xs text-slate-500">Add more anytime from <a class="underline" href="/add/targets">Add targets</a>.</p>
+      {% else %}
+        <p class="text-sm text-slate-600 mb-3">
+          Targets are the prospects you want to reach. Pick a method below — you can mix later.
+        </p>
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-2">
+          <a href="/add/targets/paste?from=onboarding"
+             class="text-sm px-3 py-2 rounded-md border border-indigo-300 bg-indigo-50 hover:bg-indigo-100 text-indigo-900 text-center">
+            Paste LinkedIn URLs
+          </a>
+          <a href="/add/targets/sales-nav?from=onboarding"
+             class="text-sm px-3 py-2 rounded-md border border-indigo-300 bg-indigo-50 hover:bg-indigo-100 text-indigo-900 text-center">
+            Scrape Sales Nav
+          </a>
+          <a href="/add/targets/csv?from=onboarding"
+             class="text-sm px-3 py-2 rounded-md border border-indigo-300 bg-indigo-50 hover:bg-indigo-100 text-indigo-900 text-center">
+            Upload CSV
+          </a>
+        </div>
+        <div class="mt-3">
+          <button type="button" data-skipbtn="targets" class="text-xs text-slate-500 underline hover:text-slate-900">Skip for now</button>
+        </div>
+      {% endif %}
+    </section>
+
+    {# =================== STEP 5: ADD SUPPORTERS =================== #}
+    <section class="mb-3 bg-white border border-slate-200 rounded-lg p-5 shadow-sm">
+      {{ step_header(5, "Add your supporters", done=status.supporters.done, skipped=status.supporters.skipped) }}
+      {% if status.supporters.done %}
+        <p class="text-sm text-slate-600">
+          ✓ <strong>{{ status.supporters.count }}</strong> supporter{{ '' if status.supporters.count == 1 else 's' }} marked.
+          <a class="underline text-indigo-600 ml-1" href="/add/supporters/scan">View supporters →</a>
+        </p>
+        <p class="mt-1 text-xs text-slate-500">Add more anytime from <a class="underline" href="/add/supporters">Add supporters</a>.</p>
+      {% else %}
+        <p class="text-sm text-slate-600 mb-3">
+          Supporters are the people most likely to make warm intros for you. The wizard is fastest.
+        </p>
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-2">
+          <a href="/add/supporters/wizard?from=onboarding"
+             class="text-sm px-3 py-2 rounded-md border border-indigo-300 bg-indigo-50 hover:bg-indigo-100 text-indigo-900 text-center">
+            Type names (wizard)
+          </a>
+          <a href="/add/supporters/scan?from=onboarding"
+             class="text-sm px-3 py-2 rounded-md border border-indigo-300 bg-indigo-50 hover:bg-indigo-100 text-indigo-900 text-center">
+            Scan Gmail + Cal
+          </a>
+          <a href="/add/supporters/paste?from=onboarding"
+             class="text-sm px-3 py-2 rounded-md border border-indigo-300 bg-indigo-50 hover:bg-indigo-100 text-indigo-900 text-center">
+            Paste LinkedIn URLs
+          </a>
+        </div>
+        <div class="mt-3">
+          <button type="button" data-skipbtn="supporters" class="text-xs text-slate-500 underline hover:text-slate-900">Skip for now</button>
+        </div>
+      {% endif %}
+    </section>
+
+    {# =================== STEP 6: OPTIONAL INTEGRATIONS =================== #}
+    <section class="mb-3 bg-white border border-slate-200 rounded-lg p-5 shadow-sm">
+      {{ step_header(6, "Optional integrations") }}
+      <p class="text-sm text-slate-600 mb-3">
+        None required — but each one unlocks features. Manage in detail on the <a class="underline text-indigo-600" href="/settings/integrations">Integrations page</a>.
+      </p>
+      <ul class="text-sm space-y-1.5">
+        <li class="flex items-center justify-between gap-3">
+          <span class="flex items-center gap-2">
+            <span class="text-xs">{% if status.resolver.apollo_ready or status.resolver.cse_ready or status.resolver.has_openai_key %}✓{% else %}○{% endif %}</span>
+            <span><strong>Apollo / OpenAI / Google CSE</strong> — LinkedIn resolver, prospecting, lookalikes</span>
+          </span>
+          <a href="/settings/integrations" class="text-xs underline text-indigo-600">{% if status.resolver.done %}Manage{% else %}Set up{% endif %}</a>
+        </li>
+        <li class="flex items-center justify-between gap-3">
+          <span class="flex items-center gap-2">
+            <span class="text-xs">{% if status.google.done %}✓{% else %}○{% endif %}</span>
+            <span><strong>Google Workspace</strong> — Gmail + Calendar scan for supporter candidates</span>
+          </span>
+          <a href="/settings/google" class="text-xs underline text-indigo-600">{% if status.google.done %}Manage{% else %}Connect{% endif %}</a>
+        </li>
+        <li class="flex items-center justify-between gap-3">
+          <span class="flex items-center gap-2">
+            <span class="text-xs">{% if status.slack.done %}✓{% else %}○{% endif %}</span>
+            <span><strong>Slack</strong> — outbound notifications</span>
+          </span>
+          <a href="/settings/slack" class="text-xs underline text-indigo-600">{% if status.slack.done %}Manage{% else %}Set up{% endif %}</a>
+        </li>
+      </ul>
+    </section>
+
+    {# =================== STEP 7: DONE =================== #}
+    <section class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm">
+      {{ step_header(7, "You're ready", done=status.completed) }}
+      {% if status.completed %}
+        <p class="text-sm text-slate-600">
+          Onboarding complete. The kit won't auto-redirect here anymore — come back via the Setup link in the nav if you ever want to revisit a step.
+        </p>
+      {% else %}
+        <p class="text-sm text-slate-600 mb-3">
+          Click below to mark onboarding done — the kit will stop auto-redirecting you here. You can always come back from the Setup link in the nav.
+        </p>
+        <button type="button" id="complete-btn"
+                class="text-sm px-4 py-2 rounded-md bg-emerald-600 hover:bg-emerald-700 text-white font-medium {% if not status.api_key.done %}opacity-50 cursor-not-allowed{% endif %}"
+                {% if not status.api_key.done %}disabled{% endif %}>
+          Finish setup → Take me to my Targets
+        </button>
+        {% if not status.api_key.done %}
+          <p class="mt-2 text-xs text-amber-700">Connect a Draftboard API key (step 2) first.</p>
+        {% endif %}
+      {% endif %}
+    </section>
+
+    <footer class="mt-10 text-xs text-slate-400 text-center">
+      Draftboard API starter · Onboarding
+    </footer>
+  </div>
+
+  <script>
+    (function () {
+      // Profile inline save
+      var profSaveBtn = document.querySelector('[data-savebtn="profile"]');
+      if (profSaveBtn) {
+        profSaveBtn.addEventListener('click', function () {
+          var status = document.querySelector('[data-status="profile"]');
+          var body = {
+            user_first_name: (document.getElementById('prof-first').value || '').trim(),
+            user_last_name:  (document.getElementById('prof-last').value || '').trim(),
+            user_company:    (document.getElementById('prof-company').value || '').trim(),
+            user_company_description: (document.getElementById('prof-desc').value || '').trim(),
+          };
+          if (!body.user_first_name || !body.user_last_name || !body.user_company) {
+            status.textContent = 'First, last, and company are required.';
+            status.className = 'text-xs text-rose-700 ml-2';
+            return;
+          }
+          profSaveBtn.disabled = true;
+          var orig = profSaveBtn.textContent;
+          profSaveBtn.textContent = 'Saving…';
+          fetch('/onboarding/profile', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
+            body: JSON.stringify(body),
+          })
+            .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+            .then(function (resp) {
+              profSaveBtn.disabled = false;
+              profSaveBtn.textContent = orig;
+              var b = resp.body || {};
+              if (!b.ok) {
+                status.textContent = b.error || 'Save failed';
+                status.className = 'text-xs text-rose-700 ml-2';
+                return;
+              }
+              status.textContent = '✓ Saved. Reloading…';
+              status.className = 'text-xs text-emerald-700 ml-2';
+              setTimeout(function () { window.location.reload(); }, 300);
+            })
+            .catch(function (err) {
+              profSaveBtn.disabled = false;
+              profSaveBtn.textContent = orig;
+              status.textContent = 'Network error: ' + (err && err.message ? err.message : 'unknown');
+              status.className = 'text-xs text-rose-700 ml-2';
+            });
+        });
+      }
+
+      // Skip handlers (profile / targets / supporters)
+      document.querySelectorAll('[data-skipbtn]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var step = btn.getAttribute('data-skipbtn');
+          btn.disabled = true;
+          btn.textContent = 'Skipping…';
+          fetch('/onboarding/skip-step', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
+            body: JSON.stringify({ step: step }),
+          })
+            .then(function () { window.location.reload(); })
+            .catch(function () { btn.disabled = false; btn.textContent = 'Skip for now'; });
+        });
+      });
+
+      // Final "Finish setup" button
+      var doneBtn = document.getElementById('complete-btn');
+      if (doneBtn) {
+        doneBtn.addEventListener('click', function () {
+          doneBtn.disabled = true;
+          var orig = doneBtn.textContent;
+          doneBtn.textContent = 'Finishing…';
+          fetch('/onboarding/complete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
+          })
+            .then(function () { window.location.href = '/'; })
+            .catch(function () { doneBtn.disabled = false; doneBtn.textContent = orig; });
+        });
+      }
+    })();
+  </script>
+</body>
+</html>

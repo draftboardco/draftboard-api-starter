@@ -4127,23 +4127,36 @@ def targets_view():
     # "no API key" states.
     if db_app_state_get("welcome_wizard_done") != "1":
         return redirect(url_for("welcome_view"))
-    # First-run nudge: brand-new install with no API key gets bounced to
-    # /setup so they have a paste field instead of an empty Targets page.
-    # The "Continue" action on /setup writes setup_dismissed in app_state.
+    # First-run nudge: brand-new install gets bounced to /onboarding so the
+    # user has a guided flow instead of an empty Targets page. The user
+    # clicks "Finish setup" on the last onboarding step to set
+    # onboarding_completed_at and stop the auto-redirect.
+    #
+    # Three conditions for the auto-redirect:
+    #   1. No API key configured (hard requirement, can't use the kit), OR
+    #   2. Onboarding hasn't been marked complete yet AND the user hasn't
+    #      explicitly dismissed it via setup_dismissed (legacy flag, kept
+    #      for installs that completed the OLD /setup flow).
     #
     # If the user later loses their API key (revoked, .env deleted, env var
     # unset), the dismiss flag would otherwise leave them stranded on a
-    # broken Targets page with no nudge back to /setup. So: when the key
-    # disappears, clear the dismiss flag and re-fire the redirect.
-    if not _current_api_key():
-        if db_app_state_get("setup_dismissed"):
+    # broken Targets page with no nudge back. So: when the key disappears,
+    # clear both dismissal flags + re-fire the redirect.
+    api_key_present = bool(_current_api_key())
+    onboarding_done = bool(
+        db_app_state_get("onboarding_completed_at") or db_app_state_get("setup_dismissed")
+    )
+    if not api_key_present:
+        if db_app_state_get("setup_dismissed") or db_app_state_get("onboarding_completed_at"):
             with _db_lock, _db_connect() as conn:
                 conn.execute(
-                    "DELETE FROM app_state WHERE key = ?",
-                    ("setup_dismissed",),
+                    "DELETE FROM app_state WHERE key IN (?, ?)",
+                    ("setup_dismissed", "onboarding_completed_at"),
                 )
                 conn.commit()
-        return redirect(url_for("setup_view"))
+        return redirect(url_for("onboarding_view"))
+    if not onboarding_done:
+        return redirect(url_for("onboarding_view"))
     force_refresh = request.args.get("refresh") == "1"
     targets, error = fetch_all_targets(force=force_refresh)
 
@@ -9035,6 +9048,22 @@ def _onboarding_status():
     slack_done = slack_is_configured()
     slack_channel = (db_get_slack_config("channel_name") or "").strip() if slack_done else ""
 
+    # ---- New onboarding-step status (profile / targets / supporters) ---
+    user_ctx = _user_context()
+    profile_done = bool(
+        (user_ctx.get("user_first_name") or "").strip()
+        and (user_ctx.get("user_last_name") or "").strip()
+        and (user_ctx.get("user_company") or "").strip()
+    )
+
+    with _db_lock, _db_connect() as conn:
+        target_count = (conn.execute("SELECT COUNT(*) FROM targets_cache").fetchone() or [0])[0]
+        supporter_count = (conn.execute("SELECT COUNT(*) FROM manual_supporters").fetchone() or [0])[0]
+
+    targets_done = target_count > 0 or bool(db_app_state_get("onboarding_skipped_targets"))
+    supporters_done = supporter_count > 0 or bool(db_app_state_get("onboarding_skipped_supporters"))
+    profile_done_or_skipped = profile_done or bool(db_app_state_get("onboarding_skipped_profile"))
+
     # Signup-status nudge: when the customer has no API key yet AND hasn't
     # answered "are you already a Draftboard customer?", the wizard shows a
     # banner asking. Persisted in app_state so the question only fires once.
@@ -9073,24 +9102,107 @@ def _onboarding_status():
             "channel": slack_channel,
             "skipped": bool(db_app_state_get("setup_skipped_slack")),
         },
+        # New onboarding-only steps surfaced on /onboarding.
+        "profile": {
+            "done": profile_done,
+            "skipped": bool(db_app_state_get("onboarding_skipped_profile")),
+            "first": user_ctx.get("user_first_name") or "",
+            "last": user_ctx.get("user_last_name") or "",
+            "company": user_ctx.get("user_company") or "",
+            "company_desc": user_ctx.get("user_company_description") or "",
+        },
+        "targets": {
+            "done": target_count > 0,
+            "skipped": bool(db_app_state_get("onboarding_skipped_targets")),
+            "count": target_count,
+        },
+        "supporters": {
+            "done": supporter_count > 0,
+            "skipped": bool(db_app_state_get("onboarding_skipped_supporters")),
+            "count": supporter_count,
+        },
+        "completed": bool(db_app_state_get("onboarding_completed_at")),
     }
 
 
 @app.route("/setup", methods=["GET"])
 def setup_view():
-    """First-run / onboarding menu. Lists the four integrations with their
-    current status and a 'Set up' button per row. Auto-redirected to from
-    `/` when no API key is configured (unless `setup_dismissed` is set)."""
+    """Legacy URL — 308-redirects to /onboarding so bookmarks keep
+    working. The new onboarding page is a superset of the old setup."""
+    return redirect(url_for("onboarding_view"), code=308)
+
+
+@app.route("/onboarding", methods=["GET"])
+def onboarding_view():
+    """Guided 7-step onboarding flow. Welcome → API key → Profile →
+    Add targets → Add supporters → Optional integrations → Done.
+
+    Each step auto-marks ✓ when its underlying state is satisfied, so
+    re-entering the page picks up where the user left off. Steps that
+    need a full page (Sales Nav scrape, CSV upload, Google OAuth) link
+    out to the existing hub pages.
+    """
     return render_template(
-        "setup_wizard.html",
+        "onboarding.html",
         status=_onboarding_status(),
-        # Pass through any flash-style query param so the API-key form can
-        # show inline validation errors after a paste.
         api_key_error=request.args.get("api_key_error", ""),
         api_key_override_source=request.args.get("api_key_override_source", ""),
         api_key_unverified=request.args.get("api_key_unverified") == "1",
         active="setup",
     )
+
+
+@app.route("/onboarding/skip-step", methods=["POST"])
+def onboarding_skip_step():
+    """Mark a wizard step skipped so the user can move past it without
+    completing the underlying action. Used for profile / targets /
+    supporters."""
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+    body = request.get_json(silent=True) or {}
+    step = (body.get("step") or "").strip()
+    if step not in ("profile", "targets", "supporters"):
+        return jsonify({"ok": False, "error": "unknown step"}), 400
+    db_app_state_set(f"onboarding_skipped_{step}", str(int(time.time())))
+    return jsonify({"ok": True, "skipped": step})
+
+
+@app.route("/onboarding/complete", methods=["POST"])
+def onboarding_complete():
+    """Mark onboarding fully complete. Stops the auto-redirect from /."""
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+    db_app_state_set("onboarding_completed_at", str(int(time.time())))
+    return jsonify({"ok": True})
+
+
+@app.route("/onboarding/profile", methods=["POST"])
+def onboarding_save_profile():
+    """Inline profile save from step 3. Same fields as /settings/profile
+    but submits via JSON so we can stay on the onboarding page."""
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+    body = request.get_json(silent=True) or {}
+    fields = {
+        "user_first_name": (body.get("user_first_name") or "").strip()[:100],
+        "user_last_name": (body.get("user_last_name") or "").strip()[:100],
+        "user_company": (body.get("user_company") or "").strip()[:200],
+        "user_company_description": (body.get("user_company_description") or "").strip()[:1000],
+    }
+    if not fields["user_first_name"] or not fields["user_last_name"] or not fields["user_company"]:
+        return jsonify({"ok": False, "error": "First name, last name, and company are required."}), 400
+    for k, v in fields.items():
+        db_app_state_set(k, v)
+    # Invalidate the per-request cache so the next render sees the new values.
+    try:
+        from flask import g
+        g._user_context_cache = None
+    except (ImportError, RuntimeError):
+        pass
+    return jsonify({"ok": True, **fields})
 
 
 @app.route("/setup/api-key", methods=["POST"])
