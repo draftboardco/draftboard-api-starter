@@ -915,6 +915,17 @@ def init_db():
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_lookalike_targets_status ON lookalike_targets_discovered(status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_lookalike_targets_discovered_at ON lookalike_targets_discovered(discovered_at DESC)")
+        # v0.3 columns: source ('apollo'|'cse') + snippet (the bio chunk
+        # GPT used for its reasoning, so the user can audit the score).
+        # Added via ALTER so existing data.db files don't lose their rows.
+        for col_sql in (
+            "ALTER TABLE lookalike_targets_discovered ADD COLUMN source TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE lookalike_targets_discovered ADD COLUMN snippet TEXT NOT NULL DEFAULT ''",
+        ):
+            try:
+                conn.execute(col_sql)
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
         # Manual path lists — uploaded CSVs from external network owners
         # (typically the customer's investors). Each list is one upload;
@@ -5690,6 +5701,29 @@ def settings_icp_save():
 
 LOOKALIKE_CADENCE_DEFAULT = 10
 LOOKALIKE_CADENCE_OPTIONS = (10, 30, 50)
+# Minimum AI confidence to show by default. The page UI exposes a
+# "show low confidence" toggle that reveals everything below.
+LOOKALIKE_SCORE_FLOOR = 0.7
+
+
+def _ll_name_company_key(name: str, company: str) -> str:
+    """Build a stable dedup key from name + company. Lowercases, strips
+    common suffixes/punctuation, collapses whitespace. Matches across
+    "Yoav Oz · Rep AI" and "Yoav Oz · Rep" by trimming the company to
+    its leading alphanumeric word if the full match misses.
+
+    Returns "" when name OR company is empty — caller must filter those.
+    """
+    def _norm(s: str) -> str:
+        s = (s or "").strip().lower()
+        s = re.sub(r"[^\w\s]", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+    n = _norm(name)
+    c = _norm(company)
+    if not n or not c:
+        return ""
+    return f"{n}||{c}"
 
 
 def db_lookalike_save(rows: list[dict]) -> int:
@@ -5712,8 +5746,9 @@ def db_lookalike_save(rows: list[dict]) -> int:
             conn.execute(
                 "INSERT INTO lookalike_targets_discovered "
                 "(linkedin_url_norm, linkedin_url, account_key, account_display_name, "
-                " name, title, ai_confidence, ai_reason, status, discovered_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                " name, title, ai_confidence, ai_reason, source, snippet, "
+                " status, discovered_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
                 (
                     norm, r.get("linkedin_url") or "",
                     r.get("account_key") or "",
@@ -5722,6 +5757,8 @@ def db_lookalike_save(rows: list[dict]) -> int:
                     r.get("title") or "",
                     float(r.get("ai_confidence") or 0),
                     (r.get("ai_reason") or "")[:500],
+                    (r.get("source") or "")[:20],
+                    (r.get("snippet") or "")[:600],
                     now, now,
                 ),
             )
@@ -5734,7 +5771,8 @@ def db_lookalike_list(status: str = "pending", limit: int = 200) -> list[dict]:
     with _db_lock, _db_connect() as conn:
         cur = conn.execute(
             "SELECT linkedin_url_norm, linkedin_url, account_key, account_display_name, "
-            "       name, title, ai_confidence, ai_reason, status, discovered_at "
+            "       name, title, ai_confidence, ai_reason, source, snippet, "
+            "       status, discovered_at "
             "FROM lookalike_targets_discovered "
             "WHERE status = ? "
             "ORDER BY discovered_at DESC, ai_confidence DESC LIMIT ?",
@@ -5823,6 +5861,21 @@ def _lookalike_run_batch(target_count: int, tag_filter: str = "") -> dict:
     errors: list[str] = []
     last_idx = start_idx
 
+    # Build the name+company dedup set ONCE. Catches the case where a
+    # candidate's LinkedIn URL slug differs from the kit's stored slug
+    # (e.g. il.linkedin.com vs www., or the user changed their vanity
+    # URL). The primary URL-based dedup runs per-account inside
+    # _prospecting_dedupe; this is a belt-and-suspenders second pass.
+    _ll_all_targets, _ = fetch_all_targets()
+    existing_name_company: set = {
+        _ll_name_company_key(
+            (t.get("firstName") or "") + " " + (t.get("lastName") or ""),
+            (t.get("position") or {}).get("companyName") or "",
+        )
+        for t in _ll_all_targets
+    }
+    existing_name_company.discard("")
+
     for i in range(len(account_keys)):
         if found_new >= target_count:
             break
@@ -5858,14 +5911,26 @@ def _lookalike_run_batch(target_count: int, tag_filter: str = "") -> dict:
             except Exception:  # noqa: BLE001
                 pass
 
+        # Apollo-first: cleaner data (structured titles, current company)
+        # at the cost of slightly lower recall. CSE runs as fallback when
+        # Apollo has no Israeli / EMEA coverage for this account.
         cands, err = _prospecting_search_people(
             display_name, titles[:10], domain, keys,
             company_linkedin_url=company_linkedin,
+            apollo_first=True,
         )
         if err and not cands:
             errors.append(f"{display_name}: {err}")
             continue
         cands = _prospecting_dedupe(cands, existing_norm)
+
+        # Belt-and-suspenders name+company dedup against the full
+        # existing-target set built once above the loop.
+        cands = [c for c in cands if _ll_name_company_key(
+            c.get("name") or "",
+            c.get("organization_name") or display_name,
+        ) not in existing_name_company]
+
         accounts_scanned += 1
 
         # Persist all NEW (non-dup) candidates from this account. Cap
@@ -5885,6 +5950,12 @@ def _lookalike_run_batch(target_count: int, tag_filter: str = "") -> dict:
                 "title": (c.get("title") or c.get("position") or "").strip(),
                 "ai_confidence": c.get("ai_confidence") or 0,
                 "ai_reason": (c.get("ai_reason") or "")[:500],
+                # New: track which engine surfaced this row + the bio
+                # snippet so the user can audit AI reasoning later. The
+                # CSE path tags rows with source="cse"; Apollo doesn't
+                # tag, so absence of source means apollo.
+                "source": c.get("source") or "apollo",
+                "snippet": (c.get("snippet") or "")[:600],
             })
         inserted = db_lookalike_save(rows_to_save)
         found_new += inserted
@@ -5948,7 +6019,19 @@ def prospecting_lookalike_targets_view():
     keys = _load_resolver_keys()
     keys_ready = bool(keys.get("apollo_api_key") or (keys.get("google_cse_api_key") and keys.get("google_cse_id")))
 
+    # Whether to surface low-confidence (score < LOOKALIKE_SCORE_FLOOR)
+    # results. Default OFF — high-confidence only — so the user sees
+    # signal first. Toggle persists via ?show_low=1 on the query string.
+    show_low = (request.args.get("show_low") or "").strip() == "1"
+
     pending = db_lookalike_list("pending", limit=500)
+    if not show_low:
+        pending = [p for p in pending if (p.get("ai_confidence") or 0) >= LOOKALIKE_SCORE_FLOOR]
+    low_conf_count = (
+        db_lookalike_counts().get("pending", 0)
+        - sum(1 for p in db_lookalike_list("pending", limit=500)
+              if (p.get("ai_confidence") or 0) >= LOOKALIKE_SCORE_FLOOR)
+    )
     added = db_lookalike_list("added", limit=200)
     skipped = db_lookalike_list("skipped", limit=200)
 
@@ -5968,6 +6051,9 @@ def prospecting_lookalike_targets_view():
         counts=db_lookalike_counts(),
         all_tags=db_all_tags_with_counts(),
         current_tag=(db_app_state_get("lookalike_targets_tag_filter") or "").strip(),
+        score_floor=LOOKALIKE_SCORE_FLOOR,
+        show_low=show_low,
+        low_conf_count=max(0, low_conf_count),
     )
 
 

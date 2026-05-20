@@ -81,7 +81,7 @@
     </section>
 
     {# ---- Stats strip ---- #}
-    <section class="mb-4 flex items-center gap-4 text-xs text-slate-500">
+    <section class="mb-4 flex items-center gap-4 text-xs text-slate-500 flex-wrap">
       <span><strong class="text-slate-900" id="count-pending">{{ counts.pending }}</strong> pending</span>
       <span>·</span>
       <span><strong class="text-emerald-700" id="count-added">{{ counts.added }}</strong> added</span>
@@ -89,6 +89,19 @@
       <span><strong class="text-slate-500" id="count-skipped">{{ counts.skipped }}</strong> skipped</span>
       <span class="text-slate-400">· Persists across sessions; each decision is sticky.</span>
     </section>
+
+    {# ---- Score-floor toggle ---- #}
+    {% if low_conf_count > 0 or show_low %}
+      <section class="mb-4 px-3 py-2 rounded-md border border-slate-200 bg-white text-xs text-slate-600 flex items-center justify-between gap-3">
+        {% if show_low %}
+          <span>Showing all confidence scores including low-confidence matches.</span>
+          <a href="?show_low=0" class="text-indigo-600 hover:underline whitespace-nowrap">← Hide low confidence</a>
+        {% else %}
+          <span>Hiding <strong>{{ low_conf_count }}</strong> low-confidence match{{ '' if low_conf_count == 1 else 'es' }} (score &lt; {{ (score_floor * 10) | int }}/10).</span>
+          <a href="?show_low=1" class="text-indigo-600 hover:underline whitespace-nowrap">Show them →</a>
+        {% endif %}
+      </section>
+    {% endif %}
 
     {# ---- Pending grouped by account ---- #}
     <section id="pending-section" class="space-y-4">
@@ -143,12 +156,25 @@
                     {% endif %}
                   </div>
                   <div class="flex-1 min-w-0">
-                    <div class="text-sm font-semibold text-slate-900 truncate">{{ c.name or '(unnamed)' }}</div>
+                    <div class="flex items-center gap-2 flex-wrap">
+                      <span class="text-sm font-semibold text-slate-900 truncate">{{ c.name or '(unnamed)' }}</span>
+                      {% if c.source == 'apollo' %}
+                        <span class="text-[10px] px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-100" title="Apollo: structured job title from Apollo's people DB. More reliable than scraped headlines.">Apollo</span>
+                      {% elif c.source == 'cse' %}
+                        <span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 border border-slate-200" title="Google CSE: title is the LinkedIn page headline, scraped from search results. May be a tagline rather than a structured job title.">CSE</span>
+                      {% endif %}
+                    </div>
                     {% if show_title %}
                       <div class="text-xs text-slate-600 truncate">{{ c.title }}</div>
                     {% endif %}
                     {% if c.ai_reason %}
                       <div class="mt-1 text-[11px] text-slate-500 line-clamp-2">{{ c.ai_reason }}</div>
+                    {% endif %}
+                    {% if c.snippet %}
+                      <details class="mt-1">
+                        <summary class="text-[11px] text-slate-400 cursor-pointer hover:text-slate-600">Show the bio snippet GPT saw</summary>
+                        <p class="mt-1 px-2 py-1.5 bg-slate-50 border border-slate-200 rounded text-[11px] text-slate-600 whitespace-pre-wrap">{{ c.snippet }}</p>
+                      </details>
                     {% endif %}
                     <a href="{{ c.linkedin_url }}" target="_blank" rel="noopener" class="mt-1 inline-block text-[11px] text-indigo-600 hover:underline">↗ LinkedIn</a>
                   </div>
