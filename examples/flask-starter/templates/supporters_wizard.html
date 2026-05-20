@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Draftboard — Supporter wizard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    /* Autocomplete dropdown — positioned absolute under each input. */
+    .ac-wrap { position: relative; }
+    .ac-list { position: absolute; left: 0; right: 0; top: 100%; z-index: 30;
+               max-height: 320px; overflow-y: auto; background: white;
+               border: 1px solid #cbd5e1; border-radius: 6px;
+               box-shadow: 0 8px 24px rgba(0,0,0,.08); margin-top: 4px; }
+    .ac-list[hidden] { display: none; }
+    .ac-item { padding: 6px 10px; cursor: pointer; font-size: 13px; line-height: 1.3; }
+    .ac-item.active { background: #eef2ff; }
+    .ac-item .sub { font-size: 11px; color: #64748b; }
+    .ac-item .li { font-size: 10px; color: #94a3b8; }
+    .ac-item .already { font-size: 10px; padding: 1px 6px; border-radius: 4px;
+                       background: #f1f5f9; color: #64748b; margin-left: 4px; }
+    /* Chip styling for picked connectors */
+    .chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 6px 2px 8px;
+            border-radius: 999px; background: #eef2ff; color: #3730a3;
+            font-size: 12px; margin: 2px 4px 2px 0; }
+    .chip button { color: #64748b; padding: 0 4px; font-size: 14px; line-height: 1; }
+    .chip button:hover { color: #1e293b; }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    {% include "_nav.html" %}
+
+    <header class="mb-6">
+      <h1 class="text-2xl font-semibold tracking-tight">Who can vouch for you?</h1>
+      <p class="text-sm text-slate-500 mt-1">
+        Start typing names; we'll autocomplete against your Draftboard network
+        ({{ network_size }} connections). Use <kbd class="px-1 bg-slate-100 rounded text-[10px]">↓</kbd>
+        / <kbd class="px-1 bg-slate-100 rounded text-[10px]">Tab</kbd> /
+        <kbd class="px-1 bg-slate-100 rounded text-[10px]">Enter</kbd> to pick a match.
+      </p>
+    </header>
+
+    {% if network_size == 0 %}
+      <div class="mb-6 rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+        <strong>Your network is empty.</strong> Run a Draftboard sync first so the autocomplete has connections to match against.
+      </div>
+    {% endif %}
+
+    <div id="loading-banner" class="mb-4 text-xs text-slate-500">
+      Loading your network for autocomplete…
+    </div>
+
+    <section id="form" class="space-y-5" style="display:none">
+      {% for prompt in prompts %}
+        <div class="bg-white border border-slate-200 rounded-lg p-5 shadow-sm">
+          <h2 class="text-base font-semibold text-slate-900">{{ prompt.title }}</h2>
+          <p class="text-xs text-slate-500 mt-1 mb-3">{{ prompt.hint }}</p>
+          <div class="ac-wrap" data-bucket="{{ prompt.key }}">
+            <input
+              type="text"
+              class="ac-input w-full text-sm rounded-md border border-slate-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+              placeholder="Start typing a name…"
+              autocomplete="off"
+            />
+            <div class="ac-list" hidden></div>
+          </div>
+          <div class="ac-chips mt-2" data-chips-for="{{ prompt.key }}"></div>
+        </div>
+      {% endfor %}
+
+      <div class="flex items-center justify-between gap-3 sticky bottom-0 bg-slate-50 py-3 border-t border-slate-200">
+        <p class="text-xs text-slate-500">
+          <span id="picked-count">0</span> selected. Click below to tag them all as supporters.
+        </p>
+        <button
+          type="button"
+          id="mark-btn"
+          disabled
+          class="inline-flex items-center justify-center rounded-md bg-emerald-600 hover:bg-emerald-700 px-4 py-2 text-sm font-medium text-white shadow disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          Mark selected as supporters
+        </button>
+      </div>
+    </section>
+
+    <section id="step-done" class="hidden">
+      <div class="rounded-md border border-emerald-300 bg-emerald-50 px-4 py-4 text-sm text-emerald-900">
+        <strong id="done-title"></strong>
+        <p class="mt-1" id="done-detail"></p>
+      </div>
+      <div class="mt-4 flex items-center gap-3">
+        <a href="/supporters/candidates" class="text-sm text-indigo-700 underline">View all supporters →</a>
+        <button
+          type="button"
+          id="restart-btn"
+          class="text-xs text-slate-500 underline hover:text-slate-900"
+        >
+          Add more names
+        </button>
+      </div>
+    </section>
+
+    <footer class="mt-10 text-xs text-slate-400 text-center">
+      Draftboard API starter · Supporter wizard
+    </footer>
+  </div>
+
+  <script>
+    (function () {
+      var loadingBanner = document.getElementById('loading-banner');
+      var formEl = document.getElementById('form');
+      var stepDone = document.getElementById('step-done');
+      var markBtn = document.getElementById('mark-btn');
+      var pickedCountEl = document.getElementById('picked-count');
+      var restartBtn = document.getElementById('restart-btn');
+      var doneTitle = document.getElementById('done-title');
+      var doneDetail = document.getElementById('done-detail');
+
+      // ----- DATA -----
+      // Connector index, loaded once on page boot. Each entry:
+      //   { name, name_norm, linkedin, title, company, already_supporter }
+      var connectors = [];
+
+      // Picked supporters, keyed by LinkedIn URL (normalized) so the same
+      // person can't be added twice across different buckets.
+      // Map { normUrl -> { linkedin_url, display_name, bucket } }
+      var picked = new Map();
+
+      function normalizeName(s) {
+        return String(s || '').toLowerCase()
+          .replace(/[^\w\s'-]/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+      }
+      function normalizeLinkedIn(s) {
+        return String(s || '').toLowerCase().replace(/\/$/, '').replace(/^https?:\/\/(www\.)?/, '');
+      }
+      function escapeHtml(s) {
+        return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+          return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
+        });
+      }
+
+      // ----- FUZZY MATCH -----
+      // For each connector with a name that startsWith / contains / has all
+      // query tokens, score and return top N. Cheap enough at ~5000 entries
+      // to run on every keystroke (under 5ms typical).
+      function scoreMatch(query_norm, connector) {
+        var name = connector.name_norm;
+        if (!name) return 0;
+        if (name === query_norm) return 1.0;
+        if (name.indexOf(query_norm) === 0) return 0.95;          // startsWith
+        if (name.indexOf(' ' + query_norm) !== -1) return 0.9;    // word-startsWith
+        if (name.indexOf(query_norm) !== -1) return 0.8;          // substring
+        // All query tokens appear (any order) - handles "ritter harry"
+        var tokens = query_norm.split(' ').filter(function (t) { return t; });
+        if (tokens.length > 1) {
+          var allPresent = tokens.every(function (t) { return name.indexOf(t) !== -1; });
+          if (allPresent) return 0.75;
+        }
+        return 0;
+      }
+      function findMatches(query, limit) {
+        var q = normalizeName(query);
+        if (!q || q.length < 1) return [];
+        var scored = [];
+        for (var i = 0; i < connectors.length; i++) {
+          var s = scoreMatch(q, connectors[i]);
+          if (s > 0) scored.push({ score: s, c: connectors[i] });
+        }
+        scored.sort(function (a, b) { return b.score - a.score; });
+        return scored.slice(0, limit || 8).map(function (r) { return r.c; });
+      }
+
+      // ----- AUTOCOMPLETE PER INPUT -----
+      function attachAutocomplete(wrap) {
+        var bucket = wrap.getAttribute('data-bucket');
+        var input = wrap.querySelector('.ac-input');
+        var list = wrap.querySelector('.ac-list');
+        var activeIdx = -1;
+        var currentMatches = [];
+
+        function render() {
+          if (currentMatches.length === 0) {
+            list.hidden = true;
+            list.innerHTML = '';
+            return;
+          }
+          var html = currentMatches.map(function (c, i) {
+            var sub = [c.title, c.company].filter(function (x) { return x; }).map(escapeHtml).join(' · ');
+            var li = c.linkedin ? '<div class="li">' + escapeHtml(c.linkedin) + '</div>' : '';
+            var alreadyTag = c.already_supporter ? '<span class="already">already a supporter</span>' : '';
+            return '<div class="ac-item' + (i === activeIdx ? ' active' : '') + '" data-idx="' + i + '">'
+              + '<div>' + escapeHtml(c.name) + alreadyTag + '</div>'
+              + (sub ? '<div class="sub">' + sub + '</div>' : '')
+              + li
+              + '</div>';
+          }).join('');
+          list.innerHTML = html;
+          list.hidden = false;
+          // Click handler on each item
+          list.querySelectorAll('.ac-item').forEach(function (el) {
+            el.addEventListener('mousedown', function (e) {
+              e.preventDefault(); // prevents blur before selection
+              var idx = parseInt(el.getAttribute('data-idx'), 10);
+              selectMatch(idx);
+            });
+            el.addEventListener('mouseenter', function () {
+              activeIdx = parseInt(el.getAttribute('data-idx'), 10);
+              updateActiveClass();
+            });
+          });
+        }
+        function updateActiveClass() {
+          list.querySelectorAll('.ac-item').forEach(function (el, i) {
+            el.classList.toggle('active', i === activeIdx);
+          });
+          var activeEl = list.querySelector('.ac-item.active');
+          if (activeEl) activeEl.scrollIntoView({ block: 'nearest' });
+        }
+        function refresh() {
+          currentMatches = findMatches(input.value, 8);
+          activeIdx = currentMatches.length > 0 ? 0 : -1;
+          render();
+        }
+        function selectMatch(idx) {
+          if (idx < 0 || idx >= currentMatches.length) return;
+          var c = currentMatches[idx];
+          var norm = normalizeLinkedIn(c.linkedin);
+          if (norm && !picked.has(norm)) {
+            picked.set(norm, {
+              linkedin_url: c.linkedin,
+              display_name: c.name,
+              bucket: bucket,
+              already_supporter: c.already_supporter,
+            });
+            renderChips(bucket);
+            refreshPickedCount();
+          }
+          input.value = '';
+          currentMatches = [];
+          list.hidden = true;
+          input.focus();
+        }
+
+        input.addEventListener('input', refresh);
+        input.addEventListener('focus', refresh);
+        input.addEventListener('blur', function () {
+          // Delay so click on dropdown registers first.
+          setTimeout(function () { list.hidden = true; }, 120);
+        });
+        input.addEventListener('keydown', function (e) {
+          if (list.hidden || currentMatches.length === 0) {
+            if (e.key === 'ArrowDown') { refresh(); }
+            return;
+          }
+          if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            activeIdx = (activeIdx + 1) % currentMatches.length;
+            updateActiveClass();
+          } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            activeIdx = (activeIdx - 1 + currentMatches.length) % currentMatches.length;
+            updateActiveClass();
+          } else if (e.key === 'Enter' || e.key === 'Tab') {
+            if (activeIdx >= 0) {
+              e.preventDefault();
+              selectMatch(activeIdx);
+            }
+          } else if (e.key === 'Escape') {
+            list.hidden = true;
+          }
+        });
+      }
+
+      // ----- CHIPS -----
+      function renderChips(bucket) {
+        var container = document.querySelector('.ac-chips[data-chips-for="' + bucket + '"]');
+        if (!container) return;
+        var chips = [];
+        picked.forEach(function (entry, norm) {
+          if (entry.bucket !== bucket) return;
+          chips.push(
+            '<span class="chip" data-norm="' + escapeHtml(norm) + '">' +
+              escapeHtml(entry.display_name) +
+              (entry.already_supporter ? ' <span class="text-[10px] text-slate-500">(already)</span>' : '') +
+              '<button type="button" aria-label="Remove">×</button>' +
+            '</span>'
+          );
+        });
+        container.innerHTML = chips.join('');
+        container.querySelectorAll('.chip').forEach(function (el) {
+          var norm = el.getAttribute('data-norm');
+          el.querySelector('button').addEventListener('click', function () {
+            picked.delete(norm);
+            renderChips(bucket);
+            refreshPickedCount();
+          });
+        });
+      }
+      function refreshPickedCount() {
+        var n = 0;
+        picked.forEach(function (e) { if (!e.already_supporter) n++; });
+        pickedCountEl.textContent = n;
+        markBtn.disabled = n === 0;
+      }
+
+      // ----- INIT: load the index ------
+      fetch('/supporters/wizard/index', { credentials: 'same-origin' })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          if (!data.ok) {
+            loadingBanner.textContent = 'Failed to load network: ' + (data.error || 'unknown');
+            loadingBanner.className = 'mb-4 text-xs text-rose-700';
+            return;
+          }
+          // Precompute name_norm so we don't redo it per keystroke.
+          connectors = (data.connectors || []).map(function (c) {
+            return Object.assign({}, c, { name_norm: normalizeName(c.name) });
+          });
+          loadingBanner.textContent = 'Ready · ' + connectors.length + ' connections loaded.';
+          loadingBanner.className = 'mb-4 text-xs text-emerald-700';
+          formEl.style.display = '';
+          document.querySelectorAll('.ac-wrap').forEach(attachAutocomplete);
+        })
+        .catch(function (err) {
+          loadingBanner.textContent = 'Network error loading index: ' + (err && err.message ? err.message : 'unknown');
+          loadingBanner.className = 'mb-4 text-xs text-rose-700';
+        });
+
+      // ----- SUBMIT -----
+      markBtn.addEventListener('click', function () {
+        var selections = [];
+        picked.forEach(function (entry) {
+          if (entry.already_supporter) return;
+          selections.push({
+            linkedin_url: entry.linkedin_url,
+            display_name: entry.display_name,
+          });
+        });
+        if (selections.length === 0) return;
+        markBtn.disabled = true;
+        var orig = markBtn.textContent;
+        markBtn.textContent = 'Marking…';
+        fetch('/supporters/wizard/mark', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ selections: selections }),
+        })
+          .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+          .then(function (resp) {
+            markBtn.disabled = false;
+            markBtn.textContent = orig;
+            var b = resp.body || {};
+            if (!b.ok) {
+              alert(b.error || 'Mark failed');
+              return;
+            }
+            doneTitle.textContent = '✓ Marked ' + b.added + ' new supporter' + (b.added === 1 ? '' : 's');
+            var detailBits = [];
+            if (b.already_supporter) detailBits.push(b.already_supporter + ' were already tagged');
+            if (b.errors && b.errors.length) detailBits.push(b.errors.length + ' had errors');
+            doneDetail.textContent = detailBits.length ? '(' + detailBits.join(', ') + ')' : '';
+            formEl.style.display = 'none';
+            stepDone.classList.remove('hidden');
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+          })
+          .catch(function (err) {
+            markBtn.disabled = false;
+            markBtn.textContent = orig;
+            alert('Network error: ' + (err && err.message ? err.message : 'unknown'));
+          });
+      });
+
+      restartBtn.addEventListener('click', function () {
+        picked = new Map();
+        document.querySelectorAll('.ac-chips').forEach(function (c) { c.innerHTML = ''; });
+        document.querySelectorAll('.ac-input').forEach(function (i) { i.value = ''; });
+        refreshPickedCount();
+        formEl.style.display = '';
+        stepDone.classList.add('hidden');
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      });
+    })();
+  </script>
+</body>
+</html>
