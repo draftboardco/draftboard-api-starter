@@ -57,8 +57,12 @@
     <a href="/add/shortlist-responses" class="block px-4 py-1.5 transition {% if active == 'shortlist_responses' %}bg-indigo-50 text-indigo-900 font-medium border-l-4 border-indigo-600 pl-3{% else %}text-slate-600 hover:bg-slate-100 border-l-4 border-transparent{% endif %}">Shortlist responses</a>
 
     {# --- PROSPECTING --- #}
+    {# Lookalike accounts hidden from nav until the engine is rebuilt
+       (persistence + score-floor + possible Apollo→Ocean.io swap). Route
+       at /prospecting/lookalikes stays alive for the feature branch
+       that's iterating on it. #}
     <div class="px-3 mt-4 mb-1 text-[10px] uppercase tracking-wider text-slate-400 font-semibold">Prospecting</div>
-    <a href="/prospecting/lookalikes" class="block px-4 py-1.5 transition {% if active == 'prospecting_lookalikes' %}bg-indigo-50 text-indigo-900 font-medium border-l-4 border-indigo-600 pl-3{% else %}text-slate-600 hover:bg-slate-100 border-l-4 border-transparent{% endif %}">Lookalike accounts</a>
+    <a href="/prospecting/lookalike-targets" class="block px-4 py-1.5 transition {% if active == 'prospecting_lookalike_targets' %}bg-indigo-50 text-indigo-900 font-medium border-l-4 border-indigo-600 pl-3{% else %}text-slate-600 hover:bg-slate-100 border-l-4 border-transparent{% endif %}">Lookalike targets</a>
 
     {# --- SETTINGS --- #}
     <div class="px-3 mt-4 mb-1 text-[10px] uppercase tracking-wider text-slate-400 font-semibold">Settings</div>
@@ -92,6 +96,52 @@
     </div>
   </div>
 </aside>
+
+{# Onboarding nudge banner. Renders inline at the top of every page when
+   onboarding isn't complete + the user hasn't dismissed it. The aside
+   above is position: fixed so it doesn't share flow; this div lands at
+   the top of whatever max-w wrapper the page uses. #}
+{% if onboarding_banner and onboarding_banner.show %}
+  <div id="onboarding-banner" class="mb-4 -mt-4 rounded-md border border-indigo-200 bg-indigo-50 px-4 py-2.5 text-sm text-indigo-900 flex items-center justify-between gap-3">
+    <div class="flex items-center gap-3 min-w-0">
+      <div class="flex-shrink-0 w-7 h-7 rounded-full bg-indigo-600 text-white text-xs font-bold flex items-center justify-center">
+        {{ onboarding_banner.progress_done }}
+      </div>
+      <div class="min-w-0">
+        <div class="font-medium truncate">
+          {{ onboarding_banner.progress_done }} of {{ onboarding_banner.progress_total }} setup steps done.
+          {% if onboarding_banner.next_step_label %}Next: <span class="text-indigo-700">{{ onboarding_banner.next_step_label }}</span>.{% endif %}
+        </div>
+        <div class="text-[11px] text-indigo-700/80">
+          Sample data is loaded so you can explore right away. Finish setup to load your own.
+        </div>
+      </div>
+    </div>
+    <div class="flex items-center gap-2 flex-shrink-0">
+      <a href="/onboarding" class="text-xs px-3 py-1.5 rounded-md bg-indigo-600 hover:bg-indigo-700 text-white font-medium">
+        Finish setup →
+      </a>
+      <button type="button" id="onboarding-banner-dismiss"
+              class="text-indigo-400 hover:text-indigo-700 text-lg leading-none px-1"
+              aria-label="Dismiss">×</button>
+    </div>
+  </div>
+  <script>
+    (function () {
+      var btn = document.getElementById('onboarding-banner-dismiss');
+      var banner = document.getElementById('onboarding-banner');
+      if (!btn || !banner) return;
+      btn.addEventListener('click', function () {
+        banner.style.display = 'none';
+        fetch('/onboarding/dismiss-banner', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+        }).catch(function () {});
+      });
+    })();
+  </script>
+{% endif %}
 
 <script>
 (function () {

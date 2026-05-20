@@ -385,6 +385,66 @@ def _inject_globals():
         f"?subject={quote('Draftboard kit feedback / bug report')}"
         f"&body={quote(chr(10).join(body_lines))}"
     )
+    # --- Onboarding banner state ---
+    # Shown on every page when onboarding isn't complete AND the user
+    # hasn't dismissed the banner. Reset whenever progress advances so
+    # the banner reappears with the new count if the user crossed a
+    # step without explicitly finishing setup.
+    onboarding_banner = {"show": False}
+    try:
+        completed = bool(
+            db_app_state_get("onboarding_completed_at")
+            or db_app_state_get("setup_dismissed")
+        )
+        if not completed:
+            stat = _onboarding_status()
+            # Count: each step counts when done OR explicitly skipped.
+            done = 0
+            steps = [
+                stat["api_key"]["done"],
+                stat["profile"]["done"] or stat["profile"]["skipped"],
+                stat["targets"]["done"] or stat["targets"]["skipped"],
+                stat["supporters"]["done"] or stat["supporters"]["skipped"],
+                stat["resolver"]["done"] or stat["resolver"]["skipped"],
+                stat["google"]["done"] or stat["google"]["skipped"],
+                stat["slack"]["done"] or stat["slack"]["skipped"],
+            ]
+            done = sum(1 for s in steps if s)
+            total = len(steps)
+            # Dismissal is keyed on the progress count, so the banner
+            # reappears if the user makes more progress after dismissing.
+            dismissed_at_count = db_app_state_get("onboarding_banner_dismissed_at_count")
+            try:
+                dismissed_at_count = int(dismissed_at_count or "-1")
+            except ValueError:
+                dismissed_at_count = -1
+            # Next step label — first incomplete step
+            next_label = ""
+            labels = [
+                ("api_key", "Connect your Draftboard API key"),
+                ("profile", "Fill in your profile"),
+                ("targets", "Add your first targets"),
+                ("supporters", "Add supporters"),
+                ("resolver", "Set up Apollo / OpenAI"),
+                ("google", "Connect Google Workspace"),
+                ("slack", "Set up Slack"),
+            ]
+            for i, (_, lbl) in enumerate(labels):
+                if not steps[i]:
+                    next_label = lbl
+                    break
+            onboarding_banner = {
+                "show": done < total and done > dismissed_at_count,
+                "progress_done": done,
+                "progress_total": total,
+                "next_step_label": next_label,
+            }
+    except Exception:  # noqa: BLE001
+        # The context processor runs on every render, including ones
+        # before the DB is ready. Suppress + skip the banner rather than
+        # 500'ing every page.
+        pass
+
     return {
         "feedback_mailto": feedback_mailto,
         # Used by the nav sync pill: when no API key is set, the idle CTA
@@ -394,6 +454,7 @@ def _inject_globals():
         # Status dropdown menu shares one meta dict across every connector
         # card render — no need for every route to pass it explicitly.
         "intro_status_meta_all": INTRO_STATUS_META,
+        "onboarding_banner": onboarding_banner,
     }
 
 # Per-field input caps for resolve endpoints. Apollo / CSE / OpenAI all reject
@@ -4127,36 +4188,11 @@ def targets_view():
     # "no API key" states.
     if db_app_state_get("welcome_wizard_done") != "1":
         return redirect(url_for("welcome_view"))
-    # First-run nudge: brand-new install gets bounced to /onboarding so the
-    # user has a guided flow instead of an empty Targets page. The user
-    # clicks "Finish setup" on the last onboarding step to set
-    # onboarding_completed_at and stop the auto-redirect.
-    #
-    # Three conditions for the auto-redirect:
-    #   1. No API key configured (hard requirement, can't use the kit), OR
-    #   2. Onboarding hasn't been marked complete yet AND the user hasn't
-    #      explicitly dismissed it via setup_dismissed (legacy flag, kept
-    #      for installs that completed the OLD /setup flow).
-    #
-    # If the user later loses their API key (revoked, .env deleted, env var
-    # unset), the dismiss flag would otherwise leave them stranded on a
-    # broken Targets page with no nudge back. So: when the key disappears,
-    # clear both dismissal flags + re-fire the redirect.
-    api_key_present = bool(_current_api_key())
-    onboarding_done = bool(
-        db_app_state_get("onboarding_completed_at") or db_app_state_get("setup_dismissed")
-    )
-    if not api_key_present:
-        if db_app_state_get("setup_dismissed") or db_app_state_get("onboarding_completed_at"):
-            with _db_lock, _db_connect() as conn:
-                conn.execute(
-                    "DELETE FROM app_state WHERE key IN (?, ?)",
-                    ("setup_dismissed", "onboarding_completed_at"),
-                )
-                conn.commit()
-        return redirect(url_for("onboarding_view"))
-    if not onboarding_done:
-        return redirect(url_for("onboarding_view"))
+    # No more auto-redirect to /onboarding. Sample data ships preloaded
+    # so the user can explore the kit immediately on first visit. The
+    # nav banner (rendered globally in _nav.html via the
+    # onboarding_banner context processor) nudges them to finish
+    # setup when they're ready, and they can dismiss it if they aren't.
     force_refresh = request.args.get("refresh") == "1"
     targets, error = fetch_all_targets(force=force_refresh)
 
@@ -5604,6 +5640,30 @@ def settings_icp_save():
         return jsonify({"ok": False, "error": "ICP description too long (max 5000 chars)"}), 400
     db_set_icp_definition(description, examples)
     return jsonify({"ok": True, "description": description, "examples": examples})
+
+
+@app.route("/prospecting/lookalike-targets", methods=["GET"])
+def prospecting_lookalike_targets_view():
+    """Placeholder for the upcoming standalone lookalike-targets page.
+    Real implementation lands in the next PR — cadence picker, persisted
+    discovery queue, per-account round-robin, push-to-Draftboard."""
+    return render_template(
+        "hub_stub.html",
+        active="prospecting_lookalike_targets",
+        hub_tabs=[],
+        hub_title="Lookalike targets",
+        hub_intro="Find more people at the same accounts as your existing targets.",
+        feature_title="Coming up next",
+        feature_body=(
+            "Pick a daily cadence (10 / 30 / 50 new targets per day). The kit "
+            "scans your existing account list, runs the prospecting engine on "
+            "each account in round-robin, and surfaces ranked candidates you "
+            "can add to Draftboard with one click. Results persist across "
+            "sessions so you can come back to yesterday's batch. "
+            "For now, the Find Lookalike Targets button still lives inside "
+            "the account drawer when you click any account."
+        ),
+    )
 
 
 @app.route("/prospecting/lookalikes", methods=["GET"])
@@ -9166,6 +9226,32 @@ def onboarding_skip_step():
         return jsonify({"ok": False, "error": "unknown step"}), 400
     db_app_state_set(f"onboarding_skipped_{step}", str(int(time.time())))
     return jsonify({"ok": True, "skipped": step})
+
+
+@app.route("/onboarding/dismiss-banner", methods=["POST"])
+def onboarding_dismiss_banner():
+    """Hide the onboarding nudge banner across all pages. Re-appears
+    when the user's progress count moves past the dismissed level
+    (handled by the context processor comparing
+    `onboarding_banner_dismissed_at_count`)."""
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+    try:
+        stat = _onboarding_status()
+        steps_done = sum(1 for s in [
+            stat["api_key"]["done"],
+            stat["profile"]["done"] or stat["profile"]["skipped"],
+            stat["targets"]["done"] or stat["targets"]["skipped"],
+            stat["supporters"]["done"] or stat["supporters"]["skipped"],
+            stat["resolver"]["done"] or stat["resolver"]["skipped"],
+            stat["google"]["done"] or stat["google"]["skipped"],
+            stat["slack"]["done"] or stat["slack"]["skipped"],
+        ] if s)
+    except Exception:  # noqa: BLE001
+        steps_done = 0
+    db_app_state_set("onboarding_banner_dismissed_at_count", str(steps_done))
+    return jsonify({"ok": True, "dismissed_at": steps_done})
 
 
 @app.route("/onboarding/complete", methods=["POST"])
