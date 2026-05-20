@@ -9375,8 +9375,9 @@ def _wizard_match_one(query: str, index: list[dict]) -> list[dict]:
 
 @app.route("/supporters/wizard", methods=["GET"])
 def supporters_wizard_view():
-    """Render the empty wizard form. Five textareas, one per prompt
-    bucket; the JS handles the find-matches step inline."""
+    """Render the empty wizard. Five typeahead inputs, one per prompt
+    bucket; the JS fetches the connector index once on load and matches
+    client-side as the user types."""
     network_size = 0
     with _db_lock, _db_connect() as conn:
         cur = conn.execute("SELECT COUNT(DISTINCT connector_key) FROM connector_paths")
@@ -9388,6 +9389,31 @@ def supporters_wizard_view():
         prompts=SUPPORTER_WIZARD_PROMPTS,
         network_size=network_size,
     )
+
+
+@app.route("/supporters/wizard/index", methods=["GET"])
+def supporters_wizard_index():
+    """Return the full connector index for client-side autocomplete.
+    Each entry is the minimum the typeahead needs to render a row:
+    name + linkedin + title + company + already-supporter flag.
+
+    Size: ~80 bytes per connector. A workspace with 5,000 connectors
+    serializes to ~400KB - acceptable for a one-time page-load fetch."""
+    idx = _build_connector_index()
+    already = db_manual_supporter_urls_norm()
+    # Strip internal-only fields (connector_key, name_norm, first, last)
+    # to keep the payload small. The client recomputes name_norm.
+    out = []
+    for c in idx:
+        norm_li = _normalize_linkedin(c.get("linkedin") or "")
+        out.append({
+            "name": c["name"],
+            "linkedin": c.get("linkedin") or "",
+            "title": c.get("title") or "",
+            "company": c.get("company") or "",
+            "already_supporter": bool(norm_li and norm_li in already),
+        })
+    return jsonify({"ok": True, "count": len(out), "connectors": out})
 
 
 @app.route("/supporters/wizard/match", methods=["POST"])
