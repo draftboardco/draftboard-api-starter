@@ -3,22 +3,27 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Settings — Categorization rules</title>
+  <title>Settings — Supporter classification</title>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-50 text-slate-900 min-h-screen">
   <div class="max-w-4xl mx-auto px-6 py-10">
     {% include "_nav.html" %}
 
-    <header class="mb-6">
-      <h1 class="text-2xl font-semibold tracking-tight">Categorization rules</h1>
+    <header class="mb-4">
+      <h1 class="text-2xl font-semibold tracking-tight">Supporter classification</h1>
       <p class="text-sm text-slate-500 mt-1">
-        Tell the categorizer who counts as a customer / investor / vendor / friend / coworker. Each row on <strong>Supporters</strong> gets a category badge based on these rules. Match priority: <strong>your rules</strong> &gt; built-in heuristics (personal email domains → friend) &gt; LLM fallback (gpt-4o-mini, only if your OpenAI key is set in the resolver) &gt; unclassified.
-      </p>
-      <p class="text-xs text-slate-500 mt-2">
-        Manual overrides on the Supporters page win over everything here. They're sticky — bulk re-categorize won't undo them.
+        Auto-tag Gmail-scan supporters as customer / investor / vendor / friend / coworker so the Supporters page surfaces the right badges without you clicking each row.
       </p>
     </header>
+
+    <div class="mb-6 rounded-md border border-blue-200 bg-blue-50 px-4 py-3 text-xs text-blue-900">
+      <strong>When this page matters:</strong> only for supporters added via the <a class="underline" href="/add/supporters/scan">Gmail + Calendar scan</a>. Wizard-added supporters already carry their bucket (investors / advisors / customers / coworkers / friends / prior-intros) and don't need re-classifying. Paste-URL + CSV supporters bypass classification entirely — add a manual badge on the row if you want one.
+    </div>
+
+    <p class="text-xs text-slate-500 mb-4">
+      Match priority: <strong>your rules</strong> &gt; built-in heuristics (personal email domains → friend) &gt; LLM fallback (gpt-4o-mini, only if your OpenAI key is configured on the <a class="underline" href="/settings/integrations">Integrations page</a>) &gt; unclassified. Manual badges on the Supporters page win over everything here.
+    </p>
 
     {% if saved %}
       <div class="mb-4 rounded-md border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">

@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Draftboard — {{ hub_title }} · {{ feature_title }}</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    {% include "_nav.html" %}
+
+    <header class="mb-4">
+      <h1 class="text-2xl font-semibold tracking-tight">{{ hub_title }}</h1>
+      <p class="text-sm text-slate-500 mt-1">{{ hub_intro }}</p>
+    </header>
+
+    {% include "_hub_tabs.html" %}
+
+    <section class="bg-white border border-slate-200 rounded-lg p-6 shadow-sm">
+      <h2 class="text-base font-semibold text-slate-900 mb-2">{{ feature_title }}</h2>
+      <p class="text-sm text-slate-600">{{ feature_body }}</p>
+    </section>
+  </div>
+</body>
+</html>

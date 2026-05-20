@@ -385,6 +385,66 @@ def _inject_globals():
         f"?subject={quote('Draftboard kit feedback / bug report')}"
         f"&body={quote(chr(10).join(body_lines))}"
     )
+    # --- Onboarding banner state ---
+    # Shown on every page when onboarding isn't complete AND the user
+    # hasn't dismissed the banner. Reset whenever progress advances so
+    # the banner reappears with the new count if the user crossed a
+    # step without explicitly finishing setup.
+    onboarding_banner = {"show": False}
+    try:
+        completed = bool(
+            db_app_state_get("onboarding_completed_at")
+            or db_app_state_get("setup_dismissed")
+        )
+        if not completed:
+            stat = _onboarding_status()
+            # Count: each step counts when done OR explicitly skipped.
+            done = 0
+            steps = [
+                stat["api_key"]["done"],
+                stat["profile"]["done"] or stat["profile"]["skipped"],
+                stat["targets"]["done"] or stat["targets"]["skipped"],
+                stat["supporters"]["done"] or stat["supporters"]["skipped"],
+                stat["resolver"]["done"] or stat["resolver"]["skipped"],
+                stat["google"]["done"] or stat["google"]["skipped"],
+                stat["slack"]["done"] or stat["slack"]["skipped"],
+            ]
+            done = sum(1 for s in steps if s)
+            total = len(steps)
+            # Dismissal is keyed on the progress count, so the banner
+            # reappears if the user makes more progress after dismissing.
+            dismissed_at_count = db_app_state_get("onboarding_banner_dismissed_at_count")
+            try:
+                dismissed_at_count = int(dismissed_at_count or "-1")
+            except ValueError:
+                dismissed_at_count = -1
+            # Next step label — first incomplete step
+            next_label = ""
+            labels = [
+                ("api_key", "Connect your Draftboard API key"),
+                ("profile", "Fill in your profile"),
+                ("targets", "Add your first targets"),
+                ("supporters", "Add supporters"),
+                ("resolver", "Set up Apollo / OpenAI"),
+                ("google", "Connect Google Workspace"),
+                ("slack", "Set up Slack"),
+            ]
+            for i, (_, lbl) in enumerate(labels):
+                if not steps[i]:
+                    next_label = lbl
+                    break
+            onboarding_banner = {
+                "show": done < total and done > dismissed_at_count,
+                "progress_done": done,
+                "progress_total": total,
+                "next_step_label": next_label,
+            }
+    except Exception:  # noqa: BLE001
+        # The context processor runs on every render, including ones
+        # before the DB is ready. Suppress + skip the banner rather than
+        # 500'ing every page.
+        pass
+
     return {
         "feedback_mailto": feedback_mailto,
         # Used by the nav sync pill: when no API key is set, the idle CTA
@@ -394,6 +454,7 @@ def _inject_globals():
         # Status dropdown menu shares one meta dict across every connector
         # card render — no need for every route to pass it explicitly.
         "intro_status_meta_all": INTRO_STATUS_META,
+        "onboarding_banner": onboarding_banner,
     }
 
 # Per-field input caps for resolve endpoints. Apollo / CSE / OpenAI all reject
@@ -831,6 +892,29 @@ def init_db():
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_category_rules_value ON category_rules(value)")
+
+        # Lookalike targets discovered by the standalone prospecting page.
+        # One row per person; status moves through pending → added/skipped
+        # as the user triages the queue. linkedin_url_norm is the PK so
+        # re-running the engine never re-creates rows the user has already
+        # actioned (the upsert preserves the existing row's status).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS lookalike_targets_discovered (
+                linkedin_url_norm TEXT PRIMARY KEY,
+                linkedin_url TEXT NOT NULL,
+                account_key TEXT NOT NULL,
+                account_display_name TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                ai_confidence REAL NOT NULL DEFAULT 0,
+                ai_reason TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                discovered_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_lookalike_targets_status ON lookalike_targets_discovered(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_lookalike_targets_discovered_at ON lookalike_targets_discovered(discovered_at DESC)")
 
         # Manual path lists — uploaded CSVs from external network owners
         # (typically the customer's investors). Each list is one upload;
@@ -1538,18 +1622,26 @@ def _reject_cross_site_form():
 def _normalize_linkedin(url):
     """Canonicalize a LinkedIn URL for fuzzy match.
 
-    Strips: scheme (http/https), `www.` prefix, query string, anchor, trailing
-    slash. Lowercases everything. So all of these compare equal:
+    Strips: scheme (http/https), `www.` prefix, country subdomains
+    (`il.`, `de.`, `fr.`, …), query string, anchor, trailing slash.
+    Lowercases everything. So all of these compare equal:
         https://www.linkedin.com/in/orencharnoff/
         https://linkedin.com/in/orencharnoff
         http://www.linkedin.com/in/orencharnoff?utm_source=email
         linkedin.com/in/orencharnoff#anchor
+        https://il.linkedin.com/in/orencharnoff       (Israeli LinkedIn)
+        https://de.linkedin.com/in/orencharnoff/      (German LinkedIn)
     Result: "linkedin.com/in/orencharnoff".
 
     The `www.`-stripping matters because Apollo, Google CSE, and LinkedIn
     itself emit URLs with and without the prefix interchangeably. Without
     this, the supporter-badge cross-reference silently misses ~half its
     real matches when one side has `www.` and the other doesn't.
+
+    The country-subdomain stripping caught a real-world dedup miss:
+    Apollo had `il.linkedin.com/in/yoavoz`, the kit's existing target
+    had `www.linkedin.com/in/yoavoz`. Same person, two normalized
+    strings, no match. Stripping the country code fixes it.
     """
     if not url:
         return ""
@@ -1565,6 +1657,13 @@ def _normalize_linkedin(url):
     # Strip leading www.
     if u.startswith("www."):
         u = u[4:]
+    # Strip leading country subdomain like `il.`, `de.`, `fr.`, `uk.`.
+    # LinkedIn uses 2-letter ISO country codes; match any 2-letter
+    # prefix that's followed by `linkedin.com` so we don't accidentally
+    # strip something else (linkedin.com itself doesn't start with a
+    # 2-letter dotted prefix without the country case).
+    if len(u) > 3 and u[2] == "." and u[3:].startswith("linkedin.com"):
+        u = u[3:]
     return u.rstrip("/")
 
 
@@ -4127,23 +4226,11 @@ def targets_view():
     # "no API key" states.
     if db_app_state_get("welcome_wizard_done") != "1":
         return redirect(url_for("welcome_view"))
-    # First-run nudge: brand-new install with no API key gets bounced to
-    # /setup so they have a paste field instead of an empty Targets page.
-    # The "Continue" action on /setup writes setup_dismissed in app_state.
-    #
-    # If the user later loses their API key (revoked, .env deleted, env var
-    # unset), the dismiss flag would otherwise leave them stranded on a
-    # broken Targets page with no nudge back to /setup. So: when the key
-    # disappears, clear the dismiss flag and re-fire the redirect.
-    if not _current_api_key():
-        if db_app_state_get("setup_dismissed"):
-            with _db_lock, _db_connect() as conn:
-                conn.execute(
-                    "DELETE FROM app_state WHERE key = ?",
-                    ("setup_dismissed",),
-                )
-                conn.commit()
-        return redirect(url_for("setup_view"))
+    # No more auto-redirect to /onboarding. Sample data ships preloaded
+    # so the user can explore the kit immediately on first visit. The
+    # nav banner (rendered globally in _nav.html via the
+    # onboarding_banner context processor) nudges them to finish
+    # setup when they're ready, and they can dismiss it if they aren't.
     force_refresh = request.args.get("refresh") == "1"
     targets, error = fetch_all_targets(force=force_refresh)
 
@@ -4438,7 +4525,42 @@ def accounts_view():
     )
 
 
+# =====================================================================
+# Hub tab strips
+# =====================================================================
+# Each "Add data" hub page (Add targets, Add supporters) carries a
+# secondary tab strip across the top. Tabs are server-rendered links —
+# clicking switches to a sibling route, no JS-toggle. Each handler
+# calls one of the builders below to get its tab context.
+
+def _hub_tabs_for_targets(active: str) -> list[dict]:
+    """Tab strip for /add/targets/* pages. active is one of:
+    'paste', 'sales_nav', 'csv'."""
+    return [
+        {"label": "Paste URLs",     "url": "/add/targets/paste",     "active": active == "paste"},
+        {"label": "Sales Navigator", "url": "/add/targets/sales-nav", "active": active == "sales_nav"},
+        # CSV upload is queued but not built yet; surfaced as a stub so
+        # the IA is complete and users know it's coming.
+        {"label": "Upload CSV",     "url": "/add/targets/csv",       "active": active == "csv",
+         "badge": "soon"},
+    ]
+
+
+def _hub_tabs_for_supporters(active: str) -> list[dict]:
+    """Tab strip for /add/supporters/* pages. active is one of:
+    'wizard', 'scan', 'paste', 'csv'."""
+    return [
+        {"label": "Type names (wizard)", "url": "/add/supporters/wizard", "active": active == "wizard"},
+        {"label": "Scan Gmail + Calendar", "url": "/add/supporters/scan", "active": active == "scan"},
+        {"label": "Paste URLs",         "url": "/add/supporters/paste",  "active": active == "paste"},
+        {"label": "Upload CSV",         "url": "/add/supporters/csv",    "active": active == "csv",
+         "badge": "soon"},
+    ]
+
+
 @app.route("/import", methods=["GET"])
+@app.route("/add/targets", methods=["GET"])
+@app.route("/add/targets/paste", methods=["GET"])
 def import_form():
     tags, tag_error = fetch_tags()
     return render_template(
@@ -4447,11 +4569,337 @@ def import_form():
         tag_error=tag_error,
         api_key_set=bool(API_KEY),
         result=None,
-        active="import",
+        active="add_targets",
+        hub_tabs=_hub_tabs_for_targets("paste"),
     )
 
 
+# =====================================================================
+# CSV upload (Add targets + Add supporters)
+# =====================================================================
+# Both CSV flows reuse the same parser:
+#   1. Read upload as utf-8-sig (handles Excel's BOM-prefixed exports).
+#   2. Find the LinkedIn URL column by header-name OR by content-sniffing
+#      the first non-empty cell of each column.
+#   3. Feed all cell values through normalize_linkedin_urls which already
+#      handles http/https/www/slug-only/trailing-slash + dedupes.
+#
+# Why content-sniff after header-match: real-world CSVs from Apollo,
+# Sales Nav exports, LinkedIn data downloads, and HubSpot all use
+# different column names. Sniffing is the safety net when the header is
+# something we haven't seen before (e.g. "URL" or "Person LinkedIn").
+
+# Synonyms we accept for the LinkedIn URL header. Matched case-
+# insensitively after stripping punctuation, so "LinkedIn URL",
+# "linkedinurl", and "LinkedIn-URL" all hit.
+_CSV_LINKEDIN_HEADER_SYNONYMS = {
+    "linkedin", "linkedin url", "linkedin profile", "linkedin profile url",
+    "profile url", "profile", "profile link", "li url",
+    "linkedinurl", "linkedinprofile", "linkedinprofileurl",
+    "linkedin_url", "linkedin_profile", "linkedin_profile_url",
+    "profile_url", "profileurl",
+    # Sales Nav exports
+    "sales nav url", "sales navigator url",
+    # Apollo
+    "linkedin url 1", "person linkedin url",
+}
+
+
+def _csv_detect_linkedin_column(headers: list[str], sniff_rows: list[list[str]]) -> tuple[int | None, str]:
+    """Find which column contains LinkedIn URLs. Returns (column_index,
+    detection_method). Pass 1 matches header synonyms; pass 2 sniffs
+    cell contents for the linkedin.com/in/ pattern across the first
+    handful of rows.
+    """
+    norm_headers = [
+        re.sub(r"[^\w\s]", " ", (h or "").lower()).strip()
+        for h in headers
+    ]
+    # Pass 1: exact-synonym header match.
+    for i, h in enumerate(norm_headers):
+        if h in _CSV_LINKEDIN_HEADER_SYNONYMS:
+            return i, f"header '{headers[i]}' matched"
+    # Pass 1b: substring match — "person_linkedin", "linkedin_url_1", etc.
+    for i, h in enumerate(norm_headers):
+        if "linkedin" in h or "profile url" in h or "profile_url" in h:
+            return i, f"header '{headers[i]}' contains 'linkedin' / 'profile_url'"
+    # Pass 2: sniff cell contents.
+    for col in range(len(headers)):
+        for row in sniff_rows:
+            if col < len(row):
+                cell = (row[col] or "").lower()
+                if "linkedin.com/in/" in cell:
+                    return col, f"sniffed column {col} for linkedin.com/in/ in cell content"
+    return None, "no LinkedIn column found in headers or first rows"
+
+
+def _csv_detect_name_column(headers: list[str]) -> int | None:
+    """Find a 'name' column for supporter imports. Returns index or
+    None — name is optional, the kit can render the LinkedIn slug if
+    we don't find one."""
+    norm = [
+        re.sub(r"[^\w\s]", " ", (h or "").lower()).strip()
+        for h in headers
+    ]
+    # Prefer full name; fall back to first+last.
+    for i, h in enumerate(norm):
+        if h in ("name", "full name", "fullname", "display name", "displayname"):
+            return i
+    for i, h in enumerate(norm):
+        if "name" in h and "first" not in h and "last" not in h:
+            return i
+    return None
+
+
+def _parse_csv_for_linkedin(file_storage) -> tuple[list[dict], dict]:
+    """Read uploaded CSV, find the LinkedIn URL column, return cleaned
+    rows. Each returned row is {linkedin_url, display_name?}.
+
+    Returns (rows, meta) where meta has:
+      detected_column     - the column header we picked
+      detection_method    - "header '...' matched" or "sniffed column ..."
+      name_column         - the column header we picked for display_name (or None)
+      total_rows          - total data rows (excluding header)
+      kept_rows           - rows that produced a valid LinkedIn URL
+      error               - present iff we couldn't parse
+    """
+    import csv as _csv
+    import io as _io
+    try:
+        raw = file_storage.read().decode("utf-8-sig", errors="replace")
+    except Exception as e:  # noqa: BLE001
+        return [], {"error": f"Couldn't read upload: {type(e).__name__}"}
+    if not raw.strip():
+        return [], {"error": "CSV is empty."}
+
+    reader = _csv.reader(_io.StringIO(raw))
+    all_rows = list(reader)
+    if not all_rows:
+        return [], {"error": "CSV has no rows."}
+
+    headers = all_rows[0]
+    body = all_rows[1:]
+    if not body:
+        return [], {"error": "CSV only contains a header row."}
+
+    sniff = body[:10]  # first 10 data rows used for content-sniff fallback
+    col_idx, method = _csv_detect_linkedin_column(headers, sniff)
+    if col_idx is None:
+        return [], {
+            "error": "Couldn't find a LinkedIn URL column. Headers we saw: "
+                     + ", ".join(repr(h) for h in headers[:10])
+        }
+
+    name_idx = _csv_detect_name_column(headers)
+
+    # Feed all cell values through normalize_linkedin_urls, which handles
+    # every URL variant + dedupes. We process row-by-row so we can pair
+    # each canonical URL with its display name on the same row.
+    out_rows: list[dict] = []
+    seen_norm: set = set()
+    for row in body:
+        if col_idx >= len(row):
+            continue
+        raw_url = (row[col_idx] or "").strip()
+        if not raw_url:
+            continue
+        # normalize_linkedin_urls expects free text + returns canonical URLs
+        canonical = normalize_linkedin_urls(raw_url)
+        if not canonical:
+            continue
+        url = canonical[0]
+        norm = _normalize_linkedin(url)
+        if not norm or norm in seen_norm:
+            continue
+        seen_norm.add(norm)
+        display_name = ""
+        if name_idx is not None and name_idx < len(row):
+            display_name = (row[name_idx] or "").strip()
+        out_rows.append({
+            "linkedin_url": url,
+            "display_name": display_name,
+        })
+
+    return out_rows, {
+        "detected_column": headers[col_idx],
+        "detection_method": method,
+        "name_column": headers[name_idx] if name_idx is not None else None,
+        "total_rows": len(body),
+        "kept_rows": len(out_rows),
+    }
+
+
+@app.route("/add/targets/csv", methods=["GET"])
+def add_targets_csv_view():
+    return render_template(
+        "add_data_csv.html",
+        active="add_targets",
+        hub_tabs=_hub_tabs_for_targets("csv"),
+        hub_title="Add targets",
+        hub_intro="Pick how you want to add new prospects to your Draftboard workspace.",
+        feature_title="Upload a CSV",
+        feature_body=(
+            "Drop in a CSV from Apollo, Sales Nav, HubSpot, or any other tool. "
+            "We auto-detect the LinkedIn URL column and import each row as a "
+            "Draftboard target."
+        ),
+        upload_endpoint="/add/targets/csv/upload",
+        result_link_label="View your Targets",
+        result_link_url="/",
+        accepts_tags=True,
+        accepts_teammate=False,
+    )
+
+
+@app.route("/add/supporters/csv", methods=["GET"])
+def add_supporters_csv_view():
+    return render_template(
+        "add_data_csv.html",
+        active="add_supporters",
+        hub_tabs=_hub_tabs_for_supporters("csv"),
+        hub_title="Add supporters",
+        hub_intro="Pick how you want to identify the people in your network most likely to make warm intros.",
+        feature_title="Upload a CSV",
+        feature_body=(
+            "Drop in a CSV of supporter contacts (LinkedIn URL + optional name). "
+            "We bulk-mark each as a supporter so they show up with the ⭐ badge."
+        ),
+        upload_endpoint="/add/supporters/csv/upload",
+        result_link_label="View your supporters",
+        result_link_url="/add/supporters/scan",
+        accepts_tags=False,
+        accepts_teammate=True,
+        owners=db_unique_owners(),
+    )
+
+
+@app.route("/add/targets/csv/upload", methods=["POST"])
+def add_targets_csv_upload():
+    """Take an uploaded CSV → extract LinkedIn URLs → POST to Draftboard's
+    /targets/import. Same end behavior as the paste-URLs flow."""
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+    upload = request.files.get("csv_file")
+    if not upload or not upload.filename:
+        return jsonify({"ok": False, "error": "No file uploaded."}), 400
+    rows, meta = _parse_csv_for_linkedin(upload)
+    if meta.get("error"):
+        return jsonify({"ok": False, "error": meta["error"], "meta": meta}), 400
+    if not rows:
+        return jsonify({
+            "ok": False,
+            "error": "Parsed CSV but found no valid LinkedIn URLs.",
+            "meta": meta,
+        }), 400
+    if not _current_api_key():
+        return jsonify({
+            "ok": False,
+            "error": "DRAFTBOARD_API_KEY not set. Add it before importing.",
+            "meta": meta,
+        }), 400
+
+    tags_raw = request.form.get("tags", "")
+    tags = [t.strip() for t in re.split(r"[\n,]+", tags_raw or "") if t.strip()]
+
+    urls = [r["linkedin_url"] for r in rows]
+    payload = {"linkedinUrls": urls}
+    if tags:
+        payload["tags"] = tags
+    try:
+        r = requests.post(
+            f"{API_BASE}/targets/import",
+            headers=_auth_headers(),
+            json=payload,
+            timeout=60,
+        )
+    except requests.RequestException as e:
+        return jsonify({"ok": False, "error": f"Network error reaching Draftboard: {type(e).__name__}", "meta": meta}), 502
+    try:
+        data = r.json()
+    except ValueError:
+        data = {"raw": r.text}
+    if r.status_code != 200:
+        return jsonify({
+            "ok": False,
+            "error": f"Draftboard /targets/import returned {r.status_code}",
+            "detail": data,
+            "meta": meta,
+        }), r.status_code
+    return jsonify({
+        "ok": True,
+        "meta": meta,
+        "imported": data.get("imported"),
+        "notImported": data.get("notImported"),
+        "errors": data.get("errors") or [],
+        "tags_used": tags,
+        "submitted": len(urls),
+    })
+
+
+@app.route("/add/supporters/csv/upload", methods=["POST"])
+def add_supporters_csv_upload():
+    """Take an uploaded CSV → extract LinkedIn URLs + names → write to
+    manual_supporters with source='csv'."""
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+    upload = request.files.get("csv_file")
+    if not upload or not upload.filename:
+        return jsonify({"ok": False, "error": "No file uploaded."}), 400
+    rows, meta = _parse_csv_for_linkedin(upload)
+    if meta.get("error"):
+        return jsonify({"ok": False, "error": meta["error"], "meta": meta}), 400
+    if not rows:
+        return jsonify({
+            "ok": False,
+            "error": "Parsed CSV but found no valid LinkedIn URLs.",
+            "meta": meta,
+        }), 400
+
+    # Optional teammate attribution. The form posts owner_id; resolve to
+    # the matching teammate's name + email for downstream attribution.
+    teammate_email = ""
+    teammate_name = ""
+    owner_id = (request.form.get("teammate") or "").strip()
+    if owner_id:
+        for o in db_unique_owners():
+            if str(o.get("owner_id") or "") == owner_id:
+                teammate_email = o.get("owner_email") or ""
+                teammate_name = o.get("owner_name") or ""
+                break
+
+    added = 0
+    skipped_existing = 0
+    errors: list[str] = []
+    for row in rows:
+        url = row["linkedin_url"]
+        was_new, err = db_manual_supporter_upsert(
+            linkedin_url_raw=url,
+            display_name=row.get("display_name") or "",
+            teammate_email=teammate_email,
+            teammate_name=teammate_name,
+            source="csv",
+        )
+        if err:
+            errors.append(f"{url}: {err}")
+            continue
+        if was_new:
+            added += 1
+        else:
+            skipped_existing += 1
+    return jsonify({
+        "ok": True,
+        "meta": meta,
+        "added": added,
+        "already_supporter": skipped_existing,
+        "errors": errors,
+        "teammate_name": teammate_name,
+    })
+
+
 @app.route("/import/supporters", methods=["GET", "POST"])
+@app.route("/add/supporters/paste", methods=["GET", "POST"])
 def import_supporters_view():
     """Paste-URLs form for bulk-flagging supporters. On POST, normalizes the
     pasted URLs and writes one manual_supporters row per URL with source='paste'.
@@ -4514,7 +4962,7 @@ def import_supporters_view():
             "import_supporters.html",
             owners=owners,
             api_key_set=bool(API_KEY),
-            active="import_supporters",
+            active="add_supporters",
             result={
                 "submitted_count": len(urls),
                 "added": added,
@@ -4523,19 +4971,22 @@ def import_supporters_view():
                 "note": note,
             },
             recent=db_manual_supporters_recent(50),
+            hub_tabs=_hub_tabs_for_supporters("paste"),
         )
 
     return render_template(
         "import_supporters.html",
         owners=owners,
         api_key_set=bool(API_KEY),
-        active="import_supporters",
+        active="add_supporters",
         result=None,
         recent=db_manual_supporters_recent(50),
+        hub_tabs=_hub_tabs_for_supporters("paste"),
     )
 
 
 @app.route("/import/triage-responses", methods=["GET", "POST"])
+@app.route("/add/shortlist-responses", methods=["GET", "POST"])
 def import_triage_responses_view():
     """Upload-a-JSON-file flow that ingests the responses a connector
     submitted on draftboard.com/triage/<token>.
@@ -4564,7 +5015,7 @@ def import_triage_responses_view():
             return render_template(
                 "import_triage_responses.html",
                 api_key_set=bool(API_KEY),
-                active="import_triage_responses",
+                active="shortlist_responses",
                 result={"error": "No file uploaded. Pick the JSON file you downloaded from the shortlist view page."},
                 recent_overrides=_recent_connector_overrides_for_display(),
             )
@@ -4579,7 +5030,7 @@ def import_triage_responses_view():
             return render_template(
                 "import_triage_responses.html",
                 api_key_set=bool(API_KEY),
-                active="import_triage_responses",
+                active="shortlist_responses",
                 result={"error": f"File too large ({size} bytes). Triage JSON files should be under a few hundred KB."},
                 recent_overrides=_recent_connector_overrides_for_display(),
             )
@@ -4590,7 +5041,7 @@ def import_triage_responses_view():
             return render_template(
                 "import_triage_responses.html",
                 api_key_set=bool(API_KEY),
-                active="import_triage_responses",
+                active="shortlist_responses",
                 result={"error": f"Not valid JSON: {type(e).__name__}. Was this the file you downloaded from the shortlist page?"},
                 recent_overrides=_recent_connector_overrides_for_display(),
             )
@@ -4600,7 +5051,7 @@ def import_triage_responses_view():
             return render_template(
                 "import_triage_responses.html",
                 api_key_set=bool(API_KEY),
-                active="import_triage_responses",
+                active="shortlist_responses",
                 result={"error": "Unrecognized file shape. Expected `{version: 2, session, responses}` from draftboard.com/shortlist (or /triage on older mints)."},
                 recent_overrides=_recent_connector_overrides_for_display(),
             )
@@ -4610,7 +5061,7 @@ def import_triage_responses_view():
             return render_template(
                 "import_triage_responses.html",
                 api_key_set=bool(API_KEY),
-                active="import_triage_responses",
+                active="shortlist_responses",
                 result={"error": "`responses` should be an array."},
                 recent_overrides=_recent_connector_overrides_for_display(),
             )
@@ -4624,7 +5075,7 @@ def import_triage_responses_view():
             return render_template(
                 "import_triage_responses.html",
                 api_key_set=bool(API_KEY),
-                active="import_triage_responses",
+                active="shortlist_responses",
                 result={"error": "Connector LinkedIn URL missing from the upload. Generate a new shortlist page from inside Draftboard so the connector's LinkedIn URL is included."},
                 recent_overrides=_recent_connector_overrides_for_display(),
             )
@@ -4634,7 +5085,7 @@ def import_triage_responses_view():
             return render_template(
                 "import_triage_responses.html",
                 api_key_set=bool(API_KEY),
-                active="import_triage_responses",
+                active="shortlist_responses",
                 result={"error": f"Connector LinkedIn URL doesn't look like a LinkedIn URL: {connector_linkedin}"},
                 recent_overrides=_recent_connector_overrides_for_display(),
             )
@@ -4728,7 +5179,7 @@ def import_triage_responses_view():
         return render_template(
             "import_triage_responses.html",
             api_key_set=bool(API_KEY),
-            active="import_triage_responses",
+            active="shortlist_responses",
             result={
                 "connector_name": session_meta.get("connectorName") or "(connector)",
                 "connector_first": connector_first,
@@ -4751,7 +5202,7 @@ def import_triage_responses_view():
     return render_template(
         "import_triage_responses.html",
         api_key_set=bool(API_KEY),
-        active="import_triage_responses",
+        active="shortlist_responses",
         result=None,
         compose_drafts=[],
         recent_overrides=_recent_connector_overrides_for_display(),
@@ -5005,6 +5456,7 @@ def _scrupp_fetch_data(api_key: str, process_id: str) -> tuple[list[dict], str |
 
 
 @app.route("/import/sales-nav", methods=["GET"])
+@app.route("/add/targets/sales-nav", methods=["GET"])
 def import_sales_nav_view():
     """Render the Sales Nav URL → Scrupp → import flow. The page is
     a single SPA-ish form with JS handling the two POSTs (search +
@@ -5013,11 +5465,12 @@ def import_sales_nav_view():
     keys = _load_resolver_keys()
     return render_template(
         "import_sales_nav.html",
-        active="import_sales_nav",
+        active="add_targets",
         api_key_set=bool(API_KEY),
         scrupp_configured=bool(keys.get("scrupp_api_key")),
         default_max=SCRUPP_SEARCH_DEFAULT_MAX,
         hard_max=SCRUPP_SEARCH_HARD_MAX,
+        hub_tabs=_hub_tabs_for_targets("sales_nav"),
     )
 
 
@@ -5225,6 +5678,382 @@ def settings_icp_save():
         return jsonify({"ok": False, "error": "ICP description too long (max 5000 chars)"}), 400
     db_set_icp_definition(description, examples)
     return jsonify({"ok": True, "description": description, "examples": examples})
+
+
+# =====================================================================
+# Lookalike targets (standalone page)
+# =====================================================================
+# Round-robins through the user's existing account list, runs the
+# prospecting engine per account, persists candidates so the user can
+# triage them across sessions. Each candidate moves through pending
+# → added or skipped; on Add we POST to Draftboard's /targets/import.
+
+LOOKALIKE_CADENCE_DEFAULT = 10
+LOOKALIKE_CADENCE_OPTIONS = (10, 30, 50)
+
+
+def db_lookalike_save(rows: list[dict]) -> int:
+    """Upsert discovered candidates. Existing rows preserve status +
+    updated_at so re-running the engine never overwrites a user's
+    Add/Skip decisions. Returns the count of NEW rows inserted."""
+    now = int(time.time())
+    inserted = 0
+    with _db_lock, _db_connect() as conn:
+        for r in rows:
+            norm = _normalize_linkedin(r.get("linkedin_url") or "")
+            if not norm:
+                continue
+            cur = conn.execute(
+                "SELECT 1 FROM lookalike_targets_discovered WHERE linkedin_url_norm = ?",
+                (norm,),
+            )
+            if cur.fetchone():
+                continue
+            conn.execute(
+                "INSERT INTO lookalike_targets_discovered "
+                "(linkedin_url_norm, linkedin_url, account_key, account_display_name, "
+                " name, title, ai_confidence, ai_reason, status, discovered_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                (
+                    norm, r.get("linkedin_url") or "",
+                    r.get("account_key") or "",
+                    r.get("account_display_name") or "",
+                    r.get("name") or "",
+                    r.get("title") or "",
+                    float(r.get("ai_confidence") or 0),
+                    (r.get("ai_reason") or "")[:500],
+                    now, now,
+                ),
+            )
+            inserted += 1
+        conn.commit()
+    return inserted
+
+
+def db_lookalike_list(status: str = "pending", limit: int = 200) -> list[dict]:
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT linkedin_url_norm, linkedin_url, account_key, account_display_name, "
+            "       name, title, ai_confidence, ai_reason, status, discovered_at "
+            "FROM lookalike_targets_discovered "
+            "WHERE status = ? "
+            "ORDER BY discovered_at DESC, ai_confidence DESC LIMIT ?",
+            (status, limit),
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def db_lookalike_counts() -> dict:
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "SELECT status, COUNT(*) FROM lookalike_targets_discovered GROUP BY status"
+        )
+        out = {"pending": 0, "added": 0, "skipped": 0}
+        for s, c in cur.fetchall():
+            out[s] = c
+        return out
+
+
+def db_lookalike_set_status(linkedin_url: str, new_status: str) -> bool:
+    if new_status not in ("pending", "added", "skipped"):
+        return False
+    norm = _normalize_linkedin(linkedin_url)
+    if not norm:
+        return False
+    now = int(time.time())
+    with _db_lock, _db_connect() as conn:
+        cur = conn.execute(
+            "UPDATE lookalike_targets_discovered SET status = ?, updated_at = ? "
+            "WHERE linkedin_url_norm = ?",
+            (new_status, now, norm),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def _lookalike_run_batch(target_count: int, tag_filter: str = "") -> dict:
+    """Run discovery across the user's account list until we've added
+    `target_count` NEW pending candidates (or run out of accounts to
+    scan). Round-robin by `lookalike_targets_last_account_idx` saved in
+    app_state so consecutive runs hit different accounts.
+
+    When `tag_filter` is set, only accounts that have at least one
+    target carrying that tag get scanned. Lets the user constrain the
+    blast radius ("only auto-prospect on my Q2 target list").
+    """
+    keys = _load_resolver_keys()
+    if not (keys.get("apollo_api_key") or (keys.get("google_cse_api_key") and keys.get("google_cse_id"))):
+        return {"ok": False, "error": "Need Apollo or Google CSE configured. Set up on /settings/integrations."}
+
+    # Build the list of account keys from the user's targets. Each unique
+    # company name becomes one source account. Optional tag filter
+    # narrows to only accounts where ≥1 target carries the tag.
+    targets_all, _ = fetch_all_targets()
+    if tag_filter:
+        tagged_target_ids = db_target_ids_with_tag(tag_filter)
+        targets_all = [t for t in targets_all if t.get("id") in tagged_target_ids]
+        if not targets_all:
+            return {"ok": False, "error": f"No targets carry the tag '{tag_filter}'. Tag some targets first."}
+    seen: set = set()
+    account_keys: list[str] = []
+    for t in targets_all:
+        comp = (_target_company_with_fallback(t) or "").strip()
+        if not comp:
+            continue
+        k = comp.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        account_keys.append(k)
+    if not account_keys:
+        return {"ok": False, "error": "No accounts to scan. Add some targets first."}
+
+    # Round-robin index — start where we left off last run.
+    try:
+        start_idx = int(db_app_state_get("lookalike_targets_last_account_idx") or "0")
+    except ValueError:
+        start_idx = 0
+    if start_idx >= len(account_keys):
+        start_idx = 0
+
+    found_new = 0
+    accounts_scanned = 0
+    accounts_skipped_no_seed = 0
+    errors: list[str] = []
+    last_idx = start_idx
+
+    for i in range(len(account_keys)):
+        if found_new >= target_count:
+            break
+        idx = (start_idx + i) % len(account_keys)
+        key = account_keys[idx]
+        last_idx = (idx + 1) % len(account_keys)
+
+        seeds, display_name, seed_titles, company_linkedin, existing_norm = (
+            _prospecting_collect_seeds(key)
+        )
+        if not seeds or not seed_titles:
+            accounts_skipped_no_seed += 1
+            continue
+
+        # Use Apollo's resolved domain if we have it; else just pass
+        # company name and let the engine sort it out.
+        domain = ""
+        if keys.get("apollo_api_key"):
+            org, _ = _prospecting_find_org(display_name, keys.get("apollo_api_key") or "", company_linkedin)
+            if org and org.get("primary_domain"):
+                domain = org["primary_domain"]
+
+        # Expand the seed titles with the LLM (same pattern as the
+        # in-drawer flow). If no OpenAI key, just use the seeds.
+        titles = seed_titles[:]
+        if keys.get("openai_api_key"):
+            try:
+                expanded, _terr = _prospecting_generate_titles(
+                    seed_titles, display_name, keys.get("openai_api_key") or "", n=8,
+                )
+                if expanded:
+                    titles = list(dict.fromkeys(seed_titles + expanded))
+            except Exception:  # noqa: BLE001
+                pass
+
+        cands, err = _prospecting_search_people(
+            display_name, titles[:10], domain, keys,
+            company_linkedin_url=company_linkedin,
+        )
+        if err and not cands:
+            errors.append(f"{display_name}: {err}")
+            continue
+        cands = _prospecting_dedupe(cands, existing_norm)
+        accounts_scanned += 1
+
+        # Persist all NEW (non-dup) candidates from this account. Cap
+        # per-account to avoid one big company swamping the batch.
+        rows_to_save = []
+        for c in cands[:8]:
+            li = (c.get("linkedinUrl") or c.get("linkedin_url") or "").strip()
+            if not li:
+                continue
+            rows_to_save.append({
+                "linkedin_url": li,
+                "account_key": key,
+                "account_display_name": display_name,
+                "name": (c.get("name") or "").strip()
+                        or " ".join(filter(None, [(c.get("firstName") or "").strip(),
+                                                  (c.get("lastName") or "").strip()])),
+                "title": (c.get("title") or c.get("position") or "").strip(),
+                "ai_confidence": c.get("ai_confidence") or 0,
+                "ai_reason": (c.get("ai_reason") or "")[:500],
+            })
+        inserted = db_lookalike_save(rows_to_save)
+        found_new += inserted
+
+    db_app_state_set("lookalike_targets_last_account_idx", str(last_idx))
+    return {
+        "ok": True,
+        "found_new": found_new,
+        "accounts_scanned": accounts_scanned,
+        "accounts_skipped_no_seed": accounts_skipped_no_seed,
+        "errors": errors[:5],
+        "target_count": target_count,
+    }
+
+
+def _group_lookalikes_by_account(rows: list[dict], targets_all: list[dict]) -> list[dict]:
+    """Pivot the flat list into one entry per account, with the account's
+    candidates + the user's EXISTING targets at that account inline so
+    the user can see context without leaving the page.
+    """
+    # Index existing targets by normalized company name for fast lookup
+    targets_by_company: dict[str, list[dict]] = {}
+    for t in targets_all:
+        comp = (_target_company_with_fallback(t) or "").strip().lower()
+        if not comp:
+            continue
+        pos = t.get("position") or {}
+        first = (t.get("firstName") or "").strip()
+        last = (t.get("lastName") or "").strip()
+        name = (first + " " + last).strip()
+        targets_by_company.setdefault(comp, []).append({
+            "name": name or "(unnamed)",
+            "title": pos.get("title") or "",
+            "linkedin": t.get("linkedinUrl") or "",
+        })
+
+    by_account: dict[str, dict] = {}
+    for row in rows:
+        key = (row.get("account_key") or "").lower()
+        display = row.get("account_display_name") or key
+        if key not in by_account:
+            by_account[key] = {
+                "account_key": key,
+                "display_name": display,
+                "candidates": [],
+                "existing_targets": targets_by_company.get(key, []),
+            }
+        by_account[key]["candidates"].append(row)
+    # Sort accounts by candidate count desc (more interesting first)
+    return sorted(by_account.values(), key=lambda a: -len(a["candidates"]))
+
+
+@app.route("/prospecting/lookalike-targets", methods=["GET"])
+def prospecting_lookalike_targets_view():
+    """Standalone lookalike-targets page. Cadence picker + tag filter +
+    run button + persistent discovery queue grouped by account."""
+    try:
+        cadence = int(db_app_state_get("lookalike_targets_per_day") or LOOKALIKE_CADENCE_DEFAULT)
+    except ValueError:
+        cadence = LOOKALIKE_CADENCE_DEFAULT
+    keys = _load_resolver_keys()
+    keys_ready = bool(keys.get("apollo_api_key") or (keys.get("google_cse_api_key") and keys.get("google_cse_id")))
+
+    pending = db_lookalike_list("pending", limit=500)
+    added = db_lookalike_list("added", limit=200)
+    skipped = db_lookalike_list("skipped", limit=200)
+
+    targets_all, _ = fetch_all_targets()
+    pending_by_account = _group_lookalikes_by_account(pending, targets_all)
+
+    return render_template(
+        "lookalike_targets.html",
+        active="prospecting_lookalike_targets",
+        api_key_set=bool(API_KEY),
+        cadence=cadence,
+        cadence_options=LOOKALIKE_CADENCE_OPTIONS,
+        keys_ready=keys_ready,
+        pending_by_account=pending_by_account,
+        added_rows=added,
+        skipped_rows=skipped,
+        counts=db_lookalike_counts(),
+        all_tags=db_all_tags_with_counts(),
+        current_tag=(db_app_state_get("lookalike_targets_tag_filter") or "").strip(),
+    )
+
+
+@app.route("/prospecting/lookalike-targets/save-cadence", methods=["POST"])
+def prospecting_lookalike_save_cadence():
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+    body = request.get_json(silent=True) or {}
+    try:
+        n = int(body.get("cadence") or 0)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "cadence must be a number"}), 400
+    if n not in LOOKALIKE_CADENCE_OPTIONS:
+        return jsonify({"ok": False, "error": f"cadence must be one of {LOOKALIKE_CADENCE_OPTIONS}"}), 400
+    db_app_state_set("lookalike_targets_per_day", str(n))
+    return jsonify({"ok": True, "cadence": n})
+
+
+@app.route("/prospecting/lookalike-targets/run", methods=["POST"])
+def prospecting_lookalike_run():
+    """Synchronous v0: blocks the worker while we scan accounts. Small
+    cadences (10/30) finish in 20-90s typical. v1 wires this into a
+    background job + a poll endpoint."""
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+    body = request.get_json(silent=True) or {}
+    try:
+        cadence = int(db_app_state_get("lookalike_targets_per_day") or LOOKALIKE_CADENCE_DEFAULT)
+    except ValueError:
+        cadence = LOOKALIKE_CADENCE_DEFAULT
+    tag_filter = (body.get("tag") or "").strip()
+    if not tag_filter:
+        return jsonify({
+            "ok": False,
+            "error": "Pick a tag to scope the scan to specific accounts. "
+                     "Whole-database scans aren't supported in this version.",
+        }), 400
+    # Persist the most recent tag filter so the page restores the
+    # selection on next visit.
+    db_app_state_set("lookalike_targets_tag_filter", tag_filter)
+    result = _lookalike_run_batch(cadence, tag_filter=tag_filter)
+    return jsonify(result)
+
+
+@app.route("/prospecting/lookalike-targets/action", methods=["POST"])
+def prospecting_lookalike_action():
+    """Add a discovered candidate to Draftboard or mark it skipped.
+    Both update the row's status; Add additionally POSTs to
+    /targets/import."""
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+    body = request.get_json(silent=True) or {}
+    action = (body.get("action") or "").strip()
+    linkedin_url = (body.get("linkedin_url") or "").strip()
+    if action not in ("add", "skip"):
+        return jsonify({"ok": False, "error": "action must be add or skip"}), 400
+    if not linkedin_url:
+        return jsonify({"ok": False, "error": "linkedin_url required"}), 400
+
+    if action == "skip":
+        ok = db_lookalike_set_status(linkedin_url, "skipped")
+        return jsonify({"ok": ok})
+
+    # action == "add" → push to Draftboard
+    if not _current_api_key():
+        return jsonify({"ok": False, "error": "DRAFTBOARD_API_KEY not set."}), 400
+    try:
+        r = requests.post(
+            f"{API_BASE}/targets/import",
+            headers=_auth_headers(),
+            json={"linkedinUrls": [linkedin_url]},
+            timeout=30,
+        )
+    except requests.RequestException as e:
+        return jsonify({"ok": False, "error": f"Network error: {type(e).__name__}"}), 502
+    if r.status_code != 200:
+        snippet = (r.text or "")[:300]
+        return jsonify({
+            "ok": False,
+            "error": f"Draftboard /targets/import returned {r.status_code}: {snippet}",
+        }), r.status_code
+    db_lookalike_set_status(linkedin_url, "added")
+    return jsonify({"ok": True})
 
 
 @app.route("/prospecting/lookalikes", methods=["GET"])
@@ -5719,6 +6548,204 @@ def tags_json():
     """Convenience: GET /tags as JSON."""
     tags, err = fetch_tags()
     return jsonify({"tags": tags, "error": err})
+
+
+# Column order matches the production-app export spec
+# (Google Sheet 12zgxIPnqh6NQzXgLnGvAKD18wAeHh8LhWlvFCUY7RFg).
+# Fields the kit doesn't have access to from the Draftboard API ship
+# as empty cells so the column order stays consistent with whatever
+# downstream pipeline the customer is feeding this CSV into.
+_EXPORT_CSV_HEADERS = [
+    "Target First Name", "Target Last Name", "Target Headline",
+    "Target Primary Job Title", "Target LinkedIn Profile URL",
+    "Account Name", "Account Website", "Account LinkedIn URL",
+    "Connection First Name", "Connection Last Name",
+    "Connection Primary Job Title", "Connection Headline",
+    "Connection LinkedIn Profile URL",
+    "Educational Institution Overlap Name",
+    "Educational Institution Overlap Length (months)",
+    "Educational Institution Overlap End Date (Year)",
+    "Educational Institution Overlap Location",
+    "Work Overlap 1 Name", "Work Overlap 1 Length (months)",
+    "Work Overlap 1 End Date (Year)", "Work Overlap 1 End Location",
+    "Work Overlap 2 Name", "Work Overlap 2 Length (months)",
+    "Work Overlap 2 End Date (Year)", "Work Overlap 2 End Location",
+    "Work Overlap 3 Name", "Work Overlap 3 Length (months)",
+    "Work Overlap 3 End Date (Year)", "Work Overlap 3 End Location",
+    "Mutual Connections", "Team Member Owner Full Name",
+    "Relationship Score", "Connection is Supporter",
+    "Connection is Team Member Supporter", "Draftboard Tags",
+    "Draftboard Date Added", "Connection Degree",
+]
+
+
+def _parse_scoredetails_for_csv(details: list) -> tuple[str, list[tuple], str]:
+    """Best-effort extract structured (school, work_overlaps, mutuals)
+    from the human-readable scoreDetails strings the Draftboard API
+    returns. Re-uses the existing card-rendering regexes.
+
+    Returns (school_name, [(company, months, year, location), ...] up to
+    3 work overlaps, mutual_count_str).
+    """
+    school = ""
+    works: list[tuple[str, str, str, str]] = []
+    mutuals = ""
+    for d in details or []:
+        if not isinstance(d, str):
+            continue
+        m = _OVERLAP_RE.match(d)
+        if m:
+            company = (m.group(2) or "").strip()
+            duration_str = (m.group(1) or "")
+            months_m = re.search(r"(\d+)\s*months?", duration_str)
+            months = months_m.group(1) if months_m else ""
+            tail = " ".join(filter(None, [m.group(3) or "", m.group(4) or ""]))
+            year_m = re.search(r"\b(\d{4})\b", tail)
+            year = year_m.group(1) if year_m else ""
+            location = (m.group(3) or "").strip()
+            works.append((company, months, year, location))
+            continue
+        m = _SCHOOL_RE.match(d)
+        if m and not school:
+            school = (m.group(1) or "").strip()
+            continue
+        m = _MUTUALS_RE.match(d)
+        if m and not mutuals:
+            mutuals = m.group(1) or ""
+    # Pad to exactly 3 work-overlap slots
+    while len(works) < 3:
+        works.append(("", "", "", ""))
+    return school, works[:3], mutuals
+
+
+@app.route("/export/targets.csv", methods=["GET"])
+def export_targets_csv():
+    """Stream a CSV with one row per (target × connection) path. Column
+    schema matches the production-app spec (see _EXPORT_CSV_HEADERS).
+
+    Targets without any cached connections still emit one row so the user
+    sees every target in their workspace - they can re-sync paths and
+    re-export when ready.
+    """
+    if not _current_api_key():
+        return jsonify({"ok": False, "error": "DRAFTBOARD_API_KEY required to export"}), 400
+
+    targets, err = fetch_all_targets()
+    if err:
+        return jsonify({"ok": False, "error": f"failed to load targets: {err}"}), 502
+
+    tags_map = db_target_tags_map()
+    supporter_urls_norm = db_manual_supporter_urls_norm()
+
+    # Owner attribution per target (which Draftboard customer "owns" the
+    # path). Captured from each connection sync into target_owners.
+    owners_map: dict[str, list[str]] = {}
+    upload_dates_map: dict[str, str] = {}
+    with _db_lock, _db_connect() as conn:
+        for tid, of, ol in conn.execute(
+            "SELECT target_id, owner_first, owner_last FROM target_owners"
+        ).fetchall():
+            full = f"{(of or '').strip()} {(ol or '').strip()}".strip()
+            if full:
+                owners_map.setdefault(tid, []).append(full)
+        for tid, tag in conn.execute(
+            "SELECT target_id, tag FROM target_tags WHERE tag_type = 'upload_date'"
+        ).fetchall():
+            # One upload-date per target by design; last write wins if
+            # somehow there are duplicates.
+            upload_dates_map[tid] = tag
+
+    import csv as _csv
+    import io as _io
+    buf = _io.StringIO()
+    writer = _csv.writer(buf)
+    writer.writerow(_EXPORT_CSV_HEADERS)
+
+    rows_written = 0
+    for t in targets:
+        tid = t.get("id")
+        if not tid:
+            continue
+        t_first = (t.get("firstName") or "").strip()
+        t_last = (t.get("lastName") or "").strip()
+        t_pos = t.get("position") or {}
+        t_title = (t_pos.get("title") or "").strip()
+        t_company = (t_pos.get("companyName") or "").strip()
+        t_linkedin = (t.get("linkedinUrl") or "").strip()
+        owners = ", ".join(owners_map.get(tid, []))
+        tag_list = tags_map.get(tid, []) or []
+        # Filter out date tags from the user-tag list
+        tags_str = "; ".join([t for t in tag_list if t])
+        date_added = upload_dates_map.get(tid, "")
+
+        # Read cached connections — don't trigger fetches (this endpoint
+        # would otherwise spend minutes hitting the Draftboard API).
+        conns_data, _, _ = db_get_connections(tid)
+        conns = conns_data or []
+
+        if not conns:
+            # Target row with empty connection columns so the export
+            # still surfaces the target itself.
+            writer.writerow([
+                t_first, t_last, "",
+                t_title, t_linkedin,
+                t_company, "", "",
+                "", "", "", "", "",
+                "", "", "", "",
+                "", "", "", "",
+                "", "", "", "",
+                "", "", "", "",
+                "", owners, "", "no", "no",
+                tags_str, date_added, "",
+            ])
+            rows_written += 1
+            continue
+
+        for c in conns:
+            c_first = (c.get("firstName") or "").strip()
+            c_last = (c.get("lastName") or "").strip()
+            c_pos = c.get("position") or {}
+            c_title = (c_pos.get("title") or "").strip()
+            c_linkedin = (c.get("linkedinUrl") or "").strip()
+            c_norm = _normalize_linkedin(c_linkedin)
+            is_supporter = "yes" if c_norm and c_norm in supporter_urls_norm else "no"
+            score = c.get("score") or 0
+
+            school, works, mutuals = _parse_scoredetails_for_csv(c.get("scoreDetails") or [])
+
+            writer.writerow([
+                t_first, t_last, "",
+                t_title, t_linkedin,
+                t_company, "", "",
+                c_first, c_last,
+                c_title, "",
+                c_linkedin,
+                school, "", "", "",
+                works[0][0], works[0][1], works[0][2], works[0][3],
+                works[1][0], works[1][1], works[1][2], works[1][3],
+                works[2][0], works[2][1], works[2][2], works[2][3],
+                mutuals,
+                owners,
+                score,
+                is_supporter,
+                "no",  # team-member-supporter distinction not surfaced in kit
+                tags_str,
+                date_added,
+                "",  # connection degree not exposed by API
+            ])
+            rows_written += 1
+
+    csv_data = buf.getvalue()
+    filename = f"draftboard-targets-export-{time.strftime('%Y-%m-%d')}.csv"
+    from flask import Response
+    return Response(
+        csv_data,
+        mimetype="text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Rows-Exported": str(rows_written),
+        },
+    )
 
 
 @app.route("/target/<target_id>/drawer", methods=["GET"])
@@ -8669,6 +9696,22 @@ def _onboarding_status():
     slack_done = slack_is_configured()
     slack_channel = (db_get_slack_config("channel_name") or "").strip() if slack_done else ""
 
+    # ---- New onboarding-step status (profile / targets / supporters) ---
+    user_ctx = _user_context()
+    profile_done = bool(
+        (user_ctx.get("user_first_name") or "").strip()
+        and (user_ctx.get("user_last_name") or "").strip()
+        and (user_ctx.get("user_company") or "").strip()
+    )
+
+    with _db_lock, _db_connect() as conn:
+        target_count = (conn.execute("SELECT COUNT(*) FROM targets_cache").fetchone() or [0])[0]
+        supporter_count = (conn.execute("SELECT COUNT(*) FROM manual_supporters").fetchone() or [0])[0]
+
+    targets_done = target_count > 0 or bool(db_app_state_get("onboarding_skipped_targets"))
+    supporters_done = supporter_count > 0 or bool(db_app_state_get("onboarding_skipped_supporters"))
+    profile_done_or_skipped = profile_done or bool(db_app_state_get("onboarding_skipped_profile"))
+
     # Signup-status nudge: when the customer has no API key yet AND hasn't
     # answered "are you already a Draftboard customer?", the wizard shows a
     # banner asking. Persisted in app_state so the question only fires once.
@@ -8707,24 +9750,133 @@ def _onboarding_status():
             "channel": slack_channel,
             "skipped": bool(db_app_state_get("setup_skipped_slack")),
         },
+        # New onboarding-only steps surfaced on /onboarding.
+        "profile": {
+            "done": profile_done,
+            "skipped": bool(db_app_state_get("onboarding_skipped_profile")),
+            "first": user_ctx.get("user_first_name") or "",
+            "last": user_ctx.get("user_last_name") or "",
+            "company": user_ctx.get("user_company") or "",
+            "company_desc": user_ctx.get("user_company_description") or "",
+        },
+        "targets": {
+            "done": target_count > 0,
+            "skipped": bool(db_app_state_get("onboarding_skipped_targets")),
+            "count": target_count,
+        },
+        "supporters": {
+            "done": supporter_count > 0,
+            "skipped": bool(db_app_state_get("onboarding_skipped_supporters")),
+            "count": supporter_count,
+        },
+        "completed": bool(db_app_state_get("onboarding_completed_at")),
     }
 
 
 @app.route("/setup", methods=["GET"])
 def setup_view():
-    """First-run / onboarding menu. Lists the four integrations with their
-    current status and a 'Set up' button per row. Auto-redirected to from
-    `/` when no API key is configured (unless `setup_dismissed` is set)."""
+    """Legacy URL — 308-redirects to /onboarding so bookmarks keep
+    working. The new onboarding page is a superset of the old setup."""
+    return redirect(url_for("onboarding_view"), code=308)
+
+
+@app.route("/onboarding", methods=["GET"])
+def onboarding_view():
+    """Guided 7-step onboarding flow. Welcome → API key → Profile →
+    Add targets → Add supporters → Optional integrations → Done.
+
+    Each step auto-marks ✓ when its underlying state is satisfied, so
+    re-entering the page picks up where the user left off. Steps that
+    need a full page (Sales Nav scrape, CSV upload, Google OAuth) link
+    out to the existing hub pages.
+    """
     return render_template(
-        "setup_wizard.html",
+        "onboarding.html",
         status=_onboarding_status(),
-        # Pass through any flash-style query param so the API-key form can
-        # show inline validation errors after a paste.
         api_key_error=request.args.get("api_key_error", ""),
         api_key_override_source=request.args.get("api_key_override_source", ""),
         api_key_unverified=request.args.get("api_key_unverified") == "1",
         active="setup",
     )
+
+
+@app.route("/onboarding/skip-step", methods=["POST"])
+def onboarding_skip_step():
+    """Mark a wizard step skipped so the user can move past it without
+    completing the underlying action. Used for profile / targets /
+    supporters."""
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+    body = request.get_json(silent=True) or {}
+    step = (body.get("step") or "").strip()
+    if step not in ("profile", "targets", "supporters"):
+        return jsonify({"ok": False, "error": "unknown step"}), 400
+    db_app_state_set(f"onboarding_skipped_{step}", str(int(time.time())))
+    return jsonify({"ok": True, "skipped": step})
+
+
+@app.route("/onboarding/dismiss-banner", methods=["POST"])
+def onboarding_dismiss_banner():
+    """Hide the onboarding nudge banner across all pages. Re-appears
+    when the user's progress count moves past the dismissed level
+    (handled by the context processor comparing
+    `onboarding_banner_dismissed_at_count`)."""
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+    try:
+        stat = _onboarding_status()
+        steps_done = sum(1 for s in [
+            stat["api_key"]["done"],
+            stat["profile"]["done"] or stat["profile"]["skipped"],
+            stat["targets"]["done"] or stat["targets"]["skipped"],
+            stat["supporters"]["done"] or stat["supporters"]["skipped"],
+            stat["resolver"]["done"] or stat["resolver"]["skipped"],
+            stat["google"]["done"] or stat["google"]["skipped"],
+            stat["slack"]["done"] or stat["slack"]["skipped"],
+        ] if s)
+    except Exception:  # noqa: BLE001
+        steps_done = 0
+    db_app_state_set("onboarding_banner_dismissed_at_count", str(steps_done))
+    return jsonify({"ok": True, "dismissed_at": steps_done})
+
+
+@app.route("/onboarding/complete", methods=["POST"])
+def onboarding_complete():
+    """Mark onboarding fully complete. Stops the auto-redirect from /."""
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+    db_app_state_set("onboarding_completed_at", str(int(time.time())))
+    return jsonify({"ok": True})
+
+
+@app.route("/onboarding/profile", methods=["POST"])
+def onboarding_save_profile():
+    """Inline profile save from step 3. Same fields as /settings/profile
+    but submits via JSON so we can stay on the onboarding page."""
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+    body = request.get_json(silent=True) or {}
+    fields = {
+        "user_first_name": (body.get("user_first_name") or "").strip()[:100],
+        "user_last_name": (body.get("user_last_name") or "").strip()[:100],
+        "user_company": (body.get("user_company") or "").strip()[:200],
+        "user_company_description": (body.get("user_company_description") or "").strip()[:1000],
+    }
+    if not fields["user_first_name"] or not fields["user_last_name"] or not fields["user_company"]:
+        return jsonify({"ok": False, "error": "First name, last name, and company are required."}), 400
+    for k, v in fields.items():
+        db_app_state_set(k, v)
+    # Invalidate the per-request cache so the next render sees the new values.
+    try:
+        from flask import g
+        g._user_context_cache = None
+    except (ImportError, RuntimeError):
+        pass
+    return jsonify({"ok": True, **fields})
 
 
 @app.route("/setup/api-key", methods=["POST"])
@@ -9380,8 +10532,10 @@ def _wizard_match_one(query: str, index: list[dict]) -> list[dict]:
 
 
 @app.route("/supporters/wizard", methods=["GET"])
+@app.route("/add/supporters", methods=["GET"])
+@app.route("/add/supporters/wizard", methods=["GET"])
 def supporters_wizard_view():
-    """Render the empty wizard. Five typeahead inputs, one per prompt
+    """Render the empty wizard. Six typeahead inputs, one per prompt
     bucket; the JS fetches the connector index once on load and matches
     client-side as the user types."""
     network_size = 0
@@ -9390,10 +10544,11 @@ def supporters_wizard_view():
         network_size = (cur.fetchone() or [0])[0]
     return render_template(
         "supporters_wizard.html",
-        active="supporters_wizard",
+        active="add_supporters",
         api_key_set=bool(API_KEY),
         prompts=SUPPORTER_WIZARD_PROMPTS,
         network_size=network_size,
+        hub_tabs=_hub_tabs_for_supporters("wizard"),
     )
 
 
@@ -9460,6 +10615,32 @@ def supporters_wizard_match():
     return jsonify({"ok": True, "buckets": out_buckets})
 
 
+@app.route("/supporters/wizard/unmark", methods=["POST"])
+def supporters_wizard_unmark():
+    """Reverse a wizard-marked supporter. Only removes rows whose source
+    is 'wizard' so an accidental Undo can't wipe out a supporter the
+    user added via a different path (star button, paste form, etc.)."""
+    blocked = _reject_cross_site_form()
+    if blocked is not None:
+        return blocked
+    body = request.get_json(silent=True) or {}
+    linkedin_url = (body.get("linkedin_url") or "").strip()
+    if not linkedin_url:
+        return jsonify({"ok": False, "error": "linkedin_url required"}), 400
+    norm = _normalize_linkedin(linkedin_url) or linkedin_url
+    existing = db_manual_supporter_get(norm)
+    if not existing:
+        return jsonify({"ok": True, "removed": False, "reason": "not a supporter"})
+    if (existing.get("source") or "") != "wizard":
+        return jsonify({
+            "ok": True,
+            "removed": False,
+            "reason": f"added via '{existing.get('source')}' - undo only works on wizard-added supporters",
+        })
+    removed = db_manual_supporter_remove(linkedin_url)
+    return jsonify({"ok": True, "removed": removed})
+
+
 @app.route("/supporters/wizard/mark", methods=["POST"])
 def supporters_wizard_mark():
     """Bulk-mark a list of LinkedIn URLs as supporters with source="wizard".
@@ -9506,6 +10687,7 @@ def supporters_wizard_mark():
 
 
 @app.route("/supporters/candidates", methods=["GET"])
+@app.route("/add/supporters/scan", methods=["GET"])
 def supporters_candidates_view():
     """Ranked list of high-engagement contacts from the local user's Gmail
     + Calendar, plus any imported teammate scans."""
@@ -9588,8 +10770,9 @@ def supporters_candidates_view():
         status=status,
         sync_state=sync_state,
         resolver_status=resolver_status,
-        active="candidates",
+        active="add_supporters",
         api_key_set=bool(API_KEY),
+        hub_tabs=_hub_tabs_for_supporters("scan"),
     )
 
 
@@ -9654,6 +10837,7 @@ def supporters_linkedin_urls():
 # ---- Manual path uploads ---------------------------------------------------
 
 @app.route("/settings/manual-paths", methods=["GET"])
+@app.route("/add/linkedin-export", methods=["GET"])
 def manual_paths_view():
     """Upload page: list existing uploads + form to add a new one."""
     lists = db_list_manual_path_lists()
@@ -9689,7 +10873,7 @@ def manual_paths_view():
         upload_owner_title=request.args.get("owner_title", ""),
         upload_owner_company=request.args.get("owner_company", ""),
         upload_owner_linkedin=request.args.get("owner_linkedin", ""),
-        active="settings_manual_paths",
+        active="add_linkedin_export",
     )
 
 
@@ -10722,6 +11906,32 @@ def _resolver_status(keys: dict) -> dict:
         "scrupp_present": bool(keys.get("scrupp_api_key")),
         "scrupp_ready": bool(keys.get("scrupp_api_key")),
     }
+
+
+@app.route("/settings/integrations", methods=["GET"])
+def settings_integrations_view():
+    """Unified integrations page. One card per third-party service the kit
+    talks to — API-key ones (Apollo / OpenAI / Google CSE / Scrupp) get
+    an inline paste-key form; OAuth/webhook ones (Google Workspace,
+    Slack) link to their existing config pages; the outbound stack
+    (HeyReach, Smartlead, Instantly) is stubbed for a future build."""
+    keys = _load_resolver_keys()
+    gstat = google_status()
+    slack_webhook_set = bool(db_get_slack_config("webhook_url"))
+    return render_template(
+        "settings_integrations.html",
+        active="settings_integrations",
+        keys_present={
+            "apollo": bool(keys.get("apollo_api_key")),
+            "openai": bool(keys.get("openai_api_key")),
+            "cse_key": bool(keys.get("google_cse_api_key")),
+            "cse_id": bool(keys.get("google_cse_id")),
+            "scrupp": bool(keys.get("scrupp_api_key")),
+        },
+        google_connected=bool(gstat.get("account_email")),
+        google_email=gstat.get("account_email") or "",
+        slack_connected=slack_webhook_set,
+    )
 
 
 @app.route("/settings/api-keys", methods=["GET"])

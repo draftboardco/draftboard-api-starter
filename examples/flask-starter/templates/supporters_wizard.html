@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Draftboard — Supporter wizard</title>
+  <title>Draftboard — Add supporters · Type names</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
     /* Autocomplete dropdown — positioned absolute under each input. */
@@ -31,15 +31,21 @@
   <div class="max-w-3xl mx-auto px-6 py-10">
     {% include "_nav.html" %}
 
-    <header class="mb-6">
-      <h1 class="text-2xl font-semibold tracking-tight">Who can vouch for you?</h1>
+    <header class="mb-4">
+      <h1 class="text-2xl font-semibold tracking-tight">Add supporters</h1>
       <p class="text-sm text-slate-500 mt-1">
-        Start typing names; we'll autocomplete against your Draftboard network
-        ({{ network_size }} connections). Use <kbd class="px-1 bg-slate-100 rounded text-[10px]">↓</kbd>
-        / <kbd class="px-1 bg-slate-100 rounded text-[10px]">Tab</kbd> /
-        <kbd class="px-1 bg-slate-100 rounded text-[10px]">Enter</kbd> to pick a match.
+        Pick how you want to identify the people in your network most likely to make warm intros.
       </p>
     </header>
+
+    {% include "_hub_tabs.html" %}
+
+    <section class="mb-6">
+      <h2 class="text-sm font-semibold text-slate-900 mb-1">Who can vouch for you?</h2>
+      <p class="text-xs text-slate-500">
+        Start typing names — we'll autocomplete against your Draftboard network ({{ network_size }} connections). Use <kbd class="px-1 bg-slate-100 rounded text-[10px]">↓</kbd> / <kbd class="px-1 bg-slate-100 rounded text-[10px]">Tab</kbd> / <kbd class="px-1 bg-slate-100 rounded text-[10px]">Enter</kbd> to pick a match.
+      </p>
+    </section>
 
     {% if network_size == 0 %}
       <div class="mb-6 rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
@@ -71,33 +77,12 @@
 
       <div class="flex items-center justify-between gap-3 sticky bottom-0 bg-slate-50 py-3 border-t border-slate-200">
         <p class="text-xs text-slate-500">
-          <span id="picked-count">0</span> selected. Click below to tag them all as supporters.
+          <span id="picked-count">0</span> supporter<span id="picked-count-s">s</span> added this session.
+          Each name is tagged the moment you pick it — click <strong>Undo</strong> on any chip to reverse it.
         </p>
-        <button
-          type="button"
-          id="mark-btn"
-          disabled
-          class="inline-flex items-center justify-center rounded-md bg-emerald-600 hover:bg-emerald-700 px-4 py-2 text-sm font-medium text-white shadow disabled:opacity-50 disabled:cursor-not-allowed"
-        >
-          Mark selected as supporters
-        </button>
-      </div>
-    </section>
-
-    <section id="step-done" class="hidden">
-      <div class="rounded-md border border-emerald-300 bg-emerald-50 px-4 py-4 text-sm text-emerald-900">
-        <strong id="done-title"></strong>
-        <p class="mt-1" id="done-detail"></p>
-      </div>
-      <div class="mt-4 flex items-center gap-3">
-        <a href="/supporters/candidates" class="text-sm text-indigo-700 underline">View all supporters →</a>
-        <button
-          type="button"
-          id="restart-btn"
-          class="text-xs text-slate-500 underline hover:text-slate-900"
-        >
-          Add more names
-        </button>
+        <a href="/supporters/candidates" class="text-xs text-indigo-700 underline">
+          View all supporters →
+        </a>
       </div>
     </section>
 
@@ -110,12 +95,8 @@
     (function () {
       var loadingBanner = document.getElementById('loading-banner');
       var formEl = document.getElementById('form');
-      var stepDone = document.getElementById('step-done');
-      var markBtn = document.getElementById('mark-btn');
       var pickedCountEl = document.getElementById('picked-count');
-      var restartBtn = document.getElementById('restart-btn');
-      var doneTitle = document.getElementById('done-title');
-      var doneDetail = document.getElementById('done-detail');
+      var pickedCountSEl = document.getElementById('picked-count-s');
 
       // ----- DATA -----
       // Connector index, loaded once on page boot. Each entry:
@@ -229,14 +210,20 @@
           var c = currentMatches[idx];
           var norm = normalizeLinkedIn(c.linkedin);
           if (norm && !picked.has(norm)) {
+            // Initial chip state depends on whether the person was
+            // already a supporter coming in. 'already' chips don't POST;
+            // 'pending' chips POST immediately and flip to 'marked' on
+            // success or 'error' on failure.
+            var initialState = c.already_supporter ? 'already' : 'pending';
             picked.set(norm, {
               linkedin_url: c.linkedin,
               display_name: c.name,
               bucket: bucket,
-              already_supporter: c.already_supporter,
+              state: initialState,
             });
             renderChips(bucket);
             refreshPickedCount();
+            if (initialState === 'pending') markOne(norm);
           }
           input.value = '';
           currentMatches = [];
@@ -275,35 +262,142 @@
       }
 
       // ----- CHIPS -----
+      // Each chip's UI reflects its `state` field:
+      //   pending  → "Marking…" (server in flight)
+      //   marked   → ✓ green + "Undo" (server confirmed)
+      //   already  → "(already a supporter)" grey + no action
+      //   error    → red + "Retry" link
+      function chipMarkup(norm, entry) {
+        var stateBits = '';
+        var actionBits = '';
+        if (entry.state === 'pending') {
+          stateBits = ' <span class="text-[10px] text-slate-500">Marking…</span>';
+        } else if (entry.state === 'marked') {
+          stateBits = ' <span class="text-[10px] text-emerald-700">✓</span>';
+          actionBits = '<button type="button" data-action="undo" aria-label="Undo" class="text-[10px] text-slate-500 hover:text-slate-900 underline">Undo</button>';
+        } else if (entry.state === 'already') {
+          stateBits = ' <span class="text-[10px] text-slate-500">(already)</span>';
+          actionBits = '<button type="button" data-action="remove" aria-label="Remove" class="text-[10px] text-slate-500 hover:text-slate-900">×</button>';
+        } else if (entry.state === 'error') {
+          stateBits = ' <span class="text-[10px] text-rose-700">failed</span>';
+          actionBits = '<button type="button" data-action="retry" class="text-[10px] text-rose-700 hover:text-rose-900 underline">Retry</button>'
+                     + '<button type="button" data-action="remove" aria-label="Remove" class="ml-1 text-[10px] text-slate-500 hover:text-slate-900">×</button>';
+        }
+        return '<span class="chip" data-norm="' + escapeHtml(norm) + '" data-state="' + entry.state + '">' +
+                 escapeHtml(entry.display_name) + stateBits +
+                 actionBits +
+               '</span>';
+      }
       function renderChips(bucket) {
         var container = document.querySelector('.ac-chips[data-chips-for="' + bucket + '"]');
         if (!container) return;
         var chips = [];
         picked.forEach(function (entry, norm) {
           if (entry.bucket !== bucket) return;
-          chips.push(
-            '<span class="chip" data-norm="' + escapeHtml(norm) + '">' +
-              escapeHtml(entry.display_name) +
-              (entry.already_supporter ? ' <span class="text-[10px] text-slate-500">(already)</span>' : '') +
-              '<button type="button" aria-label="Remove">×</button>' +
-            '</span>'
-          );
+          chips.push(chipMarkup(norm, entry));
         });
         container.innerHTML = chips.join('');
         container.querySelectorAll('.chip').forEach(function (el) {
           var norm = el.getAttribute('data-norm');
-          el.querySelector('button').addEventListener('click', function () {
-            picked.delete(norm);
-            renderChips(bucket);
-            refreshPickedCount();
+          el.querySelectorAll('button').forEach(function (btn) {
+            var action = btn.getAttribute('data-action');
+            btn.addEventListener('click', function () {
+              if (action === 'undo') undoOne(norm);
+              else if (action === 'retry') markOne(norm);
+              else if (action === 'remove') removeChip(norm);
+            });
           });
         });
       }
       function refreshPickedCount() {
         var n = 0;
-        picked.forEach(function (e) { if (!e.already_supporter) n++; });
+        picked.forEach(function (e) { if (e.state === 'marked') n++; });
         pickedCountEl.textContent = n;
-        markBtn.disabled = n === 0;
+        if (pickedCountSEl) pickedCountSEl.textContent = (n === 1 ? '' : 's');
+      }
+
+      // ----- SERVER ROUND-TRIPS -----
+      // markOne / undoOne fire as soon as the user picks or clicks Undo.
+      // Each chip carries the in-flight state so the user sees "Marking…"
+      // then ✓ within a beat. Errors stay on the chip with a Retry link
+      // rather than alert()-ing them out of context.
+      function markOne(norm) {
+        var entry = picked.get(norm);
+        if (!entry) return;
+        entry.state = 'pending';
+        renderChips(entry.bucket);
+        refreshPickedCount();
+        fetch('/supporters/wizard/mark', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ selections: [{
+            linkedin_url: entry.linkedin_url,
+            display_name: entry.display_name,
+          }] }),
+        })
+          .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+          .then(function (resp) {
+            var current = picked.get(norm);
+            if (!current) return; // user removed the chip while in-flight
+            var b = resp.body || {};
+            if (!b.ok) {
+              current.state = 'error';
+            } else if (b.added > 0 || b.already_supporter > 0) {
+              current.state = 'marked';
+            } else {
+              current.state = 'error';
+            }
+            renderChips(current.bucket);
+            refreshPickedCount();
+          })
+          .catch(function () {
+            var current = picked.get(norm);
+            if (!current) return;
+            current.state = 'error';
+            renderChips(current.bucket);
+            refreshPickedCount();
+          });
+      }
+      function undoOne(norm) {
+        var entry = picked.get(norm);
+        if (!entry) return;
+        var bucket = entry.bucket;
+        // Optimistic UI: remove the chip immediately. Re-add it if the
+        // server rejects the undo (rare - only happens if the row was
+        // somehow not actually wizard-sourced).
+        picked.delete(norm);
+        renderChips(bucket);
+        refreshPickedCount();
+        fetch('/supporters/wizard/unmark', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ linkedin_url: entry.linkedin_url }),
+        })
+          .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
+          .then(function (resp) {
+            var b = resp.body || {};
+            if (b.ok && b.removed === false) {
+              // Server refused to remove (e.g. supporter from a different
+              // source). Put the chip back so the user sees the truth.
+              picked.set(norm, Object.assign({}, entry, { state: 'already' }));
+              renderChips(bucket);
+              refreshPickedCount();
+            }
+          })
+          .catch(function () { /* ignore — network blip; chip stays removed */ });
+      }
+      function removeChip(norm) {
+        // No server call - just drop the local chip. Used for 'already'
+        // chips (the supporter exists upstream of the wizard) or 'error'
+        // chips the user wants to dismiss without retrying.
+        var entry = picked.get(norm);
+        if (!entry) return;
+        var bucket = entry.bucket;
+        picked.delete(norm);
+        renderChips(bucket);
+        refreshPickedCount();
       }
 
       // ----- INIT: load the index ------
@@ -329,60 +423,6 @@
           loadingBanner.className = 'mb-4 text-xs text-rose-700';
         });
 
-      // ----- SUBMIT -----
-      markBtn.addEventListener('click', function () {
-        var selections = [];
-        picked.forEach(function (entry) {
-          if (entry.already_supporter) return;
-          selections.push({
-            linkedin_url: entry.linkedin_url,
-            display_name: entry.display_name,
-          });
-        });
-        if (selections.length === 0) return;
-        markBtn.disabled = true;
-        var orig = markBtn.textContent;
-        markBtn.textContent = 'Marking…';
-        fetch('/supporters/wizard/mark', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          credentials: 'same-origin',
-          body: JSON.stringify({ selections: selections }),
-        })
-          .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); })
-          .then(function (resp) {
-            markBtn.disabled = false;
-            markBtn.textContent = orig;
-            var b = resp.body || {};
-            if (!b.ok) {
-              alert(b.error || 'Mark failed');
-              return;
-            }
-            doneTitle.textContent = '✓ Marked ' + b.added + ' new supporter' + (b.added === 1 ? '' : 's');
-            var detailBits = [];
-            if (b.already_supporter) detailBits.push(b.already_supporter + ' were already tagged');
-            if (b.errors && b.errors.length) detailBits.push(b.errors.length + ' had errors');
-            doneDetail.textContent = detailBits.length ? '(' + detailBits.join(', ') + ')' : '';
-            formEl.style.display = 'none';
-            stepDone.classList.remove('hidden');
-            window.scrollTo({ top: 0, behavior: 'smooth' });
-          })
-          .catch(function (err) {
-            markBtn.disabled = false;
-            markBtn.textContent = orig;
-            alert('Network error: ' + (err && err.message ? err.message : 'unknown'));
-          });
-      });
-
-      restartBtn.addEventListener('click', function () {
-        picked = new Map();
-        document.querySelectorAll('.ac-chips').forEach(function (c) { c.innerHTML = ''; });
-        document.querySelectorAll('.ac-input').forEach(function (i) { i.value = ''; });
-        refreshPickedCount();
-        formEl.style.display = '';
-        stepDone.classList.add('hidden');
-        window.scrollTo({ top: 0, behavior: 'smooth' });
-      });
     })();
   </script>
 </body>

@@ -3,22 +3,28 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Draftboard — Import supporters</title>
+  <title>Draftboard — Add supporters · Paste URLs</title>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-50 text-slate-900 min-h-screen">
   <div class="max-w-3xl mx-auto px-6 py-10">
     {% include "_nav.html" %}
 
-    <header class="mb-6">
-      <h1 class="text-2xl font-semibold tracking-tight">Import supporters</h1>
+    <header class="mb-4">
+      <h1 class="text-2xl font-semibold tracking-tight">Add supporters</h1>
       <p class="text-sm text-slate-500 mt-1">
-        Paste LinkedIn URLs of people you've already identified as supporters.
-        They'll appear with the ⭐ badge on connector cards across Targets,
-        Accounts, and Connections — and the "Supporters only" filter will
-        include them.
+        Pick how you want to identify the people in your network most likely to make warm intros.
       </p>
     </header>
+
+    {% include "_hub_tabs.html" %}
+
+    <section class="mb-6">
+      <h2 class="text-sm font-semibold text-slate-900 mb-1">Paste LinkedIn URLs</h2>
+      <p class="text-xs text-slate-500">
+        Drop in a list of LinkedIn profile URLs you've already identified as supporters. They'll appear with the ⭐ badge across the app.
+      </p>
+    </section>
 
     {% if result %}
       <div class="mb-6 rounded-md border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">

@@ -3,24 +3,27 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Draftboard — Supporters</title>
+  <title>Draftboard — Add supporters · Scan Gmail+Calendar</title>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-50 text-slate-900 min-h-screen">
   <div class="max-w-5xl mx-auto px-6 py-10">
     {% include "_nav.html" %}
 
+    <header class="mb-4">
+      <h1 class="text-2xl font-semibold tracking-tight">Add supporters</h1>
+      <p class="text-sm text-slate-500 mt-1">
+        Pick how you want to identify the people in your network most likely to make warm intros.
+      </p>
+    </header>
+
+    {% include "_hub_tabs.html" %}
+
     <header class="mb-6 flex items-end justify-between flex-wrap gap-3">
       <div>
-        <h1 class="text-2xl font-semibold tracking-tight">Supporters</h1>
-        <p class="text-sm text-slate-500 mt-1">
-          Find potential Supporters in your Gmail and Calendar (and your
-          teammates' networks), then mark the ones you actually want to
-          add as Supporters in Draftboard.
-          <span class="block mt-1 text-xs text-slate-400">
-            Ranked by how often you actually engage — emails back-and-forth,
-            threads, and shared meetings, weighted toward recency.
-          </span>
+        <h2 class="text-sm font-semibold text-slate-900 mb-1">Scan Gmail + Calendar</h2>
+        <p class="text-xs text-slate-500">
+          Find potential supporters in your Gmail and Calendar (or your teammates' networks). Ranked by how often you actually engage — emails back-and-forth, threads, shared meetings — weighted toward recency. Requires a <a class="underline" href="/settings/google">Google Workspace connection</a>.
         </p>
       </div>
       <div class="flex items-center gap-2">
