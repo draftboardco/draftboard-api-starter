@@ -3,19 +3,28 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Draftboard — Import targets</title>
+  <title>Draftboard — Add targets · Paste URLs</title>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-50 text-slate-900 min-h-screen">
   <div class="max-w-2xl mx-auto px-6 py-10">
     {% include "_nav.html" %}
 
-    <header class="mb-8">
-      <h1 class="text-2xl font-semibold tracking-tight">Import targets</h1>
+    <header class="mb-4">
+      <h1 class="text-2xl font-semibold tracking-tight">Add targets</h1>
       <p class="text-sm text-slate-500 mt-1">
-        Paste LinkedIn URLs of prospects you want Draftboard to map warm intros for.
+        Pick how you want to add new prospects to your Draftboard workspace.
       </p>
     </header>
+
+    {% include "_hub_tabs.html" %}
+
+    <section class="mb-6">
+      <h2 class="text-sm font-semibold text-slate-900 mb-1">Paste LinkedIn URLs</h2>
+      <p class="text-xs text-slate-500">
+        Drop in a list of LinkedIn profile URLs (one per line or comma-separated). Best for small lists you already have.
+      </p>
+    </section>
 
     {% if not api_key_set %}
       <div class="mb-6 rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">

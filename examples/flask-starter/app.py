@@ -4438,7 +4438,42 @@ def accounts_view():
     )
 
 
+# =====================================================================
+# Hub tab strips
+# =====================================================================
+# Each "Add data" hub page (Add targets, Add supporters) carries a
+# secondary tab strip across the top. Tabs are server-rendered links —
+# clicking switches to a sibling route, no JS-toggle. Each handler
+# calls one of the builders below to get its tab context.
+
+def _hub_tabs_for_targets(active: str) -> list[dict]:
+    """Tab strip for /add/targets/* pages. active is one of:
+    'paste', 'sales_nav', 'csv'."""
+    return [
+        {"label": "Paste URLs",     "url": "/add/targets/paste",     "active": active == "paste"},
+        {"label": "Sales Navigator", "url": "/add/targets/sales-nav", "active": active == "sales_nav"},
+        # CSV upload is queued but not built yet; surfaced as a stub so
+        # the IA is complete and users know it's coming.
+        {"label": "Upload CSV",     "url": "/add/targets/csv",       "active": active == "csv",
+         "badge": "soon"},
+    ]
+
+
+def _hub_tabs_for_supporters(active: str) -> list[dict]:
+    """Tab strip for /add/supporters/* pages. active is one of:
+    'wizard', 'scan', 'paste', 'csv'."""
+    return [
+        {"label": "Type names (wizard)", "url": "/add/supporters/wizard", "active": active == "wizard"},
+        {"label": "Scan Gmail + Calendar", "url": "/add/supporters/scan", "active": active == "scan"},
+        {"label": "Paste URLs",         "url": "/add/supporters/paste",  "active": active == "paste"},
+        {"label": "Upload CSV",         "url": "/add/supporters/csv",    "active": active == "csv",
+         "badge": "soon"},
+    ]
+
+
 @app.route("/import", methods=["GET"])
+@app.route("/add/targets", methods=["GET"])
+@app.route("/add/targets/paste", methods=["GET"])
 def import_form():
     tags, tag_error = fetch_tags()
     return render_template(
@@ -4447,11 +4482,50 @@ def import_form():
         tag_error=tag_error,
         api_key_set=bool(API_KEY),
         result=None,
-        active="import",
+        active="add_targets",
+        hub_tabs=_hub_tabs_for_targets("paste"),
+    )
+
+
+@app.route("/add/targets/csv", methods=["GET"])
+def add_targets_csv_stub():
+    """Stub page for the future CSV-upload-targets feature."""
+    return render_template(
+        "hub_stub.html",
+        active="add_targets",
+        hub_tabs=_hub_tabs_for_targets("csv"),
+        hub_title="Add targets",
+        hub_intro="Pick how you want to add new prospects to your Draftboard workspace.",
+        feature_title="Upload CSV (coming soon)",
+        feature_body=(
+            "Drop in a CSV exported from LinkedIn Sales Navigator, Apollo, or "
+            "any other prospect tool. We'll match the columns we need "
+            "(LinkedIn URL, name, company) and import each row as a target. "
+            "Use Paste URLs or Sales Navigator for now."
+        ),
+    )
+
+
+@app.route("/add/supporters/csv", methods=["GET"])
+def add_supporters_csv_stub():
+    return render_template(
+        "hub_stub.html",
+        active="add_supporters",
+        hub_tabs=_hub_tabs_for_supporters("csv"),
+        hub_title="Add supporters",
+        hub_intro="Pick how you want to identify the people in your network most likely to make warm intros.",
+        feature_title="Upload CSV (coming soon)",
+        feature_body=(
+            "Drop in a CSV of supporter contacts (LinkedIn URL + display "
+            "name, optionally tagged to a teammate). We'll bulk-create the "
+            "manual_supporters rows in one shot. Use Type names or Paste URLs "
+            "in the meantime."
+        ),
     )
 
 
 @app.route("/import/supporters", methods=["GET", "POST"])
+@app.route("/add/supporters/paste", methods=["GET", "POST"])
 def import_supporters_view():
     """Paste-URLs form for bulk-flagging supporters. On POST, normalizes the
     pasted URLs and writes one manual_supporters row per URL with source='paste'.
@@ -4514,7 +4588,7 @@ def import_supporters_view():
             "import_supporters.html",
             owners=owners,
             api_key_set=bool(API_KEY),
-            active="import_supporters",
+            active="add_supporters",
             result={
                 "submitted_count": len(urls),
                 "added": added,
@@ -4523,19 +4597,22 @@ def import_supporters_view():
                 "note": note,
             },
             recent=db_manual_supporters_recent(50),
+            hub_tabs=_hub_tabs_for_supporters("paste"),
         )
 
     return render_template(
         "import_supporters.html",
         owners=owners,
         api_key_set=bool(API_KEY),
-        active="import_supporters",
+        active="add_supporters",
         result=None,
         recent=db_manual_supporters_recent(50),
+        hub_tabs=_hub_tabs_for_supporters("paste"),
     )
 
 
 @app.route("/import/triage-responses", methods=["GET", "POST"])
+@app.route("/add/shortlist-responses", methods=["GET", "POST"])
 def import_triage_responses_view():
     """Upload-a-JSON-file flow that ingests the responses a connector
     submitted on draftboard.com/triage/<token>.
@@ -4564,7 +4641,7 @@ def import_triage_responses_view():
             return render_template(
                 "import_triage_responses.html",
                 api_key_set=bool(API_KEY),
-                active="import_triage_responses",
+                active="shortlist_responses",
                 result={"error": "No file uploaded. Pick the JSON file you downloaded from the shortlist view page."},
                 recent_overrides=_recent_connector_overrides_for_display(),
             )
@@ -4579,7 +4656,7 @@ def import_triage_responses_view():
             return render_template(
                 "import_triage_responses.html",
                 api_key_set=bool(API_KEY),
-                active="import_triage_responses",
+                active="shortlist_responses",
                 result={"error": f"File too large ({size} bytes). Triage JSON files should be under a few hundred KB."},
                 recent_overrides=_recent_connector_overrides_for_display(),
             )
@@ -4590,7 +4667,7 @@ def import_triage_responses_view():
             return render_template(
                 "import_triage_responses.html",
                 api_key_set=bool(API_KEY),
-                active="import_triage_responses",
+                active="shortlist_responses",
                 result={"error": f"Not valid JSON: {type(e).__name__}. Was this the file you downloaded from the shortlist page?"},
                 recent_overrides=_recent_connector_overrides_for_display(),
             )
@@ -4600,7 +4677,7 @@ def import_triage_responses_view():
             return render_template(
                 "import_triage_responses.html",
                 api_key_set=bool(API_KEY),
-                active="import_triage_responses",
+                active="shortlist_responses",
                 result={"error": "Unrecognized file shape. Expected `{version: 2, session, responses}` from draftboard.com/shortlist (or /triage on older mints)."},
                 recent_overrides=_recent_connector_overrides_for_display(),
             )
@@ -4610,7 +4687,7 @@ def import_triage_responses_view():
             return render_template(
                 "import_triage_responses.html",
                 api_key_set=bool(API_KEY),
-                active="import_triage_responses",
+                active="shortlist_responses",
                 result={"error": "`responses` should be an array."},
                 recent_overrides=_recent_connector_overrides_for_display(),
             )
@@ -4624,7 +4701,7 @@ def import_triage_responses_view():
             return render_template(
                 "import_triage_responses.html",
                 api_key_set=bool(API_KEY),
-                active="import_triage_responses",
+                active="shortlist_responses",
                 result={"error": "Connector LinkedIn URL missing from the upload. Generate a new shortlist page from inside Draftboard so the connector's LinkedIn URL is included."},
                 recent_overrides=_recent_connector_overrides_for_display(),
             )
@@ -4634,7 +4711,7 @@ def import_triage_responses_view():
             return render_template(
                 "import_triage_responses.html",
                 api_key_set=bool(API_KEY),
-                active="import_triage_responses",
+                active="shortlist_responses",
                 result={"error": f"Connector LinkedIn URL doesn't look like a LinkedIn URL: {connector_linkedin}"},
                 recent_overrides=_recent_connector_overrides_for_display(),
             )
@@ -4728,7 +4805,7 @@ def import_triage_responses_view():
         return render_template(
             "import_triage_responses.html",
             api_key_set=bool(API_KEY),
-            active="import_triage_responses",
+            active="shortlist_responses",
             result={
                 "connector_name": session_meta.get("connectorName") or "(connector)",
                 "connector_first": connector_first,
@@ -4751,7 +4828,7 @@ def import_triage_responses_view():
     return render_template(
         "import_triage_responses.html",
         api_key_set=bool(API_KEY),
-        active="import_triage_responses",
+        active="shortlist_responses",
         result=None,
         compose_drafts=[],
         recent_overrides=_recent_connector_overrides_for_display(),
@@ -5005,6 +5082,7 @@ def _scrupp_fetch_data(api_key: str, process_id: str) -> tuple[list[dict], str |
 
 
 @app.route("/import/sales-nav", methods=["GET"])
+@app.route("/add/targets/sales-nav", methods=["GET"])
 def import_sales_nav_view():
     """Render the Sales Nav URL → Scrupp → import flow. The page is
     a single SPA-ish form with JS handling the two POSTs (search +
@@ -5013,11 +5091,12 @@ def import_sales_nav_view():
     keys = _load_resolver_keys()
     return render_template(
         "import_sales_nav.html",
-        active="import_sales_nav",
+        active="add_targets",
         api_key_set=bool(API_KEY),
         scrupp_configured=bool(keys.get("scrupp_api_key")),
         default_max=SCRUPP_SEARCH_DEFAULT_MAX,
         hard_max=SCRUPP_SEARCH_HARD_MAX,
+        hub_tabs=_hub_tabs_for_targets("sales_nav"),
     )
 
 
@@ -9380,8 +9459,10 @@ def _wizard_match_one(query: str, index: list[dict]) -> list[dict]:
 
 
 @app.route("/supporters/wizard", methods=["GET"])
+@app.route("/add/supporters", methods=["GET"])
+@app.route("/add/supporters/wizard", methods=["GET"])
 def supporters_wizard_view():
-    """Render the empty wizard. Five typeahead inputs, one per prompt
+    """Render the empty wizard. Six typeahead inputs, one per prompt
     bucket; the JS fetches the connector index once on load and matches
     client-side as the user types."""
     network_size = 0
@@ -9390,10 +9471,11 @@ def supporters_wizard_view():
         network_size = (cur.fetchone() or [0])[0]
     return render_template(
         "supporters_wizard.html",
-        active="supporters_wizard",
+        active="add_supporters",
         api_key_set=bool(API_KEY),
         prompts=SUPPORTER_WIZARD_PROMPTS,
         network_size=network_size,
+        hub_tabs=_hub_tabs_for_supporters("wizard"),
     )
 
 
@@ -9506,6 +9588,7 @@ def supporters_wizard_mark():
 
 
 @app.route("/supporters/candidates", methods=["GET"])
+@app.route("/add/supporters/scan", methods=["GET"])
 def supporters_candidates_view():
     """Ranked list of high-engagement contacts from the local user's Gmail
     + Calendar, plus any imported teammate scans."""
@@ -9588,8 +9671,9 @@ def supporters_candidates_view():
         status=status,
         sync_state=sync_state,
         resolver_status=resolver_status,
-        active="candidates",
+        active="add_supporters",
         api_key_set=bool(API_KEY),
+        hub_tabs=_hub_tabs_for_supporters("scan"),
     )
 
 
@@ -9654,6 +9738,7 @@ def supporters_linkedin_urls():
 # ---- Manual path uploads ---------------------------------------------------
 
 @app.route("/settings/manual-paths", methods=["GET"])
+@app.route("/add/linkedin-export", methods=["GET"])
 def manual_paths_view():
     """Upload page: list existing uploads + form to add a new one."""
     lists = db_list_manual_path_lists()
@@ -9689,7 +9774,7 @@ def manual_paths_view():
         upload_owner_title=request.args.get("owner_title", ""),
         upload_owner_company=request.args.get("owner_company", ""),
         upload_owner_linkedin=request.args.get("owner_linkedin", ""),
-        active="settings_manual_paths",
+        active="add_linkedin_export",
     )
 
 

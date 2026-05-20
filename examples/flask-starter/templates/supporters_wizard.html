@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Draftboard — Supporter wizard</title>
+  <title>Draftboard — Add supporters · Type names</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
     /* Autocomplete dropdown — positioned absolute under each input. */
@@ -31,15 +31,21 @@
   <div class="max-w-3xl mx-auto px-6 py-10">
     {% include "_nav.html" %}
 
-    <header class="mb-6">
-      <h1 class="text-2xl font-semibold tracking-tight">Who can vouch for you?</h1>
+    <header class="mb-4">
+      <h1 class="text-2xl font-semibold tracking-tight">Add supporters</h1>
       <p class="text-sm text-slate-500 mt-1">
-        Start typing names; we'll autocomplete against your Draftboard network
-        ({{ network_size }} connections). Use <kbd class="px-1 bg-slate-100 rounded text-[10px]">↓</kbd>
-        / <kbd class="px-1 bg-slate-100 rounded text-[10px]">Tab</kbd> /
-        <kbd class="px-1 bg-slate-100 rounded text-[10px]">Enter</kbd> to pick a match.
+        Pick how you want to identify the people in your network most likely to make warm intros.
       </p>
     </header>
+
+    {% include "_hub_tabs.html" %}
+
+    <section class="mb-6">
+      <h2 class="text-sm font-semibold text-slate-900 mb-1">Who can vouch for you?</h2>
+      <p class="text-xs text-slate-500">
+        Start typing names — we'll autocomplete against your Draftboard network ({{ network_size }} connections). Use <kbd class="px-1 bg-slate-100 rounded text-[10px]">↓</kbd> / <kbd class="px-1 bg-slate-100 rounded text-[10px]">Tab</kbd> / <kbd class="px-1 bg-slate-100 rounded text-[10px]">Enter</kbd> to pick a match.
+      </p>
+    </section>
 
     {% if network_size == 0 %}
       <div class="mb-6 rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">

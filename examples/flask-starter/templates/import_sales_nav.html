@@ -3,19 +3,28 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Draftboard — Import from Sales Navigator</title>
+  <title>Draftboard — Add targets · Sales Navigator</title>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-50 text-slate-900 min-h-screen">
   <div class="max-w-3xl mx-auto px-6 py-10">
     {% include "_nav.html" %}
 
-    <header class="mb-6">
-      <h1 class="text-2xl font-semibold tracking-tight">Import from Sales Navigator</h1>
+    <header class="mb-4">
+      <h1 class="text-2xl font-semibold tracking-tight">Add targets</h1>
       <p class="text-sm text-slate-500 mt-1">
-        Paste a Sales Navigator search URL. Scrupp scrapes the results and we import each lead as a Draftboard target so you can see who in your network can intro you.
+        Pick how you want to add new prospects to your Draftboard workspace.
       </p>
     </header>
+
+    {% include "_hub_tabs.html" %}
+
+    <section class="mb-6">
+      <h2 class="text-sm font-semibold text-slate-900 mb-1">Import from Sales Navigator</h2>
+      <p class="text-xs text-slate-500">
+        Paste a Sales Navigator search URL. Scrupp scrapes the results and we import each lead as a Draftboard target.
+      </p>
+    </section>
 
     {% if not scrupp_configured %}
       <div class="mb-6 rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
