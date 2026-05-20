@@ -1622,18 +1622,26 @@ def _reject_cross_site_form():
 def _normalize_linkedin(url):
     """Canonicalize a LinkedIn URL for fuzzy match.
 
-    Strips: scheme (http/https), `www.` prefix, query string, anchor, trailing
-    slash. Lowercases everything. So all of these compare equal:
+    Strips: scheme (http/https), `www.` prefix, country subdomains
+    (`il.`, `de.`, `fr.`, …), query string, anchor, trailing slash.
+    Lowercases everything. So all of these compare equal:
         https://www.linkedin.com/in/orencharnoff/
         https://linkedin.com/in/orencharnoff
         http://www.linkedin.com/in/orencharnoff?utm_source=email
         linkedin.com/in/orencharnoff#anchor
+        https://il.linkedin.com/in/orencharnoff       (Israeli LinkedIn)
+        https://de.linkedin.com/in/orencharnoff/      (German LinkedIn)
     Result: "linkedin.com/in/orencharnoff".
 
     The `www.`-stripping matters because Apollo, Google CSE, and LinkedIn
     itself emit URLs with and without the prefix interchangeably. Without
     this, the supporter-badge cross-reference silently misses ~half its
     real matches when one side has `www.` and the other doesn't.
+
+    The country-subdomain stripping caught a real-world dedup miss:
+    Apollo had `il.linkedin.com/in/yoavoz`, the kit's existing target
+    had `www.linkedin.com/in/yoavoz`. Same person, two normalized
+    strings, no match. Stripping the country code fixes it.
     """
     if not url:
         return ""
@@ -1649,6 +1657,13 @@ def _normalize_linkedin(url):
     # Strip leading www.
     if u.startswith("www."):
         u = u[4:]
+    # Strip leading country subdomain like `il.`, `de.`, `fr.`, `uk.`.
+    # LinkedIn uses 2-letter ISO country codes; match any 2-letter
+    # prefix that's followed by `linkedin.com` so we don't accidentally
+    # strip something else (linkedin.com itself doesn't start with a
+    # 2-letter dotted prefix without the country case).
+    if len(u) > 3 and u[2] == "." and u[3:].startswith("linkedin.com"):
+        u = u[3:]
     return u.rstrip("/")
 
 
