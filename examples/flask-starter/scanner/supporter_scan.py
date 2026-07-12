@@ -8,9 +8,14 @@ team's Draftboard kit. They'll import it; their kit will pool your network
 into the team's Supporter candidates view.
 
 Privacy:
-- Reads metadata only (sender/recipient + dates) — never message bodies.
+- Reads message metadata + subject lines + Gmail's short preview snippet,
+  locally on this laptop. Never opens full message bodies.
+- Subjects/snippets are used ONLY to label each relationship (friend, investor,
+  customer, vendor, etc.) and to spot who has made you introductions. They are
+  NEVER written to the output file.
+- The shareable JSON contains only contact emails + names + counts + a
+  relationship label. No subjects, no snippets, no message text.
 - All data stays on this laptop until you explicitly send the JSON.
-- The JSON contains contact emails + names + counts. No message text.
 
 Usage:
     python3 supporter_scan.py
@@ -21,6 +26,7 @@ install them with pip on first run.
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
@@ -167,7 +173,24 @@ _NOREPLY_PREFIXES = (
     "notification", "alert", "alerts", "support", "help", "info", "hello",
     "team", "billing", "receipts", "invoice", "invoices", "hr", "press",
     "marketing", "newsletter", "news", "updates", "system", "automated",
-    "calendar-notification", "auto-confirm",
+    "calendar-notification", "auto-confirm", "unsubscribe", "unsub", "bounce",
+    "bounces", "mailer-daemon", "postmaster", "mailer", "sales", "accounting",
+    "accounts", "careers", "jobs", "security", "abuse", "webmaster", "digest",
+    "cs", "care", "customerservice", "customer-service", "reply",
+)
+
+# Exact domains that are never a real person.
+_NOISE_DOMAINS_EXACT = (
+    "googlegroups.com", "calendar.google.com", "resource.calendar.google.com",
+)
+
+# Substrings that mark bulk-email / ESP / unsubscribe / test infrastructure —
+# any domain containing one of these is machine mail, not a person.
+_NOISE_DOMAIN_MARKERS = (
+    "customer.io", "beehiiv", "mailjet", "mailpool.io", "sendgrid", "mailgun",
+    "amazonses", "sparkpost", "mailchimp", "mcsv.net", "mcdlv.net", "hubspot",
+    "sendinblue", "constantcontact", "unsubscribe", "unsub.", "bnc3",
+    "terrapinn", "postmarkapp", "sparkpostmail", ".test", "example.com",
 )
 
 
@@ -177,13 +200,175 @@ def is_noise_email(email):
     local, _, domain = email.partition("@")
     local = local.lower()
     domain = domain.lower()
-    if domain in ("googlegroups.com", "calendar.google.com", "resource.calendar.google.com"):
+    if domain in _NOISE_DOMAINS_EXACT:
+        return True
+    if any(marker in domain for marker in _NOISE_DOMAIN_MARKERS):
         return True
     if local.startswith(_NOREPLY_PREFIXES):
         return True
-    if "+" in local and any(local.startswith(p) for p in ("bounce", "bounces")):
+    # Plus-addressed bounce/unsubscribe/test variants (e.g. bounce+abc@…).
+    if "+" in local and local.startswith(("bounce", "bounces", "unsub", "unsubscribe")):
         return True
     return False
+
+
+# -----------------------------------------------------------------------
+# Self-identity + intro detection + relationship classification
+#
+# These read subject lines and Gmail's short snippet preview (never full
+# message bodies) purely to (a) spot who has introduced you to others and
+# (b) label each relationship. None of this text is ever written out.
+# -----------------------------------------------------------------------
+
+def _is_me(email, me, my_local, my_domain):
+    """True for my own address, including plus-addressed variants
+    (zach+test@…) which are typically automated self-mail."""
+    if not email:
+        return False
+    if email == me:
+        return True
+    local, _, domain = email.partition("@")
+    if domain == my_domain and (local == my_local or local.startswith(my_local + "+")):
+        return True
+    return False
+
+
+_INTRO_MARKERS = (
+    "intro:", "introduction", "introducing", "introduce you", "connecting you",
+    "connect you", " <> ", " x ", "meet my", "pls meet", "please meet",
+    "putting you in touch", "happy to intro", "happy to connect",
+    "let me know other intros", "i'll let you two", "let you two take it",
+    "take it from here", "cc'ing", "adding ", "loop in", "looping in",
+    "warm intro",
+)
+
+
+def _has_intro_signal(text):
+    t = (text or "").lower()
+    return any(m in t for m in _INTRO_MARKERS)
+
+
+# Keyword banks for relationship classification. Kept generic (not
+# Draftboard-specific) so the scanner works on any teammate's mailbox.
+_PERSONAL_DOMAINS = frozenset({
+    "gmail.com", "googlemail.com", "yahoo.com", "hotmail.com", "outlook.com",
+    "icloud.com", "me.com", "mac.com", "proton.me", "protonmail.com",
+    "aol.com", "hey.com", "live.com", "msn.com", "gmx.com",
+})
+_INVESTOR_DOMAIN_MARKERS = ("capital", "ventures", "venture", "partners", "vc",
+                            "equity", "fund", "invest")
+_INVESTOR_WORDS = ("investing", "invest in", "raising", "fundraise", "fundraising",
+                   "term sheet", "portfolio", "cap table", "valuation", "our fund",
+                   "led the round", "check size", "the raise", "your round")
+_PERSONAL_WORDS = ("dinner", "lunch", "coffee", "drinks", "weekend", "family",
+                   "kids", "birthday", "vacation", "holiday", "shabbat", "congrats",
+                   "congratulations", "haha", "lol", "love you", "miss you",
+                   "catch up", "how are you", "great to see you", "good to see you",
+                   "<3", "❤", "🙏", "hope you", "your trip", "how's the family")
+_SALES_WORDS = ("demo", "free trial", "pricing", "onboard", "sign up", "signup",
+                "get started", "book a time", "proposal", "quote", "great chatting",
+                "thanks for starting", "schedule a call", "get you set up",
+                "onboarding", "trial", "would love to chat", "reschedule our call")
+_SUPPORT_WORDS = ("error", "bug", "not working", "doesn't work", "isn't working",
+                  "issue", "how do i", "can't", "cannot", "reset", "log in",
+                  "login", "broken", "help with", "having trouble", "question about",
+                  "not showing", "won't load", "stuck")
+# Strong, specific churn phrases (avoid bare "cancel" — it fires on
+# "cancel the meeting" and every calendar cancellation).
+_CANCEL_WORDS = ("refund", "delete my account", "cancel my account",
+                 "cancel my subscription", "unsubscribe me", "stop billing",
+                 "not renewing", "you cancelled", "you canceled",
+                 "saw you cancelled", "saw you canceled", "downgrade my")
+_VENDOR_WORDS = ("invoice", "receipt", "payment due", "statement", "reservation",
+                 "booking", "order confirmation", "shipping", "renewal notice",
+                 "past due", "wire transfer", "payroll", "tax", "utility",
+                 "electric bill", "water bill", "outstanding")
+
+# Supporter-likelihood multiplier per relationship type. Warm human ties
+# score full; transactional/cold ties are heavily discounted even when
+# they generate a lot of email.
+TYPE_WEIGHTS = {
+    "friend": 1.0,
+    "colleague": 0.9,
+    "advisor": 1.0,
+    "investor_warm": 1.0,
+    "other": 0.7,
+    "customer": 0.55,
+    "investor_inbound": 0.4,
+    "sales_prospect": 0.15,
+    "vendor": 0.1,
+    "customer_churned": 0.1,
+}
+
+# Human-readable labels for display.
+TYPE_LABELS = {
+    "friend": "Friend / personal",
+    "colleague": "Colleague",
+    "advisor": "Advisor / mentor",
+    "investor_warm": "Investor (warm)",
+    "investor_inbound": "Investor (inbound)",
+    "customer": "Customer / user",
+    "customer_churned": "Customer (churned)",
+    "sales_prospect": "Sales prospect",
+    "vendor": "Vendor / service",
+    "other": "Other",
+}
+
+
+def classify_relationship(email, text, emails_sent, replies_received, my_domain):
+    """Best-effort relationship type from domain + subjects/snippets + direction.
+
+    Heuristic (no LLM) — deterministic and local. Returns one of the keys in
+    TYPE_WEIGHTS. Priority order matters: transactional signals are checked
+    before warm ones so a churn/support thread isn't mislabeled 'friend'."""
+    t = (text or "").lower()
+    domain = email.partition("@")[2].lower()
+    local = email.partition("@")[0].lower()
+
+    def hits(words):
+        return sum(1 for w in words if w in t)
+
+    sent = emails_sent or 0
+    rep = replies_received or 0
+    reciprocity = (rep / sent) if sent else (1.0 if rep else 0.0)
+
+    # Vendors / life-admin — transactional counterparties.
+    if hits(_VENDOR_WORDS) >= 2 or local in ("cs", "billing", "accounting", "invoices", "payments"):
+        return "vendor"
+
+    # Churned customers — strong cancel language, not a personal thread.
+    if hits(_CANCEL_WORDS) >= 1 and hits(_PERSONAL_WORDS) == 0:
+        return "customer_churned"
+
+    # Investors. "Warm" means I actually engaged and it's roughly balanced;
+    # if they email far more than I reply (a VC chasing me), that's inbound.
+    inv_domain = any(m in domain for m in _INVESTOR_DOMAIN_MARKERS)
+    if inv_domain or hits(_INVESTOR_WORDS) >= 1:
+        warm = sent >= 2 and rep >= 1 and rep <= 3 * sent
+        return "investor_warm" if warm else "investor_inbound"
+
+    # Sales prospects — my templated outbound, mostly one-directional.
+    if hits(_SALES_WORDS) >= 2 and sent >= rep:
+        return "sales_prospect"
+
+    # Active customers reaching in for support/help.
+    if hits(_SUPPORT_WORDS) >= 2:
+        return "customer"
+
+    # Friends / personal.
+    personal_domain = domain in _PERSONAL_DOMAINS
+    if hits(_PERSONAL_WORDS) >= 2 or (
+        personal_domain
+        and (hits(_SALES_WORDS) + hits(_SUPPORT_WORDS) + hits(_VENDOR_WORDS)) == 0
+        and rep >= 1
+    ):
+        return "friend"
+
+    # Same-org colleagues.
+    if my_domain and domain == my_domain:
+        return "colleague"
+
+    return "other"
 
 
 # -----------------------------------------------------------------------
@@ -193,6 +378,8 @@ def is_noise_email(email):
 def fetch_gmail(creds, my_email, days, cap):
     service = build("gmail", "v1", credentials=creds, cache_discovery=False)
     me = (my_email or "").lower()
+    my_local = me.partition("@")[0]
+    my_domain = me.partition("@")[2]
     print(f"  Fetching Gmail thread IDs from the last {days} days…")
     thread_ids = []
     page_token = None
@@ -214,18 +401,28 @@ def fetch_gmail(creds, my_email, days, cap):
         try:
             thread = service.users().threads().get(
                 userId="me", id=tid, format="metadata",
-                metadataHeaders=["From", "To", "Cc", "Date"],
+                metadataHeaders=["From", "To", "Cc", "Date", "Subject"],
             ).execute()
         except HttpError:
             if (i + 1) % 50 == 0:
                 _progress("Gmail", i + 1, len(thread_ids))
             continue
 
-        thread_contacts = {}
+        messages = thread.get("messages", []) or []
+        thread_contacts = {}       # em -> {name, sent_by_me, replies}
+        participants = set()       # non-me, non-noise humans on the thread
+        text_parts = []            # subjects + snippets, for classification only
+        intro_senders = set()      # who sent an intro-signal message
         most_recent_ts = 0
-        for msg in thread.get("messages", []) or []:
+        months = set()
+
+        for msg in messages:
             headers = {h.get("name", "").lower(): h.get("value", "") for h in
                        (msg.get("payload", {}).get("headers", []) or [])}
+            subject = headers.get("subject", "")
+            snippet = msg.get("snippet", "") or ""
+            text_parts.append(subject)
+            text_parts.append(snippet)
             from_addrs = parse_addresses(headers.get("from", ""))
             to_addrs = parse_addresses(headers.get("to", ""))
             cc_addrs = parse_addresses(headers.get("cc", ""))
@@ -235,13 +432,18 @@ def fetch_gmail(creds, my_email, days, cap):
                 msg_ts = 0
             if msg_ts > most_recent_ts:
                 most_recent_ts = msg_ts
+            if msg_ts:
+                months.add(datetime.utcfromtimestamp(msg_ts).strftime("%Y-%m"))
 
             sender_email = from_addrs[0][1] if from_addrs else ""
-            sent_by_me = sender_email == me
+            sent_by_me = _is_me(sender_email, me, my_local, my_domain)
+            if _has_intro_signal(subject + " " + snippet) and sender_email and not sent_by_me:
+                intro_senders.add(sender_email)
 
             for nm, em in from_addrs + to_addrs + cc_addrs:
-                if em == me or is_noise_email(em):
+                if _is_me(em, me, my_local, my_domain) or is_noise_email(em):
                     continue
+                participants.add(em)
                 rec = thread_contacts.setdefault(em, {"name": "", "sent_by_me": 0, "replies": 0})
                 if nm and not rec["name"]:
                     rec["name"] = nm
@@ -250,21 +452,54 @@ def fetch_gmail(creds, my_email, days, cap):
                 elif em == sender_email:
                     rec["replies"] += 1
 
+        n_others = len(participants)          # distinct people besides me
+        is_one_to_one = (n_others == 1)
+        is_deep = len(messages) >= 4          # real multi-turn back-and-forth
+        thread_text = " ".join(text_parts).lower()
+        thread_has_intro = _has_intro_signal(thread_text)
+
         for em, rec in thread_contacts.items():
             agg = contacts.setdefault(em, {
                 "name": "", "emails_sent": 0, "replies_received": 0,
-                "threads_count": 0, "last_contact_at": 0,
+                "threads_count": 0, "one_to_one_threads": 0, "deep_threads": 0,
+                "last_contact_at": 0, "months": set(), "text_parts": [],
+                "text_len": 0, "intro_maker": False,
             })
             if rec["name"] and not agg["name"]:
                 agg["name"] = rec["name"]
             agg["emails_sent"] += rec["sent_by_me"]
             agg["replies_received"] += rec["replies"]
             agg["threads_count"] += 1
+            if is_one_to_one:
+                agg["one_to_one_threads"] += 1
+            if is_deep and (rec["sent_by_me"] + rec["replies"]) >= 1:
+                agg["deep_threads"] += 1
+            agg["months"].update(months)
             if most_recent_ts > agg["last_contact_at"]:
                 agg["last_contact_at"] = most_recent_ts
+            # Keep a bounded bag of subject/snippet text for classification.
+            if agg["text_len"] < 4000:
+                chunk = thread_text[:500]
+                agg["text_parts"].append(chunk)
+                agg["text_len"] += len(chunk)
+            # Intro-maker: they explicitly sent intro language, OR they took
+            # part in a multi-party thread that reads like an introduction.
+            if em in intro_senders or (thread_has_intro and n_others >= 2
+                                       and (rec["sent_by_me"] + rec["replies"]) >= 1):
+                agg["intro_maker"] = True
 
         if (i + 1) % 25 == 0:
             _progress("Gmail", i + 1, len(thread_ids))
+
+    # Finalize: collapse the transient month-set + text-bag into the fields we
+    # keep. relationship_type is computed here (needs the text); the text bag
+    # itself is discarded and never leaves this process.
+    for em, agg in contacts.items():
+        agg["active_months"] = len(agg.pop("months"))
+        text = " ".join(agg.pop("text_parts"))
+        agg.pop("text_len", None)
+        agg["relationship_type"] = classify_relationship(
+            em, text, agg["emails_sent"], agg["replies_received"], my_domain)
 
     _progress("Gmail", len(thread_ids), len(thread_ids))
     print()
@@ -317,17 +552,24 @@ def fetch_calendar(creds, my_email, days, cap):
                         ts = int(datetime.fromisoformat(ts_str).replace(tzinfo=timezone.utc).timestamp())
                 except (TypeError, ValueError):
                     ts = 0
+            # A small meeting (<=5 attendees) is a real relationship signal; a
+            # 30-person all-hands is noise. Track both, weight only the small.
+            human_attendees = [a for a in attendees if not a.get("resource")]
+            is_small = len(human_attendees) <= 5
             for a in attendees:
                 email = (a.get("email") or "").lower()
                 if not email or email == me or is_noise_email(email):
                     continue
                 if a.get("responseStatus") == "declined":
                     continue
-                rec = contacts.setdefault(email, {"name": "", "meetings_count": 0, "last_met_at": 0})
+                rec = contacts.setdefault(email, {
+                    "name": "", "meetings_count": 0, "small_meetings": 0, "last_met_at": 0})
                 nm = a.get("displayName") or ""
                 if nm and not rec["name"]:
                     rec["name"] = nm
                 rec["meetings_count"] += 1
+                if is_small:
+                    rec["small_meetings"] += 1
                 if ts > rec["last_met_at"]:
                     rec["last_met_at"] = ts
             processed += 1
@@ -351,21 +593,57 @@ def _progress(label, done, total):
 
 
 # -----------------------------------------------------------------------
-# Scoring — same formula as the Flask kit, applied here only to give
-# Marcus a preview of his top candidates. The JSON includes raw counts
-# so the kit can re-score authoritatively on import.
+# Scoring — supporter-likelihood, 0-100. Rewards relationship QUALITY over
+# raw volume: reciprocity, 1:1 vs group, conversation depth, how long the
+# relationship has been sustained, small meetings, and a big boost for
+# people who've actually introduced you to others. A relationship-type
+# multiplier discounts sales/vendor/support/inbound-VC/churned ties even
+# when they're high-volume.
+#
+# The JSON still carries the raw counts so the Flask kit can re-score
+# authoritatively on import; this score drives the local review page.
 # -----------------------------------------------------------------------
 
-def score(emails_sent, replies, threads, meetings, days_ago):
-    base = (emails_sent or 0) + 2 * (replies or 0) + 3 * (threads or 0) + 5 * (meetings or 0)
-    if days_ago is None:
-        return 0
-    recency = max(0.1, 1.0 - (days_ago / 365.0))
-    return int(base * recency)
+def score(d):
+    sent = d.get("emails_sent", 0)
+    rep = d.get("replies_received", 0)
+    threads = d.get("threads_count", 0)
+    o2o = d.get("one_to_one_threads", 0)
+    deep = d.get("deep_threads", 0)
+    months = d.get("active_months", 0)
+    small_meet = d.get("small_meetings", 0)
+    last = d.get("last_contact_at", 0)
+    rtype = d.get("relationship_type", "other")
+    intro = d.get("intro_maker", False)
 
+    responsiveness = min(1.0, rep / sent) if sent else (1.0 if rep else 0.0)
+    o2o_ratio = (o2o / threads) if threads else 0.0
+    depth = min(1.0, deep / threads) if threads else 0.0
+    span = min(1.0, months / 6.0)
+    volume = min(1.0, math.log1p(threads) / math.log(11)) if threads else 0.0
+    meeting_sig = min(1.0, small_meet / 3.0)
 
-def merged_top_n(gmail_contacts, calendar_contacts, n=10):
+    base = 100.0 * (
+        0.28 * responsiveness + 0.20 * o2o_ratio + 0.14 * depth +
+        0.14 * span + 0.09 * volume + 0.15 * meeting_sig
+    )
     now = int(time.time())
+    if last:
+        days_ago = (now - last) / 86400.0
+        recency = max(0.35, 1.0 - days_ago / 365.0)  # gentle floor — old-but-strong ties survive
+    else:
+        recency = 0.35
+    s = base * recency * TYPE_WEIGHTS.get(rtype, 0.7)
+    if intro:
+        s += 22.0
+    return int(max(0, min(100, round(s))))
+
+
+def rank_all(gmail_contacts, calendar_contacts, my_email):
+    """Merge Gmail + Calendar per person, keep everyone eligible (a two-way
+    email relationship OR at least one meeting), score, and return the FULL
+    ranked list (no cap), highest score first."""
+    my_domain = (my_email or "").partition("@")[2].lower()
     merged = {}
     for em, c in gmail_contacts.items():
         merged[em] = {
@@ -374,33 +652,44 @@ def merged_top_n(gmail_contacts, calendar_contacts, n=10):
             "emails_sent": c.get("emails_sent", 0),
             "replies_received": c.get("replies_received", 0),
             "threads_count": c.get("threads_count", 0),
+            "one_to_one_threads": c.get("one_to_one_threads", 0),
+            "deep_threads": c.get("deep_threads", 0),
+            "active_months": c.get("active_months", 0),
             "meetings_count": 0,
+            "small_meetings": 0,
             "last_contact_at": c.get("last_contact_at", 0),
+            "intro_maker": bool(c.get("intro_maker", False)),
+            "relationship_type": c.get("relationship_type", "other"),
         }
     for em, c in calendar_contacts.items():
         d = merged.setdefault(em, {
             "email": em, "name": c.get("name") or em,
             "emails_sent": 0, "replies_received": 0, "threads_count": 0,
-            "meetings_count": 0, "last_contact_at": 0,
+            "one_to_one_threads": 0, "deep_threads": 0, "active_months": 0,
+            "meetings_count": 0, "small_meetings": 0, "last_contact_at": 0,
+            "intro_maker": False,
+            # Calendar-only contacts have no message text — classify by domain.
+            "relationship_type": classify_relationship(em, "", 0, 0, my_domain),
         })
         d["meetings_count"] = c.get("meetings_count", 0)
+        d["small_meetings"] = c.get("small_meetings", 0)
         d["last_contact_at"] = max(d["last_contact_at"], c.get("last_met_at", 0))
-        if c.get("name") and not d["name"]:
+        if c.get("name") and (not d["name"] or d["name"] == em):
             d["name"] = c["name"]
 
-    # Apply the same bidirectional filter the kit uses: gmail-only contacts
-    # need both directions; calendar is bidirectional by definition.
-    qualifying = []
+    ranked = []
     for em, d in merged.items():
         gmail_ok = d["emails_sent"] >= 1 and d["replies_received"] >= 1
         meet_ok = d["meetings_count"] >= 1
         if not (gmail_ok or meet_ok):
             continue
-        days_ago = ((now - d["last_contact_at"]) / 86400.0) if d["last_contact_at"] else None
-        d["score"] = score(d["emails_sent"], d["replies_received"], d["threads_count"], d["meetings_count"], days_ago)
-        qualifying.append(d)
-    qualifying.sort(key=lambda x: -x["score"])
-    return qualifying[:n], len(qualifying)
+        sent = d["emails_sent"]
+        d["reply_rate"] = round(min(1.0, d["replies_received"] / sent), 2) if sent else 0.0
+        d["type_label"] = TYPE_LABELS.get(d["relationship_type"], "Other")
+        d["score"] = score(d)
+        ranked.append(d)
+    ranked.sort(key=lambda x: (-x["score"], x["name"].lower()))
+    return ranked
 
 
 # -----------------------------------------------------------------------
@@ -439,11 +728,14 @@ def _render_review_html(payload):
     <header class="mb-6">
       <h1 class="text-2xl font-semibold tracking-tight">Review your Supporter Scan</h1>
       <p class="text-sm text-slate-600 mt-2">
-        Below are the contacts your scan found in your Gmail + Calendar over
-        the last {payload["history_days"]} days. <strong>Untick anyone you
-        don't want shared</strong> with the person who asked you to run this.
-        Then click <strong>Save Filtered JSON</strong> at the top right and
-        send THAT file back to them — not this HTML.
+        Everyone below had a real back-and-forth or a meeting with you in the
+        last {payload["history_days"]} days, ranked by how likely they are to
+        make a warm intro for you (relationship quality, not email volume) and
+        labelled by type. A <span class="text-amber-500">★</span> means they've
+        introduced you to someone before. <strong>Untick anyone you don't want
+        shared</strong> with the person who asked you to run this, then click
+        <strong>Save Filtered JSON</strong> at the top right and send THAT file
+        back to them — not this HTML.
       </p>
       <p class="text-xs text-slate-500 mt-2">
         Signed in as <strong>{scanned_name}</strong> &lt;{scanned_email}&gt;.
@@ -478,12 +770,13 @@ def _render_review_html(payload):
               <input id="head-check" type="checkbox" checked class="h-4 w-4 rounded border-slate-300 text-indigo-600" />
             </th>
             <th data-sort="name" class="px-3 py-2 font-medium text-[11px] uppercase tracking-wider cursor-pointer hover:text-slate-700">Contact</th>
+            <th data-sort="type_label" class="px-3 py-2 font-medium text-[11px] uppercase tracking-wider cursor-pointer hover:text-slate-700">Type</th>
             <th data-sort="threads_count" class="px-3 py-2 font-medium text-[11px] uppercase tracking-wider text-right cursor-pointer hover:text-slate-700">Threads</th>
             <th data-sort="replies_received" class="px-3 py-2 font-medium text-[11px] uppercase tracking-wider text-right cursor-pointer hover:text-slate-700">Replies</th>
             <th data-sort="meetings_count" class="px-3 py-2 font-medium text-[11px] uppercase tracking-wider text-right cursor-pointer hover:text-slate-700">Meetings</th>
             <th data-sort="last_contact_at" class="px-3 py-2 font-medium text-[11px] uppercase tracking-wider text-right cursor-pointer hover:text-slate-700">Last contact</th>
             <th data-sort="score" class="px-3 py-2 font-medium text-[11px] uppercase tracking-wider text-right cursor-pointer hover:text-slate-700"
-                title="(emails + replies×2 + threads×3 + meetings×5) × recency_decay">
+                title="Supporter score 0-100 — rewards reciprocity, 1:1 threads, conversation depth, how long you've stayed in touch, small meetings, and intro history. Discounts sales / vendor / support / inbound-VC / churned ties.">
               Score ↓
             </th>
           </tr>
@@ -502,51 +795,15 @@ def _render_review_html(payload):
   (function () {{
     const payload = JSON.parse(document.getElementById('data').textContent);
 
-    // Merge gmail + calendar contacts by email so each row represents a
-    // unique person. Apply the same bidirectional filter the kit uses.
-    const merged = new Map();
-    for (const c of payload.gmail_contacts || []) {{
-      merged.set(c.email, {{
-        email: c.email,
-        name: c.name || c.email,
-        emails_sent: c.emails_sent || 0,
-        replies_received: c.replies_received || 0,
-        threads_count: c.threads_count || 0,
-        meetings_count: 0,
-        last_contact_at: c.last_contact_at || 0,
-      }});
-    }}
-    for (const c of payload.calendar_contacts || []) {{
-      const existing = merged.get(c.email) || {{
-        email: c.email, name: c.name || c.email,
-        emails_sent: 0, replies_received: 0, threads_count: 0,
-        meetings_count: 0, last_contact_at: 0,
-      }};
-      existing.meetings_count = c.meetings_count || 0;
-      existing.last_contact_at = Math.max(existing.last_contact_at, c.last_met_at || 0);
-      if (c.name && (!existing.name || existing.name === existing.email)) existing.name = c.name;
-      merged.set(c.email, existing);
-    }}
-
-    // Bidirectional filter — same logic as the kit's db_query_candidates.
+    // Rows arrive pre-scored, pre-classified and pre-ranked from the scan
+    // (payload.ranked_contacts). No merging or re-scoring here — we just
+    // render them; the checkboxes control what gets saved.
     const now = Math.floor(Date.now() / 1000);
-    function score(d) {{
-      const base = d.emails_sent + 2*d.replies_received + 3*d.threads_count + 5*d.meetings_count;
-      if (!d.last_contact_at) return 0;
-      const daysAgo = (now - d.last_contact_at) / 86400;
-      const recency = Math.max(0.1, 1.0 - (daysAgo / 365));
-      return Math.round(base * recency);
-    }}
-    const rows = [];
-    for (const d of merged.values()) {{
-      const gmailOk = d.emails_sent >= 1 && d.replies_received >= 1;
-      const meetOk = d.meetings_count >= 1;
-      if (!gmailOk && !meetOk) continue;
-      d.score = score(d);
-      d.included = true;  // default ticked
-      rows.push(d);
-    }}
-    rows.sort((a, b) => b.score - a.score);
+    const rows = (payload.ranked_contacts || []).map(r => Object.assign({{}}, r, {{
+      name: r.name || r.email,
+      type_label: r.type_label || 'Other',
+      included: true,  // default ticked
+    }}));
 
     let sortKey = 'score', sortDir = -1;
     let searchQuery = '';
@@ -583,8 +840,11 @@ def _render_review_html(payload):
                    class="row-check h-4 w-4 rounded border-slate-300 text-indigo-600" />
           </td>
           <td class="px-3 py-2 align-middle">
-            <div class="font-medium text-slate-900">${{escapeHtml(r.name)}}</div>
+            <div class="font-medium text-slate-900">${{escapeHtml(r.name)}}${{r.intro_maker ? ' <span title="Has introduced you to someone before" class="text-amber-500">★</span>' : ''}}</div>
             <div class="text-xs text-slate-500">${{escapeHtml(r.email)}}</div>
+          </td>
+          <td class="px-3 py-2 align-middle">
+            <span class="inline-flex items-center rounded-full bg-slate-100 text-slate-600 px-2 py-0.5 text-xs">${{escapeHtml(r.type_label || 'Other')}}</span>
           </td>
           <td class="px-3 py-2 text-right tabular-nums">${{r.threads_count}}</td>
           <td class="px-3 py-2 text-right tabular-nums">${{r.replies_received}}</td>
@@ -660,6 +920,7 @@ def _render_review_html(payload):
         ...payload,
         gmail_contacts: (payload.gmail_contacts || []).filter(c => includedEmails.has(c.email)),
         calendar_contacts: (payload.calendar_contacts || []).filter(c => includedEmails.has(c.email)),
+        ranked_contacts: (payload.ranked_contacts || []).filter(c => includedEmails.has(c.email)),
         filtered: true,
         original_total: rows.length,
         included_total: includedEmails.size,
@@ -711,12 +972,16 @@ def main():
     print("Draftboard Supporter Scan")
     print("=" * 60)
     print()
-    print("This scans the last 12 months of your Gmail + Calendar to find")
-    print("the people you actually engage with — back-and-forth emails and")
-    print("real meetings. We'll then produce an HTML review page so you can")
-    print("untick anyone you don't want shared before sending the result.")
+    print("This scans the last 12 months of your Gmail + Calendar to find the")
+    print("people most likely to make a warm intro for you — ranked by")
+    print("relationship quality (reciprocity, 1:1s, real meetings, who's")
+    print("introduced you before), not just email volume. We'll produce an HTML")
+    print("review page so you can untick anyone you don't want shared.")
     print()
-    print("Reads metadata only (no message contents). All data stays local.")
+    print("Reads metadata + subject lines + short snippet previews, all locally")
+    print("(never full message bodies). Only counts + a relationship label are")
+    print("ever saved — no message text. Nothing leaves your laptop until you")
+    print("send the file yourself.")
     print()
 
     creds = authenticate()
@@ -747,7 +1012,12 @@ def main():
     calendar_contacts = fetch_calendar(creds, my_email, args.days, args.events_cap)
     elapsed = int(time.time() - started)
 
-    # Build the output JSON.
+    # Rank everyone eligible (no cap) — this drives both the review page and
+    # the terminal preview. Computed before rendering so the HTML can embed it.
+    ranked = rank_all(gmail_contacts, calendar_contacts, my_email)
+
+    # Build the output JSON. schema_version stays 1 (the Flask kit importer
+    # requires it); new fields are additive and ignored by older importers.
     output = {
         "schema_version": SCHEMA_VERSION,
         "scan_type": "draftboard_supporter_scan",
@@ -761,7 +1031,12 @@ def main():
                 "emails_sent": c.get("emails_sent", 0),
                 "replies_received": c.get("replies_received", 0),
                 "threads_count": c.get("threads_count", 0),
+                "one_to_one_threads": c.get("one_to_one_threads", 0),
+                "deep_threads": c.get("deep_threads", 0),
+                "active_months": c.get("active_months", 0),
                 "last_contact_at": c.get("last_contact_at", 0),
+                "intro_maker": bool(c.get("intro_maker", False)),
+                "relationship_type": c.get("relationship_type", "other"),
             }
             for em, c in gmail_contacts.items()
         ],
@@ -770,10 +1045,13 @@ def main():
                 "email": em,
                 "name": c.get("name", ""),
                 "meetings_count": c.get("meetings_count", 0),
+                "small_meetings": c.get("small_meetings", 0),
                 "last_met_at": c.get("last_met_at", 0),
             }
             for em, c in calendar_contacts.items()
         ],
+        # Pre-scored, pre-classified, fully ranked — what the review page shows.
+        "ranked_contacts": ranked,
     }
 
     out_path = args.out
@@ -787,22 +1065,27 @@ def main():
     with open(out_path, "w") as f:
         f.write(html)
 
-    # Preview top candidates so Marcus sees value at the terminal.
-    top, qualifying_total = merged_top_n(gmail_contacts, calendar_contacts, n=10)
+    # Preview top candidates so the person running it sees value immediately.
+    qualifying_total = len(ranked)
+    top = ranked[:12]
     print()
     print("=" * 60)
     print(f"✓ Scan complete in {elapsed//60}m {elapsed%60}s")
     print("=" * 60)
     print(f"  Gmail contacts found:       {len(gmail_contacts):>6}")
     print(f"  Calendar contacts found:    {len(calendar_contacts):>6}")
-    print(f"  Qualifying after filter:    {qualifying_total:>6}")
+    print(f"  Eligible + ranked:          {qualifying_total:>6}")
     print()
     if top:
-        print("Top candidates by engagement:")
-        print(f"  {'Score':>5}  {'Threads':>7}  {'Replies':>7}  {'Meetings':>8}  Contact")
+        print("Top likely supporters (all eligible are in the review file):")
+        print(f"  {'Score':>5}  {'Intro':>5}  {'Type':<18}  Contact")
         for c in top:
             display_name = c["name"] if c["name"] != c["email"] else c["email"]
-            print(f"  {c['score']:>5}  {c['threads_count']:>7}  {c['replies_received']:>7}  {c['meetings_count']:>8}  {display_name} <{c['email']}>")
+            intro_flag = " ★ " if c.get("intro_maker") else "   "
+            label = (c.get("type_label") or "Other")[:18]
+            print(f"  {c['score']:>5}  {intro_flag:>5}  {label:<18}  {display_name} <{c['email']}>")
+        print()
+        print("  ★ = has introduced you to someone before (strongest supporter signal)")
     print()
     print("=" * 60)
     print(" NEXT STEPS — please do these")
